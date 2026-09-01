@@ -84,18 +84,21 @@ def mass(
     ``normalize=False`` supports ``p=2.0`` only.
     ``T_subseq_isfinite`` is ignored when ``normalize=True``, like STUMPY.
 
-    Precomputed ``M_T``/``Σ_T`` (both required, shape ``(l,)``): ``Σ_T`` is
-    honored as the per-window scale of the z-normalized distance, so passing
-    STUMPY's ``compute_mean_std`` output reproduces its ranking; a window
-    whose ``M_T`` is not finite is reported as inf (STUMPY's ``M_T == inf``
-    convention, applied ahead of the constant-window rules), and a
-    non-finite ``Σ_T`` entry acts as a zero sigma (``sqrt(2m)``, or the
-    constant-window value when the window is flagged constant, as STUMPY
-    does for ``inf``). ``M_T`` is *not* used to form the covariance: every window
-    is centered by its own exact float64 mean, which is what keeps the
-    product cancellation-free — STUMPY's ``QT - m·μ_Q·M_T`` form amplifies
-    the float64 rounding of ``M_T`` by ``(μ/σ)²`` and collapses on offset
-    data. A deliberately biased ``M_T`` therefore does not change the result.
+    Precomputed ``M_T``/``Σ_T`` (both required, shape ``(l,)``) are a
+    *cache*, not an input to the arithmetic: they are validated, an
+    infinite ``M_T`` marks its window non-finite (STUMPY's convention for
+    windows containing NaN), and otherwise every window is centered by its
+    own exact float64 mean and scaled by its own exact sigma, so the
+    profile equals the no-stats call exactly. This is a deliberate choice
+    of mathematical semantics over STUMPY's literal use of the supplied
+    values, whose rounding STUMPY lets into the distance: its
+    ``QT - m·μ_Q·M_T`` amplifies ``M_T``'s rounding by ``(μ/σ)²`` and
+    collapses on offset data, and its ``1/(σ_Q·Σ_T)`` leaves a
+    ``sqrt(2m·δ)`` floor on perfect matches from ``Σ_T``'s own relative
+    rounding ``δ``. A deliberately scaled or biased ``M_T``/``Σ_T``
+    therefore changes STUMPY's result but not this one; passing
+    ``compute_mean_std``'s output reproduces STUMPY's ranking to within
+    its own rounding.
 
     The target window matrix is streamed in bounded column blocks, so the
     profile costs one block of GPU memory at a time regardless of ``n·m``.
@@ -162,18 +165,15 @@ def mass(
         # it as ignored when normalize=True (it only feeds mass_absolute)
         prep = preprocess_series(T, m, isconstant=T_subseq_isconstant)
         if user_stats:
-            sigma = Σ_T / prep.scale  # raw-frame sigma -> standardized frame
-            sigma[prep.isconstant] = 0.0
-            with np.errstate(divide="ignore", invalid="ignore"):
-                # a non-finite Σ_T entry acts as a zero sigma: rho = 0 and
-                # sqrt(2m), unless a constant flag applies first (STUMPY:
-                # inf -> sqrt(2m), NaN -> NaN, constant rules before both)
-                sig_inv = np.where(np.isfinite(sigma) & (sigma > 0.0), 1.0 / sigma, 0.0)
-            prep.sig_inv = sig_inv
-            prep.sig_inv_mx = mx.array(sig_inv.astype(np.float32))
-            # STUMPY reports inf wherever M_T is inf, ahead of the constant
-            # rules; a NaN M_T (NaN in STUMPY) is folded into that convention
-            bad_mean = ~np.isfinite(M_T)
+            # cached statistics are a cache: every window is centered by its
+            # own exact float64 mean and scaled by its own exact sigma, so
+            # the profile equals the no-stats call exactly. STUMPY's literal
+            # use of the supplied values (`QT - m*mu_Q*M_T`, `1/(sigma_Q*Σ_T)`)
+            # lets their rounding into the distance — amplified by
+            # (mu/sigma)^2 for M_T, and as a sqrt(2m*delta) floor on perfect
+            # matches for Σ_T. The one convention kept is STUMPY's marker
+            # for windows containing NaN: an infinite M_T reports inf.
+            bad_mean = np.isinf(M_T)
             if bad_mean.any():
                 prep.isfinite = prep.isfinite & ~bad_mean
                 prep.isfinite_mx = mx.array(prep.isfinite)

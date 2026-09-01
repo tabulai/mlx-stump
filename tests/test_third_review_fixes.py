@@ -93,7 +93,7 @@ def test_mass_precomputed_stats_offset_data(offset):
     D = mlx_stump.mass(Q, T, M_T=M_T, Σ_T=Σ_T)
     D0 = mlx_stump.mass(Q, T)
     assert D[1000] < 1e-2
-    assert np.max(np.abs(D - D0)) < 1e-2
+    np.testing.assert_array_equal(D, D0)
     assert np.all(D <= 2.0 * np.sqrt(m) + 1e-6)
     if offset <= 1e3:
         Dr = stumpy.mass(Q, T, M_T=M_T, Σ_T=Σ_T)
@@ -119,11 +119,12 @@ def test_mass_stats_validation_and_nonfinite_windows():
     assert np.isfinite(D[99]) and np.isfinite(D[101])
     M = mlx_stump.match(Q, T, M_T=M2, Σ_T=Σ_T, max_distance=float("inf"))
     assert 100 not in {int(i) for _, i in M}
-    # the contract: Σ_T scales the distance, M_T's value does not enter it
-    D_biased = mlx_stump.mass(Q, T, M_T=M_T + 0.5, Σ_T=Σ_T)
-    np.testing.assert_array_equal(D_biased, mlx_stump.mass(Q, T, M_T=M_T, Σ_T=Σ_T))
-    D_scaled = mlx_stump.mass(Q, T, M_T=M_T, Σ_T=Σ_T * 2.0)
-    assert not np.allclose(D_scaled, D)
+    # the contract: cached stats are a cache — neither value enters the
+    # arithmetic, so the profile equals the no-stats call exactly
+    D0 = mlx_stump.mass(Q, T)
+    np.testing.assert_array_equal(mlx_stump.mass(Q, T, M_T=M_T + 0.5, Σ_T=Σ_T), D0)
+    np.testing.assert_array_equal(mlx_stump.mass(Q, T, M_T=M_T, Σ_T=Σ_T * 2.0), D0)
+    np.testing.assert_array_equal(mlx_stump.mass(Q, T, M_T=M_T, Σ_T=Σ_T), D0)
 
 
 # ------------------------------------------------------------- 2: memory

@@ -76,6 +76,14 @@ _MATMUL_WINDOW_BYTES = 1 << 28  # ~256 MiB
 _TILE_WINDOW_BYTES = 1 << 27  # ~128 MiB
 # byte bound on the float64 centering temporary while building window blocks
 _CENTER_BYTES = 1 << 26  # ~64 MiB
+# byte budget for the float64 window copies held live by one refinement
+# chunk (two fancy-indexed window blocks plus their centered copies); the
+# refinement runs after the device memory has been released
+_REFINE_MEM_BUDGET = 1 << 28  # ~256 MiB
+
+
+def refine_chunk_rows(m: int) -> int:
+    return max(1, min(1 << 16, _REFINE_MEM_BUDGET // (m * 8 * 4)))
 
 
 def _center_rows(m: int) -> int:
@@ -93,33 +101,50 @@ def resident_block_bytes(l: int, m: int) -> int:
     return -(-l // nblocks) * m * 4
 
 
-def estimated_peak_bytes(l: int, m: int, k: int = 1, self_join: bool = True) -> int:
+def estimated_peak_bytes(
+    l: int, m: int, k: int = 1, self_join: bool = True, l_q: int | None = None
+) -> int:
     """Estimate of the bytes one join needs beyond its O(n) per-series arrays.
 
-    The larger of the upload transient (the block staged in numpy plus its
-    device copy plus the centering temporary) and the sweep phase (the
-    resident block plus the per-batch intermediates budget — or one batch
-    row, when even a single row exceeds the budget), plus the host-side
-    outputs (float64 profile and int64 indices per neighbor, left/right
-    indices). The budget is enforced batch by batch: each batch is
-    synchronized before the next one allocates and the trailing batch is
-    computed at full width, so exactly one set of intermediates exists;
-    ``stump`` releases the block and MLX's cached buffers before its float64
-    refinement (whose chunk budget, 256 MiB, is below the intermediates
-    budget), and ``mass`` on return.
+    ``l`` is the number of target windows (the side the engine
+    materializes), ``l_q`` the number of query windows (the output rows;
+    defaults to ``l``). The largest of three phases:
 
-    It is an estimate, not a hard cap: MLX's allocator rounds buffers up
-    (about +0.5% observed), the O(n) series and stat arrays are not
-    included, and the numbers are MLX's own active-memory peak plus host
-    memory (GPU-written buffers are invisible to RSS on macOS).
+    - upload: the block staged in numpy plus its device copy plus the
+      centering temporary;
+    - sweep: the resident block plus the per-batch intermediates budget (or
+      one batch row, when even a single row exceeds the budget), plus the
+      numeric profile/index outputs (float64 + int64 per neighbor,
+      left/right indices; the tiled sweep also keeps float32/int64 top-k
+      accumulators). The budget is enforced batch by batch — each batch is
+      synchronized before the next allocates and the trailing batch is
+      computed at full width — so exactly one set of intermediates exists;
+    - assembly: after the device memory is released, the float64
+      refinement chunk plus the numeric outputs, the top-k reordering
+      temporaries, and the object-dtype ``mparray`` STUMPY's output layout
+      requires: an 8-byte pointer plus a boxed Python float/int (24/28
+      bytes) per cell, ~68 bytes per neighbor per row, which dominates for
+      large ``k`` (n=50,000, m=50, k=100: ~330 MiB for the output alone).
+
+    It is an estimate with headroom, not a hard cap: MLX's allocator rounds
+    buffers up (about +0.5% observed), the O(n) series and stat arrays are
+    not included, and the figures are MLX's own active-memory peak plus
+    host memory (GPU-written buffers are invisible to RSS on macOS).
     """
+    if l_q is None:
+        l_q = l
     block = resident_block_bytes(l, m)
     width = block // (m * 4)  # columns of the resident block
     cell = 16 if k == 1 else (48 if self_join else 40)
     one_row = width * cell + _query_batch_bytes(m)
-    sweep = block + max(_CHUNK_MEM_BUDGET, one_row)
-    outputs = l * (16 * k + 16)
-    return max(2 * block + _CENTER_BYTES, sweep) + outputs
+    numeric = l_q * (16 * k + 16)  # P (float64) and I (int64) per neighbor, IL/IR
+    accum = l_q * 12 * k if (block < l * m * 4 and k > 1) else 0  # tiled top-k merge state
+    sweep = block + max(_CHUNK_MEM_BUDGET, one_row) + numeric + accum
+    refine = refine_chunk_rows(m) * m * 8 * 4
+    reorder = l_q * 16 * k if k > 1 else 0  # argsort order + one reordered copy live
+    boxed = l_q * ((2 * k + 2) * 8 + k * (24 + 28) + 2 * 28)
+    assembly = refine + numeric + reorder + boxed
+    return max(2 * block + _CENTER_BYTES, sweep, assembly)
 
 
 def _query_batch_bytes(m: int) -> int:

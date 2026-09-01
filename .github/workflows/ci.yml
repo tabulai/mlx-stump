@@ -45,6 +45,12 @@ jobs:
           assert "site-packages" in pathlib.Path(mlx_stump.__file__).as_posix(), mlx_stump.__file__
           PY
           "${RUNNER_TEMP}/wheel-venv/bin/python" -m pytest tests/ -q
+      - name: Check that the sdist's bundled tests are self-contained
+        run: |
+          mkdir -p "${RUNNER_TEMP}/sdist"
+          tar xzf dist/*.tar.gz -C "${RUNNER_TEMP}/sdist"
+          cd "${RUNNER_TEMP}"/sdist/mlx_stump-*
+          "${RUNNER_TEMP}/wheel-venv/bin/python" -m pytest tests -q -p no:cacheprovider
       - uses: actions/upload-artifact@v4
         with:
           name: dist

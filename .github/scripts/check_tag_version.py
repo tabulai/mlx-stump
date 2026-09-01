@@ -1,17 +1,18 @@
-"""Refuse to release unless the pushed tag names the packaged version.
+"""Refuse to release unless the requested release names the packaged version.
 
 Usage::
 
     python .github/scripts/check_tag_version.py v0.1.0
 
-Exits 0 when the tag is exactly ``"v" + __version__`` (as declared in
+The argument is the tag the release workflow will create (``v<version>``).
+Exits 0 when it is exactly ``"v" + __version__`` (as declared in
 ``src/mlx_stump/__init__.py``), the version is in canonical PEP 440 form
 (what hatchling and PyPI would publish it as — ``0.1.0.DEV0`` or
 ``0.1.0-rc1`` would be normalized to something the tag does not name), and
 it is publishable (no ``.devN`` or ``+local`` segment); exits 1 with an
-explanation otherwise. Without this guard any ``v*`` tag would publish
-whatever version happens to be in the tree — e.g. tagging ``v0.1.0`` while
-the package still says ``0.1.0.dev0``.
+explanation otherwise. Without this guard a release request would publish
+whatever version happens to be in the tree — e.g. asking for ``0.1.0``
+while the package still says ``0.1.0.dev0``.
 """
 
 from __future__ import annotations

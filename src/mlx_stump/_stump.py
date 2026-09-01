@@ -8,6 +8,7 @@ import mlx.core as mx
 import numpy as np
 
 from ._engine import (
+    _REFINE_MEM_BUDGET,  # noqa: F401 - re-exported for tests that monkeypatch it here
     MassEngine,
     ReduceStep,
     default_chunk_size,
@@ -24,9 +25,6 @@ from ._preprocess import (
 )
 
 _INF = float("inf")
-# byte budget for the float64 window copies held live by one refinement chunk
-# (two fancy-indexed window blocks plus their centered copies)
-_REFINE_MEM_BUDGET = 1 << 28  # ~256 MiB
 # matches stumpy.config.STUMPY_P_NORM_THRESHOLD: squared distances below this
 # snap to exactly 0.0, so exact-duplicate subsequences report P == 0.0
 P_NORM_THRESHOLD = 1e-14
@@ -451,7 +449,7 @@ def stump(
 
     # float64 re-evaluation of the profile values at the chosen indices
     refine = _refine_znorm if normalize else _refine_absolute
-    P = np.empty_like(P32)
+    P = P32  # refined in place: the float32-derived values are not needed again
     for j in range(k):
         P[:, j] = refine(A, Bs, I[:, j])
     if k > 1:

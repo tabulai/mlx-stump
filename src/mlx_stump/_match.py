@@ -6,7 +6,7 @@ import warnings
 
 import numpy as np
 
-from ._mass import _as_flag, _check_stats, mass
+from ._mass import _as_flag, mass
 from ._preprocess import (
     EXCL_ZONE_DENOM,
     process_isconstant,
@@ -20,7 +20,7 @@ from ._stump import _refine_chunk_rows
 _MAX_REFINE_ROUNDS = 8
 
 
-def _refine_candidates(Q, T, js, normalize, q_const, t_const, Σ_T=None):
+def _refine_candidates(Q, T, js, normalize, q_const, t_const):
     """Float64 re-evaluation of the finite profile entries ``js``.
 
     The GPU profile is float32, so a perfect occurrence reads ~1e-3 instead
@@ -30,24 +30,21 @@ def _refine_candidates(Q, T, js, normalize, q_const, t_const, Σ_T=None):
 
     Candidates are processed in byte-budgeted chunks (``max_distance=inf``
     selects the whole profile, which must not materialize l*m float64
-    windows at once). Every target window is centered by its own exact
-    two-pass mean (shifted by its first element first, so a large common
-    offset cannot poison the mean): the `W@Q - m*mu_t*mu_q` form cancels
-    catastrophically for near-constant windows at an offset, even in
-    float64. With exact stats the squared distance is the sum of squared
-    differences of the two z-normalized windows (cancellation-free down to
-    0); with a user-supplied ``Σ_T`` it is STUMPY's ``2m(1 - rho)`` with
-    ``rho = cov / (m*sigma_q*Σ_T)`` from that same exact centered
-    covariance, so the user's per-window scale is honored without the
-    cancellation; ``Σ_T``'s own relative rounding ``delta`` then surfaces
-    as a floor of ``sqrt(2m*delta)`` on near-perfect matches, so windows
-    bitwise-identical to ``Q`` are snapped to 0 (their distance is 0 by
-    definition). ``q_const``/``t_const`` are the resolved constant flags
-    (including any user overrides), applied exactly like the GPU path
-    applies them. Unlike ``stump``, no P-norm zero-snap is applied: STUMPY's
-    mass/match report raw float64 distances (exact duplicates still read
-    0.0 in the exact-stats branch because the sum of squares is exactly 0
-    for identical normalized windows).
+    windows at once). Every window is centered by its own exact two-pass
+    mean (shifted by its first element first, so a large common offset
+    cannot poison the mean) and scaled by its own exact sigma: the squared
+    distance is the sum of squared differences of the two z-normalized
+    windows, cancellation-free down to 0. The `W@Q - m*mu_t*mu_q` form
+    cancels catastrophically for near-constant windows at an offset, even
+    in float64, and any form built on an externally supplied sigma leaves
+    that sigma's rounding as a floor on perfect matches — so cached
+    statistics passed to ``match`` are never used here (see ``mass``).
+    ``q_const``/``t_const`` are the resolved constant flags (including any
+    user overrides), applied exactly like the GPU path applies them.
+    Unlike ``stump``, no P-norm zero-snap is applied: STUMPY's mass/match
+    report raw float64 distances (exact and shifted duplicates still read
+    0.0 because the sum of squares is exactly 0 for identical normalized
+    windows).
     """
     js = np.asarray(js, dtype=np.int64)
     out = np.empty(js.size, dtype=np.float64)
@@ -58,42 +55,30 @@ def _refine_candidates(Q, T, js, normalize, q_const, t_const, Σ_T=None):
     if normalize:
         Wfull = np.lib.stride_tricks.sliding_window_view(T, m)
         # shift by the first element: `x - x0` errs with the window's SPREAD,
-        # so a large common offset cannot poison the two-pass mean below
-        Qs = Q - Q[0]
-        Qc = Qs - Qs.mean()
-        sig_q = float(np.sqrt(Qc @ Qc / m))
+        # so a large common offset cannot poison the two-pass mean below.
+        # The query goes through the same 2-D reductions as the windows:
+        # numpy's 1-D mean/dot can differ from the axis-1 versions by an ulp
+        # on identical data, which left exact duplicates at ~2e-15, not 0
+        Qw = Q[None, :] - Q[0]
+        Qw -= Qw.mean(axis=1)[:, None]
+        sig_q = float(np.sqrt(np.einsum("ij,ij->i", Qw, Qw)[0] / m))
         sig_inv_q = 0.0 if (q_const or sig_q == 0.0) else 1.0 / sig_q
-        u = Qc * sig_inv_q
+        u = Qw[0] * sig_inv_q
         for s in range(0, js.size, chunk):
             idx = js[s : s + chunk]
             W = Wfull[idx].astype(np.float64)
             tc = t_const[idx]
-            if Σ_T is not None:
-                # a window bitwise-identical to Q is at distance 0 by
-                # definition; under the user's Σ_T the 2m(1 - rho) form
-                # below would report sqrt(2m*delta) for Σ_T's own relative
-                # rounding delta instead (8e-4 at offset 1e12 with STUMPY's
-                # compute_mean_std, 0.06 at 1e14)
-                dup = np.all(W == Q[None, :], axis=1)
             W -= W[:, 0].copy()[:, None]
             W -= W.mean(axis=1)[:, None]
-            if Σ_T is not None:
-                sig_t = Σ_T[idx]
-                pos = (sig_t > 0.0) & ~tc & (sig_inv_q > 0.0)
-                denom = np.where(pos, m * sig_q * sig_t, 1.0)
-                rho = (W @ Qc) / denom
-                d2 = np.where(pos, np.maximum(2.0 * m * (1.0 - rho), 0.0), 2.0 * m)
-                d2[dup] = 0.0
-            else:
-                sig_t = np.sqrt(np.einsum("ij,ij->i", W, W) / m)
-                pos = (sig_t > 0.0) & ~tc
-                sig_inv_t = np.where(pos, 1.0 / np.where(sig_t > 0.0, sig_t, 1.0), 0.0)
-                W *= sig_inv_t[:, None]
-                W -= u[None, :]
-                d2 = np.einsum("ij,ij->i", W, W)
-                # zero sig_inv on either side means rho == 0 on the GPU;
-                # mirror it, the constant-flag rules overwrite as needed
-                d2 = np.where((sig_inv_t == 0.0) | (sig_inv_q == 0.0), 2.0 * m, d2)
+            sig_t = np.sqrt(np.einsum("ij,ij->i", W, W) / m)
+            pos = (sig_t > 0.0) & ~tc
+            sig_inv_t = np.where(pos, 1.0 / np.where(sig_t > 0.0, sig_t, 1.0), 0.0)
+            W *= sig_inv_t[:, None]
+            W -= u[None, :]
+            d2 = np.einsum("ij,ij->i", W, W)
+            # zero sig_inv on either side means rho == 0 on the GPU; mirror
+            # it, the constant-flag rules overwrite as needed
+            d2 = np.where((sig_inv_t == 0.0) | (sig_inv_q == 0.0), 2.0 * m, d2)
             d = np.sqrt(d2)
             out[s : s + chunk] = np.where(q_const & tc, 0.0, np.where(q_const ^ tc, np.sqrt(m), d))
     else:
@@ -186,8 +171,10 @@ def match(
     so the threshold that selects the matches comes from a profile that is
     float64-exact throughout the threshold band.
     ``normalize=False`` supports ``p=2.0`` only. Precomputed ``M_T``/``Σ_T``
-    follow the ``mass`` contract (``Σ_T`` honored as the per-window scale,
-    ``M_T`` validated; windows are centered by their own exact mean).
+    follow the ``mass`` contract: they are a cache, validated and otherwise
+    unused (an infinite ``M_T`` marks its window non-finite); the search
+    and the refinement use exact statistics, so the result equals the
+    no-stats call.
     """
     Q = np.asarray(Q)
     if Q.ndim == 2 and Q.shape[1] == 1:
@@ -226,9 +213,6 @@ def match(
         warnings.simplefilter("ignore")
         t_const = process_isconstant(T_nan, m, T_subseq_isconstant, "T_subseq_isconstant")
     t_const &= rolling_isfinite(np.isfinite(Tf), m)
-    Σ_user = None
-    if normalize and M_T is not None and Σ_T is not None:
-        _, Σ_user = _check_stats(M_T, Σ_T, l)
 
     fixed = isinstance(max_distance, (int, float, np.integer, np.floating)) and not isinstance(
         max_distance, (bool, np.bool_)
@@ -262,22 +246,6 @@ def match(
         _, sig_t_raw = rolling_mean_sigma(np.where(np.isfinite(Tf), Tf, 0.0), m)
         noise = 3.0 * np.sqrt(np.finfo(np.float32).eps * m)
         margin = margin * scale + noise * (sig_t_raw + float(Qf.std()))
-    if Σ_user is not None:
-        # a user Σ_T carries its own relative rounding delta, which STUMPY's
-        # 2m(1 - rho) form turns into a floor of sqrt(2m*delta) on perfect
-        # matches (GPU search and refinement alike); widen each window's
-        # cutoff by that floor so a bitwise duplicate is still re-evaluated
-        # (and snapped to 0) when the threshold is tighter than the floor.
-        # The exact sigma is taken on the series shifted into the bulk of its
-        # values, where the two-pass mean is not rounded at eps*offset.
-        finite_t = np.isfinite(Tf)
-        shift = float(np.median(Tf[finite_t])) if finite_t.any() else 0.0
-        _, sig_exact = rolling_mean_sigma(np.where(finite_t, Tf - shift, 0.0), m)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            ratio = np.where((Σ_user > 0.0) & (sig_exact > 0.0), sig_exact / Σ_user, 1.0)
-        delta = np.abs(1.0 - ratio)
-        delta[~np.isfinite(delta)] = 0.0
-        margin = margin + np.sqrt(2.0 * m * delta)
 
     refined = np.zeros(l, dtype=bool)
     if query_idx is not None:
@@ -288,7 +256,7 @@ def match(
     def _refine_upto(cutoff) -> int:
         js = np.nonzero((D <= cutoff) & np.isfinite(D) & ~refined)[0]
         if js.size:
-            D[js] = _refine_candidates(Qf, Tf, js, normalize, q_const, t_const, Σ_user)
+            D[js] = _refine_candidates(Qf, Tf, js, normalize, q_const, t_const)
             refined[js] = True
         return int(js.size)
 

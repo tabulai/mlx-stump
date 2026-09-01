@@ -391,20 +391,27 @@ def test_aamp_extreme_spike_match_not_dropped():
     assert sorted(int(i) for _, i in M) == sorted(int(i) for _, i in Mr) == [50_000, 300_000]
 
 
-def test_match_precomputed_stats_honored_in_refinement():
-    """A user-supplied Σ_T is the per-window scale of the distance (here a
-    deliberately doubled one), in the float32 search and the float64
-    refinement alike; the refinement used to silently recompute exact
-    stats and report a hybrid profile. (M_T is validated but does not enter
-    the covariance — see test_third_review_fixes.py.)"""
+def test_match_precomputed_stats_are_a_cache():
+    """Cached M_T/Σ_T are validated and otherwise unused — the float32 search
+    and the float64 refinement both use exact statistics, so there is no
+    hybrid profile (the refinement once recomputed exact stats while the
+    search ranked by the supplied ones). STUMPY's own compute_mean_std
+    output reproduces STUMPY's ranking; a deliberately doubled Σ_T changes
+    STUMPY's result and not this one (the documented divergence)."""
     rng = np.random.default_rng(12)
     T = rng.standard_normal(400)
     Q = rng.standard_normal(21)
     M_T, Σ_T = stumpy.core.compute_mean_std(T, 21)
-    M = mlx_stump.match(Q, T, M_T=M_T, Σ_T=Σ_T * 2.0, max_distance=float("inf"), max_matches=5)
-    Mr = stumpy.match(Q, T, M_T=M_T, Σ_T=Σ_T * 2.0, max_distance=float("inf"), max_matches=5)
+    kw = dict(max_distance=float("inf"), max_matches=5)
+    M = mlx_stump.match(Q, T, M_T=M_T, Σ_T=Σ_T, **kw)
+    Mr = stumpy.match(Q, T, M_T=M_T, Σ_T=Σ_T, **kw)
     np.testing.assert_array_equal(M[:, 1].astype(int), Mr[:, 1].astype(int))
     np.testing.assert_allclose(M[:, 0].astype(float), Mr[:, 0].astype(float), atol=1e-9)
+    M2 = mlx_stump.match(Q, T, M_T=M_T, Σ_T=Σ_T * 2.0, **kw)
+    M0 = mlx_stump.match(Q, T, **kw)
+    np.testing.assert_array_equal(M2.astype(float), M0.astype(float))
+    Mr2 = stumpy.match(Q, T, M_T=M_T, Σ_T=Σ_T * 2.0, **kw)
+    assert not np.allclose(Mr2[:, 0].astype(float), Mr[:, 0].astype(float))
 
 
 def test_dynamic_range_warning():
