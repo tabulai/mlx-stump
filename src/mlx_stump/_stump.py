@@ -9,8 +9,8 @@ import numpy as np
 
 from ._engine import (
     MassEngine,
+    ReduceStep,
     default_chunk_size,
-    make_reduce_step,
     query_windows,
     tiled_chunk_size,
 )
@@ -129,15 +129,18 @@ def _refine_absolute(
     return out
 
 
-def _topk_chunk(D: mx.array, k: int, l: int):
-    """Per-row k smallest distances (ascending) and their column indices."""
-    kk = min(k, l)
-    part = mx.argpartition(D, kth=kk - 1, axis=1)[:, :kk]
-    vals = mx.take_along_axis(D, part, axis=1)
-    order = mx.argsort(vals, axis=1)
-    vals = mx.take_along_axis(vals, order, axis=1)
-    idxs = mx.take_along_axis(part, order, axis=1)
-    return vals, idxs
+def _batches(l_q: int, B: int):
+    """Yield ``(s0, s, e)``: rows ``[s, e)`` are the batch's output rows, computed
+    over ``[s0, e)`` with ``s0 <= s`` so that every batch has the same width
+    ``B`` (whenever ``l_q >= B``). A narrower trailing batch would allocate a
+    second, differently sized set of intermediates that MLX's buffer cache
+    cannot reuse (up to another full budget retained after the call), and at
+    width 1 would dispatch a GEMV-shaped kernel whose float32 accumulation
+    order differs from the batched GEMM. Recomputing ``s - s0`` rows once
+    costs less than one batch."""
+    for s in range(0, l_q, B):
+        e = min(s + B, l_q)
+        yield max(0, e - B), s, e
 
 
 def _merge_topk(run_vals, run_idxs, blk_vals, blk_idxs, k):
@@ -180,79 +183,59 @@ def _compute_profile_tiled(
         rIl = np.full(l_q, -1, dtype=np.int64)
         rPr2 = np.full(l_q, np.inf, dtype=np.float32)
         rIr = np.full(l_q, -1, dtype=np.int64)
-    else:
+    elif k == 1:
         rP2 = np.full(l_q, np.inf, dtype=np.float32)
         rI = np.full(l_q, -1, dtype=np.int64)
     if k > 1:
         rPk2 = np.full((l_q, k), np.inf, dtype=np.float32)
         rIk = np.full((l_q, k), -1, dtype=np.int64)
 
+    step = ReduceStep(engine, normalize=normalize, self_join=self_join, excl=excl, k=k)
     for j0, j1, W in engine.target_blocks():
         j_row = mx.arange(j0, j1)[None, :]
-        for s in range(0, l_q, B):
-            e = min(s + B, l_q)
-            Q = query_windows(query, s, e)
-            QT = mx.matmul(Q, W)
+        for s0, s, e in _batches(l_q, B):
+            off = s - s0
+            Q = query_windows(query, s0, e)
             if normalize:
-                D2 = engine.znorm_sq_distances(
-                    QT,
-                    query.sig_inv_mx[s:e],
-                    query.isconstant_mx[s:e],
-                    query.isfinite_mx[s:e],
-                    j0,
-                    j1,
-                )
+                a, b = query.sig_inv_mx[s0:e], query.isconstant_mx[s0:e]
             else:
-                D2 = engine.absolute_sq_distances(
-                    QT, query.ssq_mx[s:e], query.mu_mx[s:e], query.isfinite_mx[s:e], j0, j1
-                )
-            i_col = mx.arange(s, e)[:, None]
-
-            outs = []
-            if self_join:
-                dl = mx.where(j_row <= i_col - (excl + 1), D2, _INF)
-                pl2 = mx.min(dl, axis=1)
-                il = mx.argmin(dl, axis=1)
-                dr = mx.where(j_row >= i_col + (excl + 1), D2, _INF)
-                pr2 = mx.min(dr, axis=1)
-                ir = mx.argmin(dr, axis=1)
-                outs += [pl2, il, pr2, ir]
-            else:
-                p2 = mx.min(D2, axis=1)
-                ii = mx.argmin(D2, axis=1)
-                outs += [p2, ii]
-            if k > 1:
-                Dm = mx.where(mx.abs(i_col - j_row) <= excl, _INF, D2) if self_join else D2
-                vals2, idxs = _topk_chunk(Dm, k, j1 - j0)
-                outs += [vals2, idxs]
+                a, b = query.ssq_mx[s0:e], query.mu_mx[s0:e]
+            i_col = mx.arange(s0, e)[:, None]
+            outs = step.block(mx.matmul(Q, W), a, b, query.isfinite_mx[s0:e], i_col, j0, j1, j_row)
             mx.eval(*outs)
+            # wait for the command buffer's completion handler as well: it is
+            # what returns this batch's buffers to the allocator, and without
+            # it the next batch can allocate a second set (2x the budget)
+            mx.synchronize()
 
             if self_join:
-                pl2 = np.array(outs[0])
-                il = np.array(outs[1], dtype=np.int64) + j0
+                # k == 1: (I, P2, Il, Pl2, Ir, Pr2); k > 1: (vals2, idxs, Il, Pl2, Ir, Pr2)
+                pl2 = np.array(outs[3])[off:]
+                il = np.array(outs[2], dtype=np.int64)[off:] + j0
                 upd = pl2 < rPl2[s:e]
                 rPl2[s:e][upd] = pl2[upd]
                 rIl[s:e][upd] = il[upd]
-                pr2 = np.array(outs[2])
-                ir = np.array(outs[3], dtype=np.int64) + j0
+                pr2 = np.array(outs[5])[off:]
+                ir = np.array(outs[4], dtype=np.int64)[off:] + j0
                 upd = pr2 < rPr2[s:e]
                 rPr2[s:e][upd] = pr2[upd]
                 rIr[s:e][upd] = ir[upd]
-            else:
-                p2 = np.array(outs[0])
-                ii = np.array(outs[1], dtype=np.int64) + j0
+            elif k == 1:
+                p2 = np.array(outs[1])[off:]
+                ii = np.array(outs[0], dtype=np.int64)[off:] + j0
                 upd = p2 < rP2[s:e]
                 rP2[s:e][upd] = p2[upd]
                 rI[s:e][upd] = ii[upd]
             if k > 1:
-                v = np.array(outs[-2])
-                ix = np.array(outs[-1], dtype=np.int64) + j0
+                v = np.array(outs[0])[off:]
+                ix = np.array(outs[1], dtype=np.int64)[off:] + j0
                 ix[~np.isfinite(v)] = -1
                 if v.shape[1] < k:
                     pad = k - v.shape[1]
                     v = np.pad(v, ((0, 0), (0, pad)), constant_values=np.inf)
                     ix = np.pad(ix, ((0, 0), (0, pad)), constant_values=-1)
                 rPk2[s:e], rIk[s:e] = _merge_topk(rPk2[s:e], rIk[s:e], v, ix, k)
+        del W  # release this block before the generator builds the next one
 
     if self_join:
         pl2 = rPl2.astype(np.float64)
@@ -263,7 +246,7 @@ def _compute_profile_tiled(
         left_better = pl2 <= pr2
         p2_min = np.where(left_better, pl2, pr2)
         I_min = np.where(left_better, rIl, rIr)
-    else:
+    elif k == 1:
         p2_min = rP2.astype(np.float64)
         I_min = rI
 
@@ -299,7 +282,6 @@ def _compute_profile(
         )
     m = query.m
     l_q = query.l
-    l_t = engine.l
     excl = int(np.ceil(m / EXCL_ZONE_DENOM))
     B = chunk_size or default_chunk_size(engine, l_q, k, self_join)
 
@@ -308,81 +290,37 @@ def _compute_profile(
     IL = np.full(l_q, -1, dtype=np.int64)
     IR = np.full(l_q, -1, dtype=np.int64)
 
-    if k == 1:
-        # fused compiled path: squared distances + argmin in one graph
-        step = make_reduce_step(engine, normalize=normalize, self_join=self_join, excl=excl)
-        for s in range(0, l_q, B):
-            e = min(s + B, l_q)
-            Q = query_windows(query, s, e)
-            QT = engine.sliding_dot_products(Q)
-            if normalize:
-                a, b = query.sig_inv_mx[s:e], query.isconstant_mx[s:e]
-            else:
-                a, b = query.ssq_mx[s:e], query.mu_mx[s:e]
-            outs = step(
-                QT,
-                a,
-                b,
-                query.isfinite_mx[s:e],
-                mx.arange(s, e)[:, None],
-            )
-            mx.eval(*outs)
-            p2 = np.array(outs[1], dtype=np.float64)
-            P[s:e, 0] = np.sqrt(p2)
-            I[s:e, 0] = np.where(np.isfinite(p2), np.array(outs[0], dtype=np.int64), -1)
-            if self_join:
-                pl2 = np.array(outs[3], dtype=np.float64)
-                IL[s:e] = np.where(np.isfinite(pl2), np.array(outs[2], dtype=np.int64), -1)
-                pr2 = np.array(outs[5], dtype=np.float64)
-                IR[s:e] = np.where(np.isfinite(pr2), np.array(outs[4], dtype=np.int64), -1)
-        return P, I, IL, IR
-
-    j_row = mx.arange(l_t)[None, :]
-    for s in range(0, l_q, B):
-        e = min(s + B, l_q)
-        Q = query_windows(query, s, e)
+    step = ReduceStep(engine, normalize=normalize, self_join=self_join, excl=excl, k=k)
+    for s0, s, e in _batches(l_q, B):
+        off = s - s0
+        Q = query_windows(query, s0, e)
         QT = engine.sliding_dot_products(Q)
         if normalize:
-            D2 = engine.znorm_sq_distances(
-                QT,
-                query.sig_inv_mx[s:e],
-                query.isconstant_mx[s:e],
-                query.isfinite_mx[s:e],
-            )
+            a, b = query.sig_inv_mx[s0:e], query.isconstant_mx[s0:e]
         else:
-            D2 = engine.absolute_sq_distances(
-                QT, query.ssq_mx[s:e], query.mu_mx[s:e], query.isfinite_mx[s:e]
-            )
-
-        i_col = mx.arange(s, e)[:, None]
-        if self_join:
-            D2 = mx.where(mx.abs(i_col - j_row) <= excl, _INF, D2)
-            Dl = mx.where(j_row <= i_col - (excl + 1), D2, _INF)
-            Pl2 = mx.min(Dl, axis=1)
-            Il = mx.argmin(Dl, axis=1)
-            Dr = mx.where(j_row >= i_col + (excl + 1), D2, _INF)
-            Pr2 = mx.min(Dr, axis=1)
-            Ir = mx.argmin(Dr, axis=1)
-
-        vals2, idxs = _topk_chunk(D2, k, l_t)
-        outs = [vals2, idxs] + ([Pl2, Il, Pr2, Ir] if self_join else [])
+            a, b = query.ssq_mx[s0:e], query.mu_mx[s0:e]
+        outs = step.full(QT, a, b, query.isfinite_mx[s0:e], mx.arange(s0, e)[:, None])
         mx.eval(*outs)
-
-        v = np.sqrt(np.array(vals2, dtype=np.float64))
-        ix = np.array(idxs, dtype=np.int64)
-        ix[~np.isfinite(v)] = -1
-        kk = v.shape[1]
-        P[s:e, :kk] = v
-        I[s:e, :kk] = ix
-        if kk < k:
-            P[s:e, kk:] = np.inf
-            I[s:e, kk:] = -1
+        mx.synchronize()  # see _compute_profile_tiled: releases this batch's buffers
+        if k == 1:
+            p2 = np.array(outs[1], dtype=np.float64)[off:]
+            P[s:e, 0] = np.sqrt(p2)
+            I[s:e, 0] = np.where(np.isfinite(p2), np.array(outs[0], dtype=np.int64)[off:], -1)
+        else:
+            v = np.sqrt(np.array(outs[0], dtype=np.float64)[off:])
+            ix = np.array(outs[1], dtype=np.int64)[off:]
+            ix[~np.isfinite(v)] = -1
+            kk = v.shape[1]
+            P[s:e, :kk] = v
+            I[s:e, :kk] = ix
+            if kk < k:
+                P[s:e, kk:] = np.inf
+                I[s:e, kk:] = -1
         if self_join:
-            pl2 = np.array(Pl2, dtype=np.float64)
-            IL[s:e] = np.where(np.isfinite(pl2), np.array(Il, dtype=np.int64), -1)
-            pr2 = np.array(Pr2, dtype=np.float64)
-            IR[s:e] = np.where(np.isfinite(pr2), np.array(Ir, dtype=np.int64), -1)
-
+            pl2 = np.array(outs[3], dtype=np.float64)[off:]
+            IL[s:e] = np.where(np.isfinite(pl2), np.array(outs[2], dtype=np.int64)[off:], -1)
+            pr2 = np.array(outs[5], dtype=np.float64)[off:]
+            IR[s:e] = np.where(np.isfinite(pr2), np.array(outs[4], dtype=np.int64)[off:], -1)
     return P, I, IL, IR
 
 
@@ -410,7 +348,10 @@ def stump(
     ``normalize=False`` computes the non-normalized (aamp-style) profile and
     supports ``p=2.0`` only. ``chunk_size`` is the number of distance
     profiles evaluated per GPU batch; when omitted it is chosen so the live
-    per-batch intermediates stay under a ~384 MiB budget.
+    per-batch intermediates stay under a ~384 MiB budget. Results do not
+    depend on it, except that ``chunk_size=1`` dispatches a matrix-vector
+    kernel whose float32 accumulation order differs from the batched one and
+    can resolve near-ties to a different, equally close neighbor.
     """
     T_A = check_series(T_A, "T_A")
     if not (isinstance(k, (int, np.integer)) and k >= 1):
@@ -499,6 +440,12 @@ def stump(
     P32, I, IL, IR = _compute_profile(
         A, engine, self_join=self_join, normalize=normalize, k=k, chunk_size=chunk_size
     )
+    # the sweep is over: drop the window matrix and return the batch buffers
+    # MLX cached for it to the system before the CPU refinement allocates its
+    # float64 chunks, so the documented ceiling holds one phase at a time and
+    # nothing stays cached after the call
+    del engine
+    mx.clear_cache()
 
     # float64 re-evaluation of the profile values at the chosen indices
     refine = _refine_znorm if normalize else _refine_absolute

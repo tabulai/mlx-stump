@@ -24,7 +24,7 @@ classification on the same silicon.
 ## Status
 
 **v0.1 development — the batched-MASS engine is implemented and golden-tested
-against STUMPY** (129 golden and regression tests). Distance profiles are
+against STUMPY** (200 golden and regression tests). Distance profiles are
 computed in bulk on the GPU as dense matmuls against the doubly-centered
 subsequence matrix — materialized in one piece for moderate `n*m`, streamed
 as column blocks beyond that — with a fused `mx.compile` distance+argmin
@@ -46,6 +46,14 @@ pip install .
 Requires macOS on Apple Silicon and Python ≥ 3.10. `stumpy` (≥ 1.13) is an
 optional extra used only for golden tests and CPU benchmarking (`pip install
 ".[dev]"`).
+
+### Releasing (maintainers)
+
+Pushing a `v<version>` tag builds the wheel and sdist, tests the *built
+wheel* in a clean environment, and publishes to PyPI via trusted publishing.
+The workflow refuses a tag that does not exactly match `__version__` in
+`src/mlx_stump/__init__.py`, and refuses `.dev`/local versions — so bump the
+version (e.g. to `0.1.0`), commit, then tag `v0.1.0`.
 
 ## Quickstart
 
@@ -91,7 +99,9 @@ error negligible in practice by:
    length (the streamed column blocks of the large-`n` path are centered
    identically). The non-normalized (`aamp`) profile uses the same
    centering — `d² = ‖q_c − t_c‖² + m·(μ_q − μ_t)²` — so mixed-scale data
-   doesn't hit the `ssq_q + ssq_t − 2·QT` cancellation either. Each profile
+   doesn't hit the `ssq_q + ssq_t − 2·QT` cancellation either, and the
+   window means travel to the GPU as float32 (hi, lo) pairs so their
+   difference is not limited to the ulp of the global offset. Each profile
    also comes from a fresh product rather than a long floating-point
    recurrence, so error does not accumulate along the series.
 4. **Float64 refinement** — profile values at the chosen indices are
@@ -99,7 +109,10 @@ error negligible in practice by:
    sums of squared differences of the z-normalized windows, with each
    window's mean and sigma recomputed exactly two-pass — a cancellation-free
    form that stays relatively accurate down to distance 0 — so reported `P`
-   values are float64-exact for the reported neighbor.
+   values are float64-exact for the reported neighbor. `match` refines every
+   candidate near its threshold the same way (with a user-supplied `Σ_T`,
+   STUMPY's `2m(1 − ρ)` is formed from that exact centered covariance and
+   the user's scale, never from `QT − m·μ_Q·M_T`).
 5. **STUMPY-exact semantics** for constant subsequences, NaN/inf handling,
    exclusion zones, and left/right profiles, verified by a golden test suite
    that compares every code path against float64 STUMPY.
@@ -140,6 +153,11 @@ The MASS engine does O(m) work per distance-matrix cell where STUMPY's
 recurrence does O(1), so the current speedup is structural, not a tuning
 gap — the planned diagonal Metal kernel removes that factor. At `m=50` the
 same benchmark shows 1.7x with 100% index agreement and max |ΔP| of 1.5e-08.
+Above a 256 MiB subsequence matrix (n ≈ 335k at `m=200`) the target is
+streamed in 128 MiB column blocks through the same compiled kernel: at
+n=524,288 that path measured as fast as or faster than the dense sweep
+(47.7 s vs 47.9 s in one run, 38.8 s vs 52.8 s in another), at about half
+the peak memory.
 
 Run them yourself:
 
@@ -177,33 +195,94 @@ python bench/bench_stump.py --sizes 16384 65536 262144 --m 200
 - A raw `mass` profile is the float32 GPU result: near-perfect matches read
   ~1e-3 rather than ~1e-8. `stump` and `match` re-evaluate their reported
   distances in float64, so their outputs don't carry this floor.
-- Live per-batch GPU intermediates are kept under a ~384 MiB budget (an
-  enforced ceiling, including the top-k buffers for `k > 1`); when the
-  subsequence matrix would exceed ~512 MiB it is streamed as ~256 MiB
-  column blocks with identical numerics. Pass `chunk_size` to trade memory
-  for larger batches.
+- Memory is bounded by three fixed budgets rather than by `n·m`: the
+  resident window block (the whole float32 subsequence matrix when it is
+  ≤ 256 MiB, otherwise ~128 MiB column blocks, at least four windows wide,
+  streamed one at a time — same compiled kernel, bit-identical numerics,
+  measured as fast as or faster than the dense sweep), ~384 MiB of live
+  per-batch GPU intermediates (an enforced ceiling, including the top-k
+  buffers for `k > 1`: each batch is synchronized before the next one
+  allocates, and the trailing batch is computed at full width so no second
+  set of buffers ever exists), and ≤ 64 MiB float64 CPU temporaries per
+  stage (block centering, sigma repair; the refinement chunk is ≤ 256 MiB
+  and runs after the window matrix and MLX's cached batch buffers have been
+  released). Each block exists twice while it is uploaded (numpy staging
+  plus the device copy), so the process-wide ceiling for one call is about
+  `2·block + 64 MiB` during upload or `block + 384 MiB` during the sweep,
+  plus the O(n) per-series arrays — ~640 MiB for the largest dense block,
+  ~512 MiB in tiled mode (`mlx_stump._engine.estimated_peak_bytes` gives
+  the number for a given `l`, `m`; measured with MLX's own peak counter
+  plus host RSS — note that GPU-written buffers do not show up in RSS on
+  macOS, only in the process footprint). `mass`/`match` evaluate one block
+  at a time and never hold more, and nothing stays cached in MLX after a
+  call returns. Pass `chunk_size` to trade memory for larger batches.
 - Out-of-range `query_idx` values (including negative ones) raise
   `ValueError`. STUMPY silently wraps `query_idx <= -m` through numpy
   negative indexing and fabricates a zero-distance match at a negative
-  index; rejecting is a deliberate, stricter divergence.
-- A callable `max_distance` passed to `match` is invoked twice (once on the
-  float32 profile, once on the float64-refined one); STUMPY calls it once on
-  its exact profile.
+  index; rejecting is a deliberate, stricter divergence. With
+  `normalize=False`, `match` zeroes `D[query_idx]` the way
+  `stumpy.mass_absolute` does (when the window is finite); `stumpy.aamp_match`
+  leaves that entry at its true distance, so a *mismatched* `query_idx`
+  yields a zero-distance first match here and an empty result there.
+- A data-dependent `max_distance` in `match` (the default, or a callable)
+  is evaluated on successively refined profiles until it stops moving —
+  the float32 profile first, then once per float64 refinement round,
+  typically 2–3 calls in total and at most 9 — so the threshold that
+  selects the matches comes from a profile that is float64-exact
+  throughout the threshold band. STUMPY calls it once, on its exact
+  profile; a callable with side effects would observe the difference.
+- Precomputed `M_T`/`Σ_T` for `mass`/`match`: `Σ_T` is honored as the
+  per-window scale of the distance (STUMPY's ranking is reproduced from its
+  own `compute_mean_std` output), and a window with non-finite stats is
+  reported as inf, but `M_T` does not enter the covariance — every window
+  is centered by its own exact float64 mean, because STUMPY's
+  `QT − m·μ_Q·M_T` form amplifies `M_T`'s rounding by `(μ/σ)²` and collapses
+  on offset data (self-match errors up to ~0.1 at offset 1e6, seed-dependent,
+  and a meaningless ranking at 1e9). A deliberately biased `M_T` therefore
+  changes nothing here, whereas it changes STUMPY's result. With a
+  user-supplied `Σ_T`, a perfect match is reported through `2m(1 − ρ)` and
+  can read up to ~`sqrt(2m·ε)` (≈ 1e-7) rather than exactly 0, like STUMPY;
+  the exact-stats path reports exactly 0.
+- `Q_subseq_isconstant` must be a boolean (Python/NumPy bool, or a boolean
+  array of size 1): non-boolean values such as `"False"` or `0` raise
+  `ValueError` rather than being coerced. Plain booleans and boolean *lists*
+  (for the `T_*_subseq_isconstant` arrays) are a leniency — STUMPY accepts
+  only an `np.ndarray` there.
 - A window whose sigma is 0 without being flagged constant — a truly
   constant window that a user flag array marks non-constant, or a
-  user-supplied `Σ_T` entry of 0 on a non-constant window — is ranked and
-  reported at `sqrt(2m)` (its `1/σ` is taken as 0, so `ρ = 0`). STUMPY's
-  denominator clamp yields a different convention (0 or a huge value) for
-  the same undefined quantity.
+  user-supplied `Σ_T` entry that is 0 (or negative) on a non-constant
+  window — is ranked and reported at `sqrt(2m)` (its `1/σ` is taken as 0,
+  so `ρ = 0`). STUMPY's denominator clamp yields a different convention
+  (0 or a huge value) for the same undefined quantity.
 - With `normalize=False`, a `T_subseq_isfinite` override marking a
   NaN-containing window as finite computes its distance against the
   zero-filled series; STUMPY propagates NaN there.
-- `normalize=False` searches in float32: within one series, an amplitude
-  dynamic range beyond ~1e7 between segments can push the search noise for
-  windows overlapping the extreme segment past near-tie level (reported `P`
-  stays float64-exact for the chosen neighbor, and `match` widens its
-  re-evaluation cutoff per-window so true matches are not dropped). STUMPY's
-  CPU `aamp` computes in float64 and is exact there.
+- `normalize=False` searches in float32, and its neighbor choice is not
+  identical to STUMPY's `aamp` on mixed-scale data: with a 1e5 constant
+  segment in unit noise (`m=7`) index agreement is ~83%, with a 1e6 offset
+  segment in a random walk (`m=50`) ~99%. Most of those disagreements are
+  exact ties (identical constant windows, where the chosen index is
+  arbitrary on both sides); every one is a float32 near-tie *relative to
+  the distance itself* — the two candidates' true distances differ by
+  ~1e-7 of their magnitude (≤ 5e-7 in those two cases, which the test
+  suite asserts: 3.6e-5 raw units on a ~1.7e5 distance, 0.08 on a ~4e6
+  one; up to ~5e-6 on long series with large `m`). The reported `P` stays
+  float64-exact for the chosen neighbor, and `match` widens its
+  re-evaluation cutoff per-window so true matches are not dropped. From
+  ~1e6 of dynamic range on, STUMPY's own CPU `aamp` — a float64 diagonal
+  recurrence over terms of the segment's squared magnitude — drifts (its
+  `P` is off by ~1e-2 at 1e6, ~0.5 at 1e7, ~5 at 1e8 on unit-scale rows,
+  and it can pick neighbors far from the true nearest), so agreement with
+  it stops being a precision metric there; measured against exact float64
+  truth, mlx-stump's neighbor gaps stay ≤ ~1e-7 relative and its `P`
+  float64-exact up to the ~1e13 standardization limit.
+- On smooth, highly self-similar series (a clean periodic signal with
+  small noise) most rows have many near-tied period-repeat candidates, and
+  the float32 search often resolves them differently from STUMPY (≈60% of
+  rows on a unit-amplitude sine at `m=100`, in both normalize modes). The
+  gaps are within the golden-suite tie tolerance in absolute terms (≤ 3e-3
+  on nearest distances of ~1e-2) but can be tens of percent of those small
+  distances; `P` is exact for the chosen index.
 - A series whose amplitude dynamic range approaches float64's ~16 digits
   (≳1e13 between its largest values and its smallest window variation)
   triggers a warning: global standardization cannot faithfully represent

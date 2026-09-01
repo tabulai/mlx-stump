@@ -12,21 +12,33 @@ from ._preprocess import (
     check_series,
     check_window_size,
     preprocess_series,
+    split_float32,
 )
 
 
 def _as_flag(value, name: str) -> bool | None:
-    """Normalize a Q_subseq_isconstant spec (None, bool, or shape-(1,) array)."""
+    """Normalize a ``Q_subseq_isconstant`` spec to a bool (or ``None``).
+
+    Accepts a Python/NumPy boolean or a boolean array of shape ``()`` or
+    ``(1,)``. Anything else is rejected, as STUMPY does: coercing ``"False"``,
+    ``0`` or ``[1.0]`` through ``bool()`` would silently flip the semantics.
+    """
     if value is None:
         return None
     if callable(value):
         raise NotImplementedError(
             f"Callable `{name}` is not supported yet; pass a boolean instead."
         )
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
     arr = np.asarray(value)
+    if arr.dtype != np.bool_:
+        raise ValueError(
+            f"`{name}` must be a boolean (dtype `np.bool_`) but found dtype {arr.dtype}."
+        )
     if arr.shape not in ((), (1,)):
         raise ValueError(f"`{name}` must be a single boolean value.")
-    return bool(arr.reshape(-1)[0]) if arr.shape == (1,) else bool(arr)
+    return bool(arr.reshape(-1)[0])
 
 
 def _check_isfinite_override(T_subseq_isfinite, l: int) -> np.ndarray | None:
@@ -36,6 +48,17 @@ def _check_isfinite_override(T_subseq_isfinite, l: int) -> np.ndarray | None:
     if arr.dtype != np.bool_ or arr.shape != (l,):
         raise ValueError(f"`T_subseq_isfinite` must be a boolean array of shape ({l},).")
     return arr.copy()
+
+
+def _check_stats(M_T, Σ_T, l: int) -> tuple[np.ndarray, np.ndarray]:
+    """Validate precomputed sliding stats; returns float64 copies of shape ``(l,)``."""
+    M = np.array(M_T, dtype=np.float64, copy=True)
+    S = np.array(Σ_T, dtype=np.float64, copy=True)
+    if M.shape != (l,) or S.shape != (l,):
+        raise ValueError(
+            f"`M_T` and `Σ_T` must both have shape ({l},) but found {M.shape} and {S.shape}."
+        )
+    return M, S
 
 
 def mass(
@@ -54,10 +77,25 @@ def mass(
 
     Drop-in for ``stumpy.mass``. Returns a float64 array of length
     ``len(T) - len(Q) + 1``. A query containing NaN/inf yields an all-inf
-    profile. ``query_idx`` must lie in ``[0, len(T) - len(Q)]`` and forces an exact
-    zero at the query's own position (self-join convention).
+    profile. ``query_idx`` must lie in ``[0, len(T) - len(Q)]`` and forces an
+    exact zero at the query's own position (self-join convention; with
+    ``normalize=False`` a window that ``T_subseq_isfinite`` marks non-finite
+    stays inf, exactly like ``stumpy.mass_absolute``).
     ``normalize=False`` supports ``p=2.0`` only.
     ``T_subseq_isfinite`` is ignored when ``normalize=True``, like STUMPY.
+
+    Precomputed ``M_T``/``Σ_T`` (both required, shape ``(l,)``): ``Σ_T`` is
+    honored as the per-window scale of the z-normalized distance, so passing
+    STUMPY's ``compute_mean_std`` output reproduces its ranking; a window
+    whose stats are not finite is reported as inf (STUMPY's ``M_T == inf``
+    convention). ``M_T`` is *not* used to form the covariance: every window
+    is centered by its own exact float64 mean, which is what keeps the
+    product cancellation-free — STUMPY's ``QT - m·μ_Q·M_T`` form amplifies
+    the float64 rounding of ``M_T`` by ``(μ/σ)²`` and collapses on offset
+    data. A deliberately biased ``M_T`` therefore does not change the result.
+
+    The target window matrix is streamed in bounded column blocks, so the
+    profile costs one block of GPU memory at a time regardless of ``n·m``.
 
     Note the profile is the float32 GPU result: near-perfect matches read
     ~1e-3 rather than ~1e-8 (``stump`` and ``match`` re-evaluate their
@@ -102,42 +140,60 @@ def mass(
                 stacklevel=2,
             )
 
+    # validate eagerly (STUMPY would fail on a shape mismatch too), even for
+    # the all-inf early return below
+    user_stats = M_T is not None and Σ_T is not None
+    if user_stats:
+        M_T, Σ_T = _check_stats(M_T, Σ_T, l)
+    q_const = _as_flag(Q_subseq_isconstant, "Q_subseq_isconstant")
+
     if not np.all(np.isfinite(Q)):
         return np.full(l, np.inf)
 
-    q_const = _as_flag(Q_subseq_isconstant, "Q_subseq_isconstant")
     if q_const is None:
         q_const = bool(np.ptp(Q) == 0.0)
 
+    D2 = np.empty(l, dtype=np.float64)
     if normalize:
         # T_subseq_isfinite is deliberately NOT applied here: STUMPY documents
         # it as ignored when normalize=True (it only feeds mass_absolute)
         prep = preprocess_series(T, m, isconstant=T_subseq_isconstant)
-        if M_T is not None and Σ_T is not None:
-            # trusted precomputed raw-frame stats, mapped into the standardized frame
-            mu = (np.asarray(M_T, dtype=np.float64) - prep.center) / prep.scale
-            sigma = np.asarray(Σ_T, dtype=np.float64) / prep.scale
-            sigma = sigma.copy()
+        if user_stats:
+            sigma = Σ_T / prep.scale  # raw-frame sigma -> standardized frame
             sigma[prep.isconstant] = 0.0
-            with np.errstate(divide="ignore"):
+            with np.errstate(divide="ignore", invalid="ignore"):
                 sig_inv = np.where(sigma > 0.0, 1.0 / sigma, 0.0)
-            prep.mu, prep.sig_inv = mu, sig_inv
+            prep.sig_inv = sig_inv
             prep.sig_inv_mx = mx.array(sig_inv.astype(np.float32))
+            usable = np.isfinite(M_T) & np.isfinite(Σ_T)
+            if not usable.all():
+                prep.isfinite = prep.isfinite & usable
+                prep.isfinite_mx = mx.array(prep.isfinite)
 
-        # standardize Q by its own moments: the window then has mean 0, sigma 1
-        mu_q = float(Q.mean())
-        sigma_q = float(Q.std())
+        # standardize Q by its own moments (the window then has mean 0, sigma
+        # 1), shifted by its first element first: `x - x0` errs with the
+        # window's SPREAD, so a large common offset cannot bias the mean and,
+        # through it, sigma_q (an unshifted Q.std() left an exact self-match
+        # reading ~1 instead of ~1e-3 for flat-jitter queries at offset 1e12)
+        Qs0 = Q - Q[0]
+        Qc = Qs0 - Qs0.mean()
+        sigma_q = float(np.sqrt(Qc @ Qc / m))
         s = sigma_q if (np.isfinite(sigma_q) and sigma_q > 0.0) else 1.0
-        Qs = (Q - mu_q) / s
+        Qs = Qc / s
 
         engine = MassEngine(prep)
-        QT = engine.sliding_dot_products(mx.array(Qs.astype(np.float32))[None, :])
-        D2 = engine.znorm_sq_distances(
-            QT,
-            mx.array([0.0 if q_const else 1.0], dtype=mx.float32),
-            mx.array([q_const]),
-            mx.array([True]),
-        )
+        Qb = mx.array(Qs.astype(np.float32))[None, :]
+        sig_inv_q = mx.array([0.0 if q_const else 1.0], dtype=mx.float32)
+        isconst_q = mx.array([q_const])
+        isfinite_q = mx.array([True])
+        for j0, j1, W in engine.target_blocks():
+            d2 = engine.znorm_sq_distances(
+                mx.matmul(Qb, W), sig_inv_q, isconst_q, isfinite_q, j0, j1
+            )
+            mx.eval(d2)
+            mx.synchronize()  # completion handler returns the block's buffers
+            D2[j0:j1] = np.array(d2[0], dtype=np.float64)
+            del W, d2  # release this block before the next one is built
     else:
         finite = np.concatenate([Q, T[np.isfinite(T)]])
         center = float(finite.mean())
@@ -153,18 +209,27 @@ def mass(
         mu_q = float(Qs.mean())
         Qsc = Qs - mu_q
         engine = MassEngine(prep, normalize=False)
-        QT = engine.sliding_dot_products(mx.array(Qsc.astype(np.float32))[None, :])
-        D2 = engine.absolute_sq_distances(
-            QT,
-            mx.array([float(np.sum(Qsc * Qsc))], dtype=mx.float32),
-            mx.array([mu_q], dtype=mx.float32),
-            mx.array([True]),
-        )
+        Qb = mx.array(Qsc.astype(np.float32))[None, :]
+        ssq_q = mx.array([float(np.sum(Qsc * Qsc))], dtype=mx.float32)
+        mu_q_mx = mx.array(split_float32(np.array([mu_q])))
+        isfinite_q = mx.array([True])
+        for j0, j1, W in engine.target_blocks():
+            d2 = engine.absolute_sq_distances(mx.matmul(Qb, W), ssq_q, mu_q_mx, isfinite_q, j0, j1)
+            mx.eval(d2)
+            mx.synchronize()
+            D2[j0:j1] = np.array(d2[0], dtype=np.float64)
+            del W, d2
 
-    mx.eval(D2)
-    profile = np.sqrt(np.array(D2[0], dtype=np.float64))
+    # hand the window block(s) MLX cached back to the system: nothing of the
+    # GPU phase is needed any more, and nothing should stay resident after
+    del engine
+    mx.clear_cache()
+    profile = np.sqrt(D2)
     if not normalize:
         profile *= prep.scale
-    if query_idx is not None:
+    if query_idx is not None and (normalize or prep.isfinite[query_idx]):
+        # STUMPY zeroes the self-match unconditionally when z-normalized, but
+        # mass_absolute re-applies its finite mask afterwards, so a window an
+        # explicit T_subseq_isfinite marks non-finite stays inf there
         profile[query_idx] = 0.0
     return profile

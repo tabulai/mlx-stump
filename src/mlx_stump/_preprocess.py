@@ -93,7 +93,8 @@ def rolling_isfinite(isfinite_pt: np.ndarray, m: int) -> np.ndarray:
     return (csum[m:] - csum[:-m]) == 0
 
 
-_SIGMA_REPAIR_CHUNK = 1 << 14
+# byte bound on the float64 window copies held by one sigma-repair chunk
+_SIGMA_REPAIR_BYTES = 1 << 25  # ~32 MiB
 # repair every window whose variance is within this factor of the cumsum
 # noise floor: a window *at* K times the floor still carries ~1/K relative
 # variance error, so a bare factor-8 bound left percent-level sigma errors
@@ -103,7 +104,9 @@ _SIGMA_REPAIR_CHUNK = 1 << 14
 _SIGMA_REPAIR_HEADROOM = 1 << 20
 
 
-def rolling_mean_sigma(a: np.ndarray, w: int) -> tuple[np.ndarray, np.ndarray]:
+def rolling_mean_sigma(
+    a: np.ndarray, w: int, known_constant: np.ndarray | None = None
+) -> tuple[np.ndarray, np.ndarray]:
     """Float64 rolling mean and standard deviation.
 
     The O(n) cumulative-sum pass is exact enough everywhere except
@@ -113,8 +116,13 @@ def rolling_mean_sigma(a: np.ndarray, w: int) -> tuple[np.ndarray, np.ndarray]:
     error. Windows whose computed variance falls within
     ``_SIGMA_REPAIR_HEADROOM`` of a per-window error bound are therefore
     recomputed exactly, two-pass, from the raw window values — an
-    O(suspects * w) repair that caps the surviving relative variance error
-    at ~1/headroom (~1e-6).
+    O(suspects * w) repair, streamed in byte-budgeted chunks, that caps the
+    surviving relative variance error at ~1/headroom (~1e-6).
+
+    ``known_constant`` (optional, ``(n-w+1,)`` bool) marks windows whose min
+    equals their max: their mean is any of their values and their variance
+    is exactly 0, so they are written directly instead of being re-read (a
+    constant series would otherwise "repair" every window it has).
     """
     csum = np.zeros(a.shape[0] + 1)
     np.cumsum(a, out=csum[1:])
@@ -129,16 +137,34 @@ def rolling_mean_sigma(a: np.ndarray, w: int) -> tuple[np.ndarray, np.ndarray]:
     eps = np.finfo(np.float64).eps
     bound = eps * (csq[w:] + 2.0 * np.abs(mu) * (np.abs(csum[w:]) + np.abs(csum[:-w]))) / w * 8.0
     suspects = np.nonzero(var <= bound * _SIGMA_REPAIR_HEADROOM)[0]
+    if known_constant is not None:
+        kc = np.nonzero(known_constant)[0]
+        mu[kc] = a[kc]
+        var[kc] = 0.0
+        suspects = suspects[~known_constant[suspects]]
     if suspects.size:
         windows = np.lib.stride_tricks.sliding_window_view(a, w)
-        for s in range(0, suspects.size, _SIGMA_REPAIR_CHUNK):
-            idx = suspects[s : s + _SIGMA_REPAIR_CHUNK]
-            wv = windows[idx]
+        chunk = max(1, _SIGMA_REPAIR_BYTES // (w * 8))
+        for s in range(0, suspects.size, chunk):
+            idx = suspects[s : s + chunk]
+            wv = windows[idx]  # fancy indexing copies, so in-place is safe
             mu_exact = wv.mean(axis=1)
             mu[idx] = mu_exact
-            var[idx] = ((wv - mu_exact[:, None]) ** 2).mean(axis=1)
+            wv -= mu_exact[:, None]
+            var[idx] = np.einsum("ij,ij->i", wv, wv) / w
 
     return mu, np.sqrt(var)
+
+
+def split_float32(x: np.ndarray) -> np.ndarray:
+    """``(..., 2)`` float32 ``[hi, lo]`` with ``hi + lo == x`` to ~float64.
+
+    ``lo`` is the float64 residual of the float32 rounding, itself rounded
+    to float32 (relative 6e-8 of a quantity already 6e-8 of ``x``).
+    """
+    hi = np.asarray(x, dtype=np.float64).astype(np.float32)
+    lo = (np.asarray(x, dtype=np.float64) - hi.astype(np.float64)).astype(np.float32)
+    return np.stack([hi, lo], axis=-1)
 
 
 def process_isconstant(T_nan: np.ndarray, m: int, user_isconstant, name: str) -> np.ndarray:
@@ -174,13 +200,21 @@ class PreprocessedSeries:
     ssq: np.ndarray | None  # (l,) CENTERED sum of squares m*sigma^2 (normalize=False only)
     # device-side float32 copies. Windows are centered in float64 before
     # upload, so the GPU never re-derives the mean — but the non-normalized
-    # distance needs the float32 mean itself for its m*(mu_q - mu_t)^2 term.
+    # distance needs the mean itself for its m*(mu_q - mu_t)^2 term. That
+    # mean is carried as a float32 (hi, lo) pair: a single float32 holding
+    # the shared frame's global offset has an ulp (3e-8 at |mu| ~ 0.5) far
+    # coarser than the ~1e-5 spacing of neighboring window means on
+    # mixed-scale data, and the difference of two such values decided
+    # neighbors by rounding noise (5e-4 relative gaps vs STUMPY's aamp).
+    # (hi_q - hi_t) is exact for nearby means (Sterbenz) and lo carries the
+    # residual, so the device difference is accurate to float32 of the
+    # difference itself.
     Ts_mx: mx.array = field(repr=False, default=None)
     sig_inv_mx: mx.array = field(repr=False, default=None)
     isfinite_mx: mx.array = field(repr=False, default=None)
     isconstant_mx: mx.array = field(repr=False, default=None)
     ssq_mx: mx.array = field(repr=False, default=None)
-    mu_mx: mx.array = field(repr=False, default=None)
+    mu_mx: mx.array = field(repr=False, default=None)  # (l, 2) float32 [hi, lo]
 
 
 def preprocess_series(
@@ -206,8 +240,14 @@ def preprocess_series(
     T_nan = np.where(np.isinf(T), np.nan, T)
 
     isfinite = rolling_isfinite(isfinite_pt, m)
+    # windows whose min equals their max (NaN windows never qualify): the
+    # default constant flags, and the windows whose stats are known exactly
+    detected = rolling_isconstant(T_nan, m)
     user_isconstant = isconstant is not None
-    isconstant = process_isconstant(T_nan, m, isconstant, isconstant_name)
+    if user_isconstant:
+        isconstant = process_isconstant(T_nan, m, isconstant, isconstant_name)
+    else:
+        isconstant = detected
     fixed = isconstant & isfinite  # a window with NaN is never constant
     if user_isconstant and np.any(fixed != isconstant):
         warnings.warn(
@@ -232,7 +272,7 @@ def preprocess_series(
 
     Ts = (T_filled - center) / scale
 
-    mu, sigma = rolling_mean_sigma(Ts, m)
+    mu, sigma = rolling_mean_sigma(Ts, m, known_constant=detected)
     sigma[isconstant] = 0.0
     with np.errstate(divide="ignore"):
         sig_inv = np.where(sigma > 0.0, 1.0 / sigma, 0.0)
@@ -275,5 +315,5 @@ def preprocess_series(
         isfinite_mx=mx.array(isfinite),
         isconstant_mx=mx.array(isconstant),
         ssq_mx=None if ssq is None else mx.array(ssq.astype(np.float32)),
-        mu_mx=mx.array(mu.astype(np.float32)),
+        mu_mx=mx.array(split_float32(mu)),
     )

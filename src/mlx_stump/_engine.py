@@ -16,7 +16,9 @@ cast, so the matmul product IS the mean-centered cross-covariance:
 - non-normalized (aamp): the distance is ||qc - tc||^2 + m*(mu_q - mu_t)^2
   (exact algebra: the cross terms vanish because centered windows sum to 0),
   which kills the `ssq_q + ssq_t - 2*QT` cancellation that otherwise scales
-  the noise with (segment offset / scale)^2 on mixed-scale data.
+  the noise with (segment offset / scale)^2 on mixed-scale data; the means
+  travel as float32 (hi, lo) pairs so their difference is not limited to
+  the ulp of the shared frame's global offset.
 
 When the full window matrix would exceed the memory cap, the target is
 processed in evenly-sized column blocks (each block built, centered, and
@@ -24,6 +26,22 @@ uploaded on demand), which preserves the identical per-window centering at
 any length. (An FFT cross-correlation fallback was used here previously; it
 operated on the raw float32 series, could not center per-window, and was
 numerically wrong for near-constant data.)
+
+Memory ceiling. Three byte budgets bound the whole computation, at any
+``n``/``m``:
+
+- the resident window block: the whole ``(m, l)`` float32 matrix when it fits
+  ``_MATMUL_WINDOW_BYTES``, else one ``_TILE_WINDOW_BYTES`` column block at a
+  time (each block is released before the next one is built);
+- the live per-batch GPU intermediates, ``_CHUNK_MEM_BUDGET``
+  (``default_chunk_size``/``tiled_chunk_size`` size the query batch to it);
+- CPU-side float64 temporaries: the block-centering step (``_CENTER_BYTES``),
+  the sigma repair in preprocessing and the float64 refinement chunks (see
+  ``_preprocess`` / ``_stump``), each a fixed budget independent of ``n``.
+
+Building a block stages it in numpy before the device copy, so the block
+exists twice for the duration of the upload. ``estimated_peak_bytes`` puts
+the pieces together; the O(n) per-series arrays are on top of it.
 
 Distances follow STUMPY's semantics exactly:
 - z-normalized: d = sqrt(2m(1 - rho)), rho from the mean-centered covariance;
@@ -48,12 +66,47 @@ _INF = float("inf")
 # constants (the window matrix or one tile of it) on top of this.
 _CHUNK_MEM_BUDGET = 3 << 27  # ~384 MiB
 # cap for materializing the (l, m) target window matrix on the GPU in one
-# piece; above it the engine switches to tiled column blocks
-_MATMUL_WINDOW_BYTES = 1 << 29
+# piece; above it the engine switches to tiled column blocks. The tiled
+# sweep runs the same compiled reduce step per block and measured as fast
+# as or faster than the dense one (n=524288, m=200: 47.7 s tiled/128 MiB
+# vs 47.9 s dense in one run, 38.8 s vs 52.8 s in another, at about half
+# the peak memory), so the cap trades nothing for memory.
+_MATMUL_WINDOW_BYTES = 1 << 28  # ~256 MiB
 # size of one materialized target window block in tiled mode
-_TILE_WINDOW_BYTES = 1 << 28
-# bound on the float64 centering intermediate while building window blocks
-_CENTER_STEP = 1 << 16
+_TILE_WINDOW_BYTES = 1 << 27  # ~128 MiB
+# byte bound on the float64 centering temporary while building window blocks
+_CENTER_BYTES = 1 << 26  # ~64 MiB
+
+
+def _center_rows(m: int) -> int:
+    """Window rows centered per float64 step so the temporary fits ``_CENTER_BYTES``."""
+    return max(1, _CENTER_BYTES // (m * 8))
+
+
+def resident_block_bytes(l: int, m: int) -> int:
+    """Bytes of the float32 window block the engine keeps on the device."""
+    full = l * m * 4
+    if full <= _MATMUL_WINDOW_BYTES:
+        return full
+    tile_rows = max(4, _TILE_WINDOW_BYTES // (4 * m))
+    nblocks = -(-l // tile_rows)
+    return -(-l // nblocks) * m * 4
+
+
+def estimated_peak_bytes(l: int, m: int) -> int:
+    """Ceiling on the bytes one join needs beyond its O(n) per-series arrays.
+
+    The larger of the upload transient (the block staged in numpy plus its
+    device copy plus the centering temporary) and the sweep phase (the
+    resident block plus the per-batch intermediates budget). The budget is
+    enforced batch by batch: each batch is synchronized before the next one
+    allocates and the trailing batch is computed at full width, so exactly
+    one set of intermediates exists. ``stump`` releases the block and MLX's
+    cached buffers before its float64 refinement (whose chunk budget, 256
+    MiB, is below the intermediates budget), and ``mass`` on return.
+    """
+    block = resident_block_bytes(l, m)
+    return max(2 * block + _CENTER_BYTES, block + _CHUNK_MEM_BUDGET)
 
 
 def _query_batch_bytes(m: int) -> int:
@@ -120,8 +173,9 @@ class MassEngine:
         the cast."""
         w = np.lib.stride_tricks.sliding_window_view(self.target.Ts, self.m)[j0:j1]
         out = np.empty((j1 - j0, self.m), dtype=np.float32)
-        for s in range(0, j1 - j0, _CENTER_STEP):
-            e = min(s + _CENTER_STEP, j1 - j0)
+        step = _center_rows(self.m)
+        for s in range(0, j1 - j0, step):
+            e = min(s + step, j1 - j0)
             out[s:e] = w[s:e] - self.target.mu[j0 + s : j0 + e, None]
         return mx.array(out).T
 
@@ -133,6 +187,12 @@ class MassEngine:
         column — would be dispatched to a different matmul kernel whose
         accumulation order can differ in the last float32 bit and flip
         near-ties to a different (equally good) neighbor.
+
+        Only one block is meant to be alive at a time: the generator drops
+        its own reference after yielding, and callers must ``del`` theirs
+        before advancing (a ``for`` target is only rebound on the next
+        iteration), or the previous block stays resident while the next one
+        is built.
         """
         if not self.tiled:
             yield 0, self.l, self.W_T
@@ -145,17 +205,26 @@ class MassEngine:
             block = self._build_block_T(j0, j1)
             mx.eval(block)
             yield j0, j1, block
+            del block
             j0 = j1
 
     def sliding_dot_products(self, Q_batch: mx.array) -> mx.array:
         """Centered QT for a (B, m) float32 centered query batch -> (B, l).
 
-        Materializes the full row; tiled callers that need bounded memory
-        should loop ``target_blocks`` themselves instead.
+        Materializes the full (B, l) row. In tiled mode each block's product
+        is evaluated before the next block is built, so only one block is
+        resident at a time; callers that also need the distances bounded per
+        block (``mass``, the tiled ``stump`` sweep) loop ``target_blocks``
+        themselves instead.
         """
         if not self.tiled:
             return mx.matmul(Q_batch, self.W_T)
-        parts = [mx.matmul(Q_batch, block) for _, _, block in self.target_blocks()]
+        parts = []
+        for _, _, block in self.target_blocks():
+            part = mx.matmul(Q_batch, block)
+            mx.eval(part)  # a lazy product would pin every block until concatenation
+            parts.append(part)
+            del block
         return mx.concatenate(parts, axis=1)
 
     def znorm_sq_distances(
@@ -206,8 +275,10 @@ class MassEngine:
 
         ``QT`` comes from centered windows and ``ssq`` values are centered
         sums of squares, so d2 = ||qc - tc||^2 + m*(mu_q - mu_t)^2 with the
-        offset carried exactly by the mean term. Multiply distances by the
-        shared ``scale`` to return to original units.
+        offset carried exactly by the mean term; ``mu_q`` is a ``(B, 2)``
+        float32 ``[hi, lo]`` split (see ``_preprocess.split_float32``).
+        Multiply distances by the shared ``scale`` to return to original
+        units.
         """
         t = self.target
         j1 = self.l if j1 is None else j1
@@ -236,7 +307,11 @@ def _znorm_sq(QT, sig_inv_q, isconstant_q, isfinite_q, sig_inv_t, isconst_t, isf
 
 
 def _abs_sq(QT, ssq_q, mu_q, isfinite_q, ssq_t, mu_t, isfinite_t, m):
-    dmu = mu_q[:, None] - mu_t[None, :]
+    # mu_* are (.., 2) float32 [hi, lo] splits of the float64 window means:
+    # hi differences are exact for nearby means and lo carries the residual,
+    # so dmu is accurate to float32 of the difference itself rather than of
+    # the means (which carry the shared frame's global offset)
+    dmu = (mu_q[:, 0][:, None] - mu_t[:, 0][None, :]) + (mu_q[:, 1][:, None] - mu_t[:, 1][None, :])
     d2 = mx.maximum(ssq_q[:, None] + ssq_t[None, :] - 2.0 * QT, 0.0) + m * dmu * dmu
     bad = mx.logical_or(mx.logical_not(isfinite_q[:, None]), mx.logical_not(isfinite_t[None, :]))
     return mx.where(bad, _INF, d2)
@@ -248,65 +323,100 @@ def _argmin_and_value(d2):
     return I, P2
 
 
-def make_reduce_step(engine: MassEngine, *, normalize: bool, self_join: bool, excl: int):
-    """Compile one fused kernel: squared distances + (left/right) argmin.
+def _topk(d2, k: int):
+    """Per-row k smallest squared distances (ascending) and their columns."""
+    kk = min(k, d2.shape[1])
+    part = mx.argpartition(d2, kth=kk - 1, axis=1)[:, :kk]
+    vals = mx.take_along_axis(d2, part, axis=1)
+    order = mx.argsort(vals, axis=1)
+    vals = mx.take_along_axis(vals, order, axis=1)
+    idxs = mx.take_along_axis(part, order, axis=1)
+    return vals, idxs
 
-    Only ``m``/``excl`` are baked in as constants; every array — the QT
-    block, both series' stats, and the row-index column — is an explicit
-    argument. (Closure-capturing the target arrays would alias a traced
-    input for single-chunk self-joins, which MLX's compile rejects.) Running
-    the whole chain as one compiled graph is what keeps the per-chunk cost
-    memory-bound instead of dispatch-bound.
 
-    The returned callable takes ``(QT, a, b, qf, i_col)`` where ``(a, b)``
-    are the query-side ``(sig_inv, isconstant)`` slices (z-normalized) or
-    ``(ssq, mu)`` slices (absolute).
+class ReduceStep:
+    """One compiled kernel: squared distances + the per-row reductions.
+
+    Only ``m``/``excl``/``k`` are baked in as constants; every array — the QT
+    block, both series' stats, and the row/column index vectors — is an
+    explicit argument. (Closure-capturing the target arrays would alias a
+    traced input for single-chunk self-joins, which MLX's compile rejects.)
+    Running the whole chain as one compiled graph is what keeps the
+    per-chunk cost memory-bound instead of dispatch-bound — the uncompiled
+    op-by-op form materializes every elementwise intermediate and ran the
+    tiled sweep ~2.5x slower than the dense one.
+
+    ``full`` reduces a chunk against the whole target row; ``block`` against
+    the target columns ``j0:j1`` (tiled mode). Both take ``(QT, a, b, qf,
+    i_col)`` where ``(a, b)`` are the query-side ``(sig_inv, isconstant)``
+    slices (z-normalized) or ``(ssq, mu)`` slices (absolute) and ``i_col``
+    the ``(B, 1)`` query row indices. Outputs, in order:
+
+    - self-join, k == 1: ``I, P2, Il, Pl2, Ir, Pr2``;
+    - self-join, k > 1: ``vals2, idxs, Il, Pl2, Ir, Pr2`` (the top-k set
+      excludes the trivial-match zone);
+    - AB-join: ``I, P2`` (k == 1) or ``vals2, idxs``.
+
+    Left/right regions already exclude the trivial-match zone, and their
+    combined minimum IS the global minimum; on exact ties the left
+    (lower-index) candidate wins, matching a full-row argmin.
     """
-    t = engine.target
-    m = float(engine.m)
-    j_row = mx.arange(engine.l)[None, :]
 
-    if normalize:
-        t_a, t_b = t.sig_inv_mx, t.isconstant_mx
+    def __init__(
+        self, engine: MassEngine, *, normalize: bool, self_join: bool, excl: int, k: int = 1
+    ):
+        t = engine.target
+        m = float(engine.m)
+        self.k = k
+        self.self_join = self_join
+        if normalize:
+            self.t_a, self.t_b = t.sig_inv_mx, t.isconstant_mx
 
-        def dist(QT, a, b, qf, t_a, t_b, t_f):
-            return _znorm_sq(QT, a, b, qf, t_a, t_b, t_f, m)
+            def dist(QT, a, b, qf, t_a, t_b, t_f):
+                return _znorm_sq(QT, a, b, qf, t_a, t_b, t_f, m)
 
-    else:
-        t_a, t_b = t.ssq_mx, t.mu_mx
+        else:
+            self.t_a, self.t_b = t.ssq_mx, t.mu_mx
 
-        def dist(QT, a, b, qf, t_a, t_b, t_f):
-            return _abs_sq(QT, a, b, qf, t_a, t_b, t_f, m)
+            def dist(QT, a, b, qf, t_a, t_b, t_f):
+                return _abs_sq(QT, a, b, qf, t_a, t_b, t_f, m)
 
-    if self_join:
+        self.t_f = t.isfinite_mx
+        self.j_row = mx.arange(engine.l)[None, :]
 
-        def step(QT, a, b, qf, i_col, t_a, t_b, t_f, j):
-            d2 = dist(QT, a, b, qf, t_a, t_b, t_f)
-            # the left/right regions already exclude the trivial-match zone,
-            # and their combined minimum IS the global minimum; on exact ties
-            # the left (lower-index) candidate wins, matching full-row argmin
-            dl = mx.where(j <= i_col - (excl + 1), d2, _INF)
-            Il, Pl2 = _argmin_and_value(dl)
-            dr = mx.where(j >= i_col + (excl + 1), d2, _INF)
-            Ir, Pr2 = _argmin_and_value(dr)
-            left_better = Pl2 <= Pr2
-            I = mx.where(left_better, Il, Ir)
-            P2 = mx.where(left_better, Pl2, Pr2)
-            return I, P2, Il, Pl2, Ir, Pr2
+        if self_join:
 
-    else:
+            def step(QT, a, b, qf, i_col, t_a, t_b, t_f, j):
+                d2 = dist(QT, a, b, qf, t_a, t_b, t_f)
+                dl = mx.where(j <= i_col - (excl + 1), d2, _INF)
+                Il, Pl2 = _argmin_and_value(dl)
+                dr = mx.where(j >= i_col + (excl + 1), d2, _INF)
+                Ir, Pr2 = _argmin_and_value(dr)
+                if k == 1:
+                    left_better = Pl2 <= Pr2
+                    I = mx.where(left_better, Il, Ir)
+                    P2 = mx.where(left_better, Pl2, Pr2)
+                    return I, P2, Il, Pl2, Ir, Pr2
+                vals2, idxs = _topk(mx.where(mx.abs(i_col - j) <= excl, _INF, d2), k)
+                return vals2, idxs, Il, Pl2, Ir, Pr2
 
-        def step(QT, a, b, qf, i_col, t_a, t_b, t_f, j):
-            I, P2 = _argmin_and_value(dist(QT, a, b, qf, t_a, t_b, t_f))
-            return I, P2
+        else:
 
-    compiled = mx.compile(step)
-    isfinite_t = t.isfinite_mx
+            def step(QT, a, b, qf, i_col, t_a, t_b, t_f, j):
+                d2 = dist(QT, a, b, qf, t_a, t_b, t_f)
+                if k == 1:
+                    return _argmin_and_value(d2)
+                return _topk(d2, k)
 
-    def run(QT, a, b, qf, i_col):
-        return compiled(QT, a, b, qf, i_col, t_a, t_b, isfinite_t, j_row)
+        self._compiled = mx.compile(step)
 
-    return run
+    def full(self, QT, a, b, qf, i_col):
+        return self._compiled(QT, a, b, qf, i_col, self.t_a, self.t_b, self.t_f, self.j_row)
+
+    def block(self, QT, a, b, qf, i_col, j0: int, j1: int, j_row):
+        return self._compiled(
+            QT, a, b, qf, i_col, self.t_a[j0:j1], self.t_b[j0:j1], self.t_f[j0:j1], j_row
+        )
 
 
 def query_windows(query: PreprocessedSeries, start: int, stop: int) -> mx.array:

@@ -65,6 +65,7 @@ include = [
     "/src",
     "/tests",
     "/bench",
+    "/.github/scripts",  # tests/test_release_guard.py exercises the tag guard
 ]
 
 [tool.ruff]

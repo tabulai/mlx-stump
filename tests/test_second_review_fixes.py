@@ -392,9 +392,11 @@ def test_aamp_extreme_spike_match_not_dropped():
 
 
 def test_match_precomputed_stats_honored_in_refinement():
-    """User-supplied M_T/Σ_T define the distances (STUMPY computes from them
-    verbatim); the float64 refinement used to silently recompute exact stats
-    and report a hybrid profile."""
+    """A user-supplied Σ_T is the per-window scale of the distance (here a
+    deliberately doubled one), in the float32 search and the float64
+    refinement alike; the refinement used to silently recompute exact
+    stats and report a hybrid profile. (M_T is validated but does not enter
+    the covariance — see test_third_review_fixes.py.)"""
     rng = np.random.default_rng(12)
     T = rng.standard_normal(400)
     Q = rng.standard_normal(21)

@@ -4,6 +4,12 @@ name: Release
 # Requires a PyPI "trusted publisher" configured for this repository
 # (project: mlx-stump, workflow: release.yml, environment: pypi) — no API
 # token is stored in the repo.
+#
+# Release procedure: bump `__version__` in src/mlx_stump/__init__.py to the
+# final/pre-release version, commit, then push the tag `v<version>`. The
+# build job refuses a tag that does not name that exact version (or a
+# `.dev`/local version), and it tests the wheel it is about to upload, not
+# the source tree.
 
 on:
   push:
@@ -17,11 +23,24 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: python -m pip install -e ".[dev]" build twine
-      - run: ruff check src tests bench
-      - run: python -m pytest tests/ -q
+      - name: Check that the tag names the package version
+        run: python .github/scripts/check_tag_version.py "${GITHUB_REF_NAME}"
+      - run: python -m pip install build twine "ruff>=0.5"
+      - run: ruff check src tests bench .github/scripts
       - run: python -m build
       - run: twine check --strict dist/*
+      - name: Test the built wheel in a clean environment
+        run: |
+          python -m venv "${RUNNER_TEMP}/wheel-venv"
+          "${RUNNER_TEMP}/wheel-venv/bin/python" -m pip install --upgrade pip
+          "${RUNNER_TEMP}/wheel-venv/bin/python" -m pip install dist/*.whl "pytest>=8" "stumpy>=1.13"
+          # the suite must import the installed wheel, never the source tree
+          "${RUNNER_TEMP}/wheel-venv/bin/python" - <<'PY'
+          import pathlib, mlx_stump
+          assert "site-packages" in pathlib.Path(mlx_stump.__file__).as_posix(), mlx_stump.__file__
+          print("testing", mlx_stump.__file__, mlx_stump.__version__)
+          PY
+          "${RUNNER_TEMP}/wheel-venv/bin/python" -m pytest tests/ -q
       - uses: actions/upload-artifact@v4
         with:
           name: dist
