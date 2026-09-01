@@ -44,12 +44,15 @@ def _refine_znorm(
     The GPU search runs in float32; re-evaluating d(i, I[i]) on the CPU in
     float64 removes the sqrt-cancellation noise from the reported profile
     values at O(l * m) cost. The squared distance is computed as the sum of
-    squared differences of the two z-normalized windows (each centered by its
-    float64 rolling mean and scaled by its float64 sigma): unlike
-    `dot - m*mu_q*mu_t` — which cancels catastrophically for near-constant
-    windows at an offset even in float64 — and unlike `2m(1-rho)` — whose
-    ~2m*eps noise floor keeps exact duplicates from snapping to 0 — a sum of
-    squares has no cancellation at all and is relatively accurate down to 0.
+    squared differences of the two z-normalized windows (each centered and
+    scaled by *exact two-pass* float64 stats): unlike `dot - m*mu_q*mu_t` —
+    which cancels catastrophically for near-constant windows at an offset
+    even in float64 — and unlike `2m(1-rho)` — whose ~2m*eps noise floor
+    keeps exact duplicates from snapping to 0 — a sum of squares has no
+    cancellation at all and is relatively accurate down to 0. Stats are
+    recomputed here rather than reusing the O(n) cumsum rolling stats: those
+    are only ~1e-6-relative after the suspect repair, fine for the float32
+    search but visible in a float64-exact reported value.
     """
     m = query.m
     out = np.full(I.shape, np.inf)
@@ -58,22 +61,31 @@ def _refine_znorm(
         return out
     WQ = np.lib.stride_tricks.sliding_window_view(query.Ts, m)
     WT = np.lib.stride_tricks.sliding_window_view(target.Ts, m)
+    dmax = 2.0 * np.sqrt(m)  # rho >= -1; sqrt rounding can overshoot 1 ulp
     chunk = _refine_chunk_rows(m)
     for s in range(0, valid.size, chunk):
         qi = valid[s : s + chunk]
         tj = I[qi]
-        qw = WQ[qi]  # fancy indexing copies, so everything can be in place
-        qw -= query.mu[qi, None]
-        qw *= query.sig_inv[qi, None]
-        tw = WT[tj]
-        tw -= target.mu[tj, None]
-        tw *= target.sig_inv[tj, None]
-        qw -= tw
-        d2 = np.einsum("ij,ij->i", qw, qw)
-        d2[d2 < P_NORM_THRESHOLD] = 0.0
-        d = np.sqrt(d2)
         qc = query.isconstant[qi]
         tc = target.isconstant[tj]
+        qw = WQ[qi]  # fancy indexing copies, so everything can be in place
+        qw -= qw.mean(axis=1)[:, None]
+        sq = np.sqrt(np.einsum("ij,ij->i", qw, qw) / m)
+        tw = WT[tj]
+        tw -= tw.mean(axis=1)[:, None]
+        st = np.sqrt(np.einsum("ij,ij->i", tw, tw) / m)
+        sq_inv = np.where((sq > 0.0) & ~qc, 1.0 / np.where(sq > 0.0, sq, 1.0), 0.0)
+        st_inv = np.where((st > 0.0) & ~tc, 1.0 / np.where(st > 0.0, st, 1.0), 0.0)
+        qw *= sq_inv[:, None]
+        tw *= st_inv[:, None]
+        qw -= tw
+        d2 = np.einsum("ij,ij->i", qw, qw)
+        # a zero sig_inv on either side (constant flag, or a truly flat
+        # window flagged non-constant) means rho == 0 on the GPU; mirror
+        # that, and let the constant-flag rules below overwrite as needed
+        d2 = np.where((sq_inv == 0.0) | (st_inv == 0.0), 2.0 * m, d2)
+        d2[d2 < P_NORM_THRESHOLD] = 0.0
+        d = np.minimum(np.sqrt(d2), dmax)
         d = np.where(qc & tc, 0.0, np.where(qc ^ tc, np.sqrt(m), d))
         d[~(query.isfinite[qi] & target.isfinite[tj])] = np.inf
         out[qi] = d
@@ -166,7 +178,7 @@ def _compute_profile_tiled(
         j_row = mx.arange(j0, j1)[None, :]
         for s in range(0, l_q, B):
             e = min(s + B, l_q)
-            Q = query_windows(query, s, e, center=normalize)
+            Q = query_windows(query, s, e)
             QT = mx.matmul(Q, W)
             if normalize:
                 D2 = engine.znorm_sq_distances(
@@ -179,7 +191,7 @@ def _compute_profile_tiled(
                 )
             else:
                 D2 = engine.absolute_sq_distances(
-                    QT, query.ssq_mx[s:e], query.isfinite_mx[s:e], j0, j1
+                    QT, query.ssq_mx[s:e], query.mu_mx[s:e], query.isfinite_mx[s:e], j0, j1
                 )
             i_col = mx.arange(s, e)[:, None]
 
@@ -288,13 +300,16 @@ def _compute_profile(
         step = make_reduce_step(engine, normalize=normalize, self_join=self_join, excl=excl)
         for s in range(0, l_q, B):
             e = min(s + B, l_q)
-            Q = query_windows(query, s, e, center=normalize)
+            Q = query_windows(query, s, e)
             QT = engine.sliding_dot_products(Q)
-            a = query.sig_inv_mx[s:e] if normalize else query.ssq_mx[s:e]
+            if normalize:
+                a, b = query.sig_inv_mx[s:e], query.isconstant_mx[s:e]
+            else:
+                a, b = query.ssq_mx[s:e], query.mu_mx[s:e]
             outs = step(
                 QT,
                 a,
-                query.isconstant_mx[s:e],
+                b,
                 query.isfinite_mx[s:e],
                 mx.arange(s, e)[:, None],
             )
@@ -312,7 +327,7 @@ def _compute_profile(
     j_row = mx.arange(l_t)[None, :]
     for s in range(0, l_q, B):
         e = min(s + B, l_q)
-        Q = query_windows(query, s, e, center=normalize)
+        Q = query_windows(query, s, e)
         QT = engine.sliding_dot_products(Q)
         if normalize:
             D2 = engine.znorm_sq_distances(
@@ -322,7 +337,9 @@ def _compute_profile(
                 query.isfinite_mx[s:e],
             )
         else:
-            D2 = engine.absolute_sq_distances(QT, query.ssq_mx[s:e], query.isfinite_mx[s:e])
+            D2 = engine.absolute_sq_distances(
+                QT, query.ssq_mx[s:e], query.mu_mx[s:e], query.isfinite_mx[s:e]
+            )
 
         i_col = mx.arange(s, e)[:, None]
         if self_join:

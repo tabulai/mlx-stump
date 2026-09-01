@@ -6,17 +6,24 @@ materialized (l, m) target window matrix. Each distance profile comes from a
 fresh product rather than a long floating-point recurrence, so error does not
 accumulate along the series.
 
-For the z-normalized profile BOTH sides of the product are mean-centered in
-float64 before the float32 cast: the doubly-centered product IS the
-covariance, so near-constant windows sitting at a large offset (a flatlined
-sensor) don't have their tiny covariance swamped by float32 rounding of the
-offset, and the catastrophic `QT - m*mu_q*mu_t` subtraction never happens in
-float32. When the full window matrix would exceed the memory cap, the target
-is processed in column blocks (each block built, centered, and uploaded on
-demand), which preserves the exact same per-window centering at any length.
-(An FFT cross-correlation fallback was used here previously; it operated on
-the raw float32 series, could not center per-window, and was numerically
-wrong for near-constant data — see test_tiled_engine_matches_matmul.)
+EVERY window on both sides is mean-centered in float64 before the float32
+cast, so the matmul product IS the mean-centered cross-covariance:
+
+- z-normalized: near-constant windows sitting at a large offset (a flatlined
+  sensor) don't have their tiny covariance swamped by float32 rounding of
+  the offset, and the catastrophic `QT - m*mu_q*mu_t` subtraction never
+  happens in float32;
+- non-normalized (aamp): the distance is ||qc - tc||^2 + m*(mu_q - mu_t)^2
+  (exact algebra: the cross terms vanish because centered windows sum to 0),
+  which kills the `ssq_q + ssq_t - 2*QT` cancellation that otherwise scales
+  the noise with (segment offset / scale)^2 on mixed-scale data.
+
+When the full window matrix would exceed the memory cap, the target is
+processed in evenly-sized column blocks (each block built, centered, and
+uploaded on demand), which preserves the identical per-window centering at
+any length. (An FFT cross-correlation fallback was used here previously; it
+operated on the raw float32 series, could not center per-window, and was
+numerically wrong for near-constant data.)
 
 Distances follow STUMPY's semantics exactly:
 - z-normalized: d = sqrt(2m(1 - rho)), rho from the mean-centered covariance;
@@ -35,10 +42,10 @@ from ._preprocess import PreprocessedSeries
 
 _INF = float("inf")
 
-# budget for the live per-chunk GPU intermediates (QT, squared distances, the
-# masked left/right variants, and the top-k sort/gather buffers). Actual peak
-# memory also includes the per-call constants (the window matrix or one tile
-# of it) on top of this.
+# budget for the live per-chunk GPU intermediates (the query window batch,
+# QT, squared distances, the masked left/right variants, and the top-k
+# sort/gather buffers). Actual peak memory also includes the per-call
+# constants (the window matrix or one tile of it) on top of this.
 _CHUNK_MEM_BUDGET = 3 << 27  # ~384 MiB
 # cap for materializing the (l, m) target window matrix on the GPU in one
 # piece; above it the engine switches to tiled column blocks
@@ -47,6 +54,11 @@ _MATMUL_WINDOW_BYTES = 1 << 29
 _TILE_WINDOW_BYTES = 1 << 28
 # bound on the float64 centering intermediate while building window blocks
 _CENTER_STEP = 1 << 16
+
+
+def _query_batch_bytes(m: int) -> int:
+    # float64 window copy + centered copy + float32 cast + device upload
+    return m * 24
 
 
 def default_chunk_size(engine: MassEngine, l_q: int, k: int = 1, self_join: bool = False) -> int:
@@ -62,6 +74,7 @@ def default_chunk_size(engine: MassEngine, l_q: int, k: int = 1, self_join: bool
         # gather intermediates: ~48 bytes/cell measured for self-joins
         # (which also carry the masked left/right variants), ~40 without
         per_row = engine.l * (48 if self_join else 40)
+    per_row += _query_batch_bytes(engine.m)
     b = max(1, min(1024, _CHUNK_MEM_BUDGET // per_row))
     return min(b, max(1, l_q))
 
@@ -69,19 +82,20 @@ def default_chunk_size(engine: MassEngine, l_q: int, k: int = 1, self_join: bool
 def tiled_chunk_size(engine: MassEngine, l_q: int, k: int = 1, self_join: bool = False) -> int:
     """Query rows per batch in tiled mode: intermediates span one tile, not l."""
     cell = 16 if k == 1 else (48 if self_join else 40)
-    b = max(1, min(4096, _CHUNK_MEM_BUDGET // (engine.tile_rows * cell)))
+    per_row = engine.tile_rows * cell + _query_batch_bytes(engine.m)
+    b = max(1, min(4096, _CHUNK_MEM_BUDGET // per_row))
     return min(b, max(1, l_q))
 
 
 class MassEngine:
-    """Holds the target series' windows and per-window stats on the GPU.
+    """Holds the target series' centered windows and per-window stats on the GPU.
 
     Sliding dot products are dense matmuls against the materialized (l, m)
-    target window matrix — built in one piece when it fits the memory cap,
-    or streamed as column blocks (``target_blocks``) when it does not. Both
-    forms apply the same float64 per-window mean-centering before the
-    float32 cast for the z-normalized profile, so precision is identical at
-    every series length.
+    doubly-centered target window matrix — built in one piece when it fits
+    the memory cap, or streamed as evenly-sized column blocks
+    (``target_blocks``) when it does not. Both forms apply the same float64
+    per-window mean-centering before the float32 cast, so precision is
+    identical at every series length.
     """
 
     def __init__(self, target: PreprocessedSeries, *, normalize: bool = True):
@@ -98,30 +112,39 @@ class MassEngine:
 
     def _build_block_T(self, j0: int, j1: int) -> mx.array:
         """(m, j1-j0) float32 transposed window block for target windows
-        ``j0:j1``; the z-normalized path centers each window by its float64
-        rolling mean before the cast."""
+        ``j0:j1``, each window centered by its float64 rolling mean before
+        the cast."""
         w = np.lib.stride_tricks.sliding_window_view(self.target.Ts, self.m)[j0:j1]
-        if self.normalize:
-            out = np.empty((j1 - j0, self.m), dtype=np.float32)
-            for s in range(0, j1 - j0, _CENTER_STEP):
-                e = min(s + _CENTER_STEP, j1 - j0)
-                out[s:e] = w[s:e] - self.target.mu[j0 + s : j0 + e, None]
-            return mx.array(out).T
-        return mx.array(np.ascontiguousarray(w, dtype=np.float32)).T
+        out = np.empty((j1 - j0, self.m), dtype=np.float32)
+        for s in range(0, j1 - j0, _CENTER_STEP):
+            e = min(s + _CENTER_STEP, j1 - j0)
+            out[s:e] = w[s:e] - self.target.mu[j0 + s : j0 + e, None]
+        return mx.array(out).T
 
     def target_blocks(self) -> Iterator[tuple[int, int, mx.array]]:
-        """Yield (j0, j1, block) covering all target windows in column order."""
+        """Yield (j0, j1, block) covering all target windows in column order.
+
+        Blocks are split as evenly as possible (never wider than
+        ``tile_rows``): a narrow trailing block — especially a single
+        column — would be dispatched to a different matmul kernel whose
+        accumulation order can differ in the last float32 bit and flip
+        near-ties to a different (equally good) neighbor.
+        """
         if not self.tiled:
             yield 0, self.l, self.W_T
             return
-        for j0 in range(0, self.l, self.tile_rows):
-            j1 = min(j0 + self.tile_rows, self.l)
+        nblocks = -(-self.l // self.tile_rows)
+        base, extra = divmod(self.l, nblocks)
+        j0 = 0
+        for b in range(nblocks):
+            j1 = j0 + base + (1 if b < extra else 0)
             block = self._build_block_T(j0, j1)
             mx.eval(block)
             yield j0, j1, block
+            j0 = j1
 
     def sliding_dot_products(self, Q_batch: mx.array) -> mx.array:
-        """QT for a (B, m) float32 query batch -> (B, l) float32.
+        """Centered QT for a (B, m) float32 centered query batch -> (B, l).
 
         Materializes the full row; tiled callers that need bounded memory
         should loop ``target_blocks`` themselves instead.
@@ -170,17 +193,30 @@ class MassEngine:
         self,
         QT: mx.array,
         ssq_q: mx.array,
+        mu_q: mx.array,
         isfinite_q: mx.array,
         j0: int = 0,
         j1: int | None = None,
     ) -> mx.array:
         """(B, j1-j0) squared non-normalized (p=2) distances, shared standardized frame.
 
-        Multiply distances by the shared ``scale`` to return to original units.
+        ``QT`` comes from centered windows and ``ssq`` values are centered
+        sums of squares, so d2 = ||qc - tc||^2 + m*(mu_q - mu_t)^2 with the
+        offset carried exactly by the mean term. Multiply distances by the
+        shared ``scale`` to return to original units.
         """
         t = self.target
         j1 = self.l if j1 is None else j1
-        return _abs_sq(QT, ssq_q, isfinite_q, t.ssq_mx[j0:j1], t.isfinite_mx[j0:j1])
+        return _abs_sq(
+            QT,
+            ssq_q,
+            mu_q,
+            isfinite_q,
+            t.ssq_mx[j0:j1],
+            t.mu_mx[j0:j1],
+            t.isfinite_mx[j0:j1],
+            float(self.m),
+        )
 
 
 def _znorm_sq(QT, sig_inv_q, isconstant_q, isfinite_q, sig_inv_t, isconst_t, isfinite_t, m):
@@ -195,8 +231,9 @@ def _znorm_sq(QT, sig_inv_q, isconstant_q, isfinite_q, sig_inv_t, isconst_t, isf
     return mx.where(bad, _INF, d2)
 
 
-def _abs_sq(QT, ssq_q, isfinite_q, ssq_t, isfinite_t):
-    d2 = mx.maximum(ssq_q[:, None] + ssq_t[None, :] - 2.0 * QT, 0.0)
+def _abs_sq(QT, ssq_q, mu_q, isfinite_q, ssq_t, mu_t, isfinite_t, m):
+    dmu = mu_q[:, None] - mu_t[None, :]
+    d2 = mx.maximum(ssq_q[:, None] + ssq_t[None, :] - 2.0 * QT, 0.0) + m * dmu * dmu
     bad = mx.logical_or(mx.logical_not(isfinite_q[:, None]), mx.logical_not(isfinite_t[None, :]))
     return mx.where(bad, _INF, d2)
 
@@ -217,29 +254,30 @@ def make_reduce_step(engine: MassEngine, *, normalize: bool, self_join: bool, ex
     the whole chain as one compiled graph is what keeps the per-chunk cost
     memory-bound instead of dispatch-bound.
 
-    The returned callable takes ``(QT, a, qc, qf, i_col)`` where ``a`` is the
-    query-side ``sig_inv`` (z-normalized) or ``ssq`` (absolute) slice.
+    The returned callable takes ``(QT, a, b, qf, i_col)`` where ``(a, b)``
+    are the query-side ``(sig_inv, isconstant)`` slices (z-normalized) or
+    ``(ssq, mu)`` slices (absolute).
     """
     t = engine.target
     m = float(engine.m)
     j_row = mx.arange(engine.l)[None, :]
-    sig_inv_t, isconst_t, isfinite_t = t.sig_inv_mx, t.isconstant_mx, t.isfinite_mx
-    ssq_t = t.ssq_mx
 
     if normalize:
+        t_a, t_b = t.sig_inv_mx, t.isconstant_mx
 
-        def dist(QT, a, qc, qf, t_a, t_c, t_f):
-            return _znorm_sq(QT, a, qc, qf, t_a, t_c, t_f, m)
+        def dist(QT, a, b, qf, t_a, t_b, t_f):
+            return _znorm_sq(QT, a, b, qf, t_a, t_b, t_f, m)
 
     else:
+        t_a, t_b = t.ssq_mx, t.mu_mx
 
-        def dist(QT, a, qc, qf, t_a, t_c, t_f):
-            return _abs_sq(QT, a, qf, t_a, t_f)
+        def dist(QT, a, b, qf, t_a, t_b, t_f):
+            return _abs_sq(QT, a, b, qf, t_a, t_b, t_f, m)
 
     if self_join:
 
-        def step(QT, a, qc, qf, i_col, t_a, t_c, t_f, j):
-            d2 = dist(QT, a, qc, qf, t_a, t_c, t_f)
+        def step(QT, a, b, qf, i_col, t_a, t_b, t_f, j):
+            d2 = dist(QT, a, b, qf, t_a, t_b, t_f)
             # the left/right regions already exclude the trivial-match zone,
             # and their combined minimum IS the global minimum; on exact ties
             # the left (lower-index) candidate wins, matching full-row argmin
@@ -254,31 +292,26 @@ def make_reduce_step(engine: MassEngine, *, normalize: bool, self_join: bool, ex
 
     else:
 
-        def step(QT, a, qc, qf, i_col, t_a, t_c, t_f, j):
-            I, P2 = _argmin_and_value(dist(QT, a, qc, qf, t_a, t_c, t_f))
+        def step(QT, a, b, qf, i_col, t_a, t_b, t_f, j):
+            I, P2 = _argmin_and_value(dist(QT, a, b, qf, t_a, t_b, t_f))
             return I, P2
 
     compiled = mx.compile(step)
-    t_a = sig_inv_t if normalize else ssq_t
+    isfinite_t = t.isfinite_mx
 
-    def run(QT, a, qc, qf, i_col):
-        return compiled(QT, a, qc, qf, i_col, t_a, isconst_t, isfinite_t, j_row)
+    def run(QT, a, b, qf, i_col):
+        return compiled(QT, a, b, qf, i_col, t_a, t_b, isfinite_t, j_row)
 
     return run
 
 
-def query_windows(
-    query: PreprocessedSeries, start: int, stop: int, *, center: bool = True
-) -> mx.array:
-    """Float32 (B, m) window batch from the standardized series.
+def query_windows(query: PreprocessedSeries, start: int, stop: int) -> mx.array:
+    """Float32 (B, m) centered window batch from the standardized series.
 
-    With ``center=True`` (the z-normalized path) each window's float64
-    rolling mean is subtracted *before* the float32 cast, which is what keeps
-    the covariance well-conditioned on the GPU. The non-normalized path needs
-    the raw windows (``center=False``).
+    Each window's float64 rolling mean is subtracted *before* the float32
+    cast, which is what keeps both the covariance (z-normalized) and the
+    centered difference norm (absolute) well-conditioned on the GPU.
     """
     w = np.lib.stride_tricks.sliding_window_view(query.Ts, query.m)[start:stop]
-    if center:
-        w = w - query.mu[start:stop, None]
-        return mx.array(w.astype(np.float32))
-    return mx.array(np.ascontiguousarray(w, dtype=np.float32))
+    w = w - query.mu[start:stop, None]
+    return mx.array(w.astype(np.float32))

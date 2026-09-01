@@ -94,17 +94,27 @@ def rolling_isfinite(isfinite_pt: np.ndarray, m: int) -> np.ndarray:
 
 
 _SIGMA_REPAIR_CHUNK = 1 << 14
+# repair every window whose variance is within this factor of the cumsum
+# noise floor: a window *at* K times the floor still carries ~1/K relative
+# variance error, so a bare factor-8 bound left percent-level sigma errors
+# on windows just above it (e.g. ordinary noise windows crushed by global
+# standardization when the series contains a huge-amplitude segment),
+# corrupting both the float32 search and the reported profile
+_SIGMA_REPAIR_HEADROOM = 1 << 20
 
 
 def rolling_mean_sigma(a: np.ndarray, w: int) -> tuple[np.ndarray, np.ndarray]:
     """Float64 rolling mean and standard deviation.
 
     The O(n) cumulative-sum pass is exact enough everywhere except
-    near-constant windows (e.g. a flatlined sensor with tiny jitter), where
-    ``E[x^2] - mu^2`` cancels below the cumsum noise floor and would zero a
-    genuinely nonzero sigma. Windows whose computed variance falls under a
-    per-window error bound are therefore recomputed exactly, two-pass, from
-    the raw window values — a rare, O(suspects * w) repair.
+    small-variance windows (e.g. a flatlined sensor with tiny jitter, or any
+    window whose variance global standardization crushed toward the cumsum
+    noise floor), where ``E[x^2] - mu^2`` cancels and leaves large relative
+    error. Windows whose computed variance falls within
+    ``_SIGMA_REPAIR_HEADROOM`` of a per-window error bound are therefore
+    recomputed exactly, two-pass, from the raw window values — an
+    O(suspects * w) repair that caps the surviving relative variance error
+    at ~1/headroom (~1e-6).
     """
     csum = np.zeros(a.shape[0] + 1)
     np.cumsum(a, out=csum[1:])
@@ -118,7 +128,7 @@ def rolling_mean_sigma(a: np.ndarray, w: int) -> tuple[np.ndarray, np.ndarray]:
     # magnitudes (csq is nondecreasing), the mu^2 term with |csum|
     eps = np.finfo(np.float64).eps
     bound = eps * (csq[w:] + 2.0 * np.abs(mu) * (np.abs(csum[w:]) + np.abs(csum[:-w]))) / w * 8.0
-    suspects = np.nonzero(var <= bound)[0]
+    suspects = np.nonzero(var <= bound * _SIGMA_REPAIR_HEADROOM)[0]
     if suspects.size:
         windows = np.lib.stride_tricks.sliding_window_view(a, w)
         for s in range(0, suspects.size, _SIGMA_REPAIR_CHUNK):
@@ -161,14 +171,16 @@ class PreprocessedSeries:
     isconstant: np.ndarray  # (l,) window min == max
     mu: np.ndarray  # (l,) float64 rolling mean of Ts
     sig_inv: np.ndarray  # (l,) float64 1/sigma of Ts windows (0 where constant)
-    ssq: np.ndarray | None  # (l,) rolling sum of squares of Ts (normalize=False only)
-    # device-side float32 copies (mu stays CPU-only: the engine centers query
-    # windows in float64 before upload, so no GPU op ever needs it)
+    ssq: np.ndarray | None  # (l,) CENTERED sum of squares m*sigma^2 (normalize=False only)
+    # device-side float32 copies. Windows are centered in float64 before
+    # upload, so the GPU never re-derives the mean — but the non-normalized
+    # distance needs the float32 mean itself for its m*(mu_q - mu_t)^2 term.
     Ts_mx: mx.array = field(repr=False, default=None)
     sig_inv_mx: mx.array = field(repr=False, default=None)
     isfinite_mx: mx.array = field(repr=False, default=None)
     isconstant_mx: mx.array = field(repr=False, default=None)
     ssq_mx: mx.array = field(repr=False, default=None)
+    mu_mx: mx.array = field(repr=False, default=None)
 
 
 def preprocess_series(
@@ -227,9 +239,11 @@ def preprocess_series(
 
     ssq = None
     if not normalize:
-        csq = np.zeros(n + 1)
-        np.cumsum(Ts * Ts, out=csq[1:])
-        ssq = csq[m:] - csq[:-m]
+        # centered sum of squares: the engine computes the non-normalized
+        # distance as ||qc - tc||^2 + m*(mu_q - mu_t)^2 (windows centered
+        # before the float32 cast), which kills the ssq_q + ssq_t - 2*QT
+        # cancellation on mixed-scale data
+        ssq = m * sigma * sigma
 
     return PreprocessedSeries(
         T=T,
@@ -249,4 +263,5 @@ def preprocess_series(
         isfinite_mx=mx.array(isfinite),
         isconstant_mx=mx.array(isconstant),
         ssq_mx=None if ssq is None else mx.array(ssq.astype(np.float32)),
+        mu_mx=mx.array(mu.astype(np.float32)),
     )

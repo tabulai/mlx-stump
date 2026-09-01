@@ -16,6 +16,19 @@ import pytest
 stumpy = pytest.importorskip("stumpy")
 
 
+def pytest_collection_modifyitems(config, items):
+    """gpu-marked tests measure Metal behavior (e.g. peak GPU memory) and are
+    skipped on CPU-only runners, as the marker description promises."""
+    import mlx.core as mx
+
+    if mx.metal.is_available():
+        return
+    skip_gpu = pytest.mark.skip(reason="requires a Metal GPU")
+    for item in items:
+        if "gpu" in item.keywords:
+            item.add_marker(skip_gpu)
+
+
 # ---------------------------------------------------------------- datasets
 def random_walk(n: int, seed: int = 0) -> np.ndarray:
     rng = np.random.default_rng(seed)

@@ -24,7 +24,7 @@ classification on the same silicon.
 ## Status
 
 **v0.1 development — the batched-MASS engine is implemented and golden-tested
-against STUMPY** (113 golden and regression tests). Distance profiles are
+against STUMPY** (123 golden and regression tests). Distance profiles are
 computed in bulk on the GPU as dense matmuls against the doubly-centered
 subsequence matrix — materialized in one piece for moderate `n*m`, streamed
 as column blocks beyond that — with a fused `mx.compile` distance+argmin
@@ -89,14 +89,17 @@ error negligible in practice by:
    product IS the centered cross-covariance and the catastrophic
    `QT - m·μ_Q·μ_T` subtraction never happens in float32 — at any series
    length (the streamed column blocks of the large-`n` path are centered
-   identically). Each profile also comes from a fresh product rather than a
-   long floating-point recurrence, so error does not accumulate along the
-   series.
+   identically). The non-normalized (`aamp`) profile uses the same
+   centering — `d² = ‖q_c − t_c‖² + m·(μ_q − μ_t)²` — so mixed-scale data
+   doesn't hit the `ssq_q + ssq_t − 2·QT` cancellation either. Each profile
+   also comes from a fresh product rather than a long floating-point
+   recurrence, so error does not accumulate along the series.
 4. **Float64 refinement** — profile values at the chosen indices are
    re-evaluated on the CPU in float64 (O(n·m), a few percent of runtime) as
-   sums of squared differences of the z-normalized windows — a
-   cancellation-free form that stays relatively accurate down to distance 0
-   — so reported `P` values are float64-exact for the reported neighbor.
+   sums of squared differences of the z-normalized windows, with each
+   window's mean and sigma recomputed exactly two-pass — a cancellation-free
+   form that stays relatively accurate down to distance 0 — so reported `P`
+   values are float64-exact for the reported neighbor.
 5. **STUMPY-exact semantics** for constant subsequences, NaN/inf handling,
    exclusion zones, and left/right profiles, verified by a golden test suite
    that compares every code path against float64 STUMPY.
@@ -186,6 +189,13 @@ python bench/bench_stump.py --sizes 16384 65536 262144 --m 200
 - A callable `max_distance` passed to `match` is invoked twice (once on the
   float32 profile, once on the float64-refined one); STUMPY calls it once on
   its exact profile.
+- A truly constant window that a user flag array explicitly marks
+  non-constant is ranked and reported at `sqrt(2m)` (its `1/σ` is taken as
+  0, so `ρ = 0`); STUMPY's `σ = 0 → 1` clamp yields a slightly different
+  convention for the same undefined quantity.
+- With `normalize=False`, a `T_subseq_isfinite` override marking a
+  NaN-containing window as finite computes its distance against the
+  zero-filled series; STUMPY propagates NaN there.
 - Like STUMPY's `gpu_stump`, streaming (`stumpi`) is out of scope for the GPU
   path for now.
 

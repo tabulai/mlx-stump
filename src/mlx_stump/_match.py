@@ -8,7 +8,7 @@ import numpy as np
 
 from ._mass import _as_flag, mass
 from ._preprocess import EXCL_ZONE_DENOM, process_isconstant, rolling_isfinite
-from ._stump import P_NORM_THRESHOLD
+from ._stump import _refine_chunk_rows
 
 
 def _refine_candidates(Q, T, D, cutoff, normalize, q_const, t_const):
@@ -19,47 +19,55 @@ def _refine_candidates(Q, T, D, cutoff, normalize, q_const, t_const):
     every candidate near the threshold restores STUMPY's behavior.
 
     Only finite entries are candidates (non-finite windows can never match,
-    and would poison the greedy argmin with NaNs). The squared distance is a
-    sum of squared differences of the two z-normalized windows — the
-    `W@Q - m*mu_t*mu_q` form cancels catastrophically for near-constant
-    windows at an offset, even in float64. ``q_const``/``t_const`` are the
-    resolved constant flags (including any user overrides), applied exactly
-    like the GPU path applies them.
+    and would poison the greedy argmin with NaNs); candidates are processed
+    in byte-budgeted chunks (``max_distance=inf`` selects the whole profile,
+    which must not materialize l*m float64 windows at once). The squared
+    distance is a sum of squared differences of the two z-normalized windows
+    — the `W@Q - m*mu_t*mu_q` form cancels catastrophically for
+    near-constant windows at an offset, even in float64. ``q_const``/
+    ``t_const`` are the resolved constant flags (including any user
+    overrides), applied exactly like the GPU path applies them. Unlike
+    ``stump``, no P-norm zero-snap is applied: STUMPY's mass/match report
+    raw float64 distances (exact duplicates still read 0.0 here because the
+    sum of squares is exactly 0 for identical normalized windows).
     """
     js = np.nonzero((D <= cutoff) & np.isfinite(D))[0]
     if js.size == 0:
         return D
     m = Q.shape[0]
+    D = D.copy()
+    chunk = _refine_chunk_rows(m)
     if normalize:
-        W = np.lib.stride_tricks.sliding_window_view(T, m)[js].astype(np.float64)
-        mu_t = W.mean(axis=1)
-        Wc = W - mu_t[:, None]
-        sig_t = np.sqrt(np.einsum("ij,ij->i", Wc, Wc) / m)
+        Wfull = np.lib.stride_tricks.sliding_window_view(T, m)
         Qc = Q - Q.mean()
         sig_q = float(np.sqrt(Qc @ Qc / m))
-        tc = t_const[js]
-        # constant-flagged or truly flat windows get sig_inv 0, mirroring the
-        # engine (the flag rules below overwrite as needed)
-        with np.errstate(divide="ignore"):
-            sig_inv_t = np.where((sig_t > 0.0) & ~tc, 1.0 / sig_t, 0.0)
         sig_inv_q = 0.0 if (q_const or sig_q == 0.0) else 1.0 / sig_q
-        Wc *= sig_inv_t[:, None]
-        Wc -= (Qc * sig_inv_q)[None, :]
-        d2 = np.einsum("ij,ij->i", Wc, Wc)
-        d2[d2 < P_NORM_THRESHOLD] = 0.0
-        d = np.sqrt(d2)
-        d = np.where(q_const & tc, 0.0, np.where(q_const ^ tc, np.sqrt(m), d))
+        u = Qc * sig_inv_q
+        for s in range(0, js.size, chunk):
+            idx = js[s : s + chunk]
+            W = Wfull[idx].astype(np.float64)
+            W -= W.mean(axis=1)[:, None]
+            sig_t = np.sqrt(np.einsum("ij,ij->i", W, W) / m)
+            tc = t_const[idx]
+            pos = (sig_t > 0.0) & ~tc
+            sig_inv_t = np.where(pos, 1.0 / np.where(sig_t > 0.0, sig_t, 1.0), 0.0)
+            W *= sig_inv_t[:, None]
+            W -= u[None, :]
+            d2 = np.einsum("ij,ij->i", W, W)
+            # zero sig_inv on either side means rho == 0 on the GPU; mirror
+            # it, then let the constant-flag rules overwrite as needed
+            d2 = np.where((sig_inv_t == 0.0) | (sig_inv_q == 0.0), 2.0 * m, d2)
+            d = np.sqrt(d2)
+            D[idx] = np.where(q_const & tc, 0.0, np.where(q_const ^ tc, np.sqrt(m), d))
     else:
         # the engine computes on the zero-filled series; mirror it so a user
         # T_subseq_isfinite override cannot inject NaN into the profile
         Tf = np.where(np.isfinite(T), T, 0.0)
-        W = np.lib.stride_tricks.sliding_window_view(Tf, m)[js].astype(np.float64)
-        diff = W - Q[None, :]
-        d2 = np.einsum("ij,ij->i", diff, diff)
-        d2[d2 < P_NORM_THRESHOLD] = 0.0
-        d = np.sqrt(d2)
-    D = D.copy()
-    D[js] = d
+        Wfull = np.lib.stride_tricks.sliding_window_view(Tf, m)
+        for s in range(0, js.size, chunk):
+            idx = js[s : s + chunk]
+            diff = Wfull[idx].astype(np.float64) - Q[None, :]
+            D[idx] = np.sqrt(np.einsum("ij,ij->i", diff, diff))
     return D
 
 
@@ -191,6 +199,14 @@ def match(
     # in particular min(D) shifts when refinement corrects the best match)
     # and refine once more in case it rose
     margin = 0.1 * (m / 50.0) ** 0.25  # float32 search noise bound
+    if not normalize:
+        # absolute distances (and their float32 noise) scale with the data's
+        # units; use the same shared frame mass() standardized with
+        finite = np.concatenate([Qf, Tf[np.isfinite(Tf)]])
+        scale = float(finite.std()) if finite.size else 1.0
+        if not np.isfinite(scale) or scale == 0.0:
+            scale = 1.0
+        margin *= scale
     md = _threshold(D)
     D = _refine_candidates(Qf, Tf, D, md + atol + margin, normalize, q_const, t_const)
     if not isinstance(max_distance, float):

@@ -150,11 +150,14 @@ def mass(
             prep.isfinite = override
             prep.isfinite_mx = mx.array(override)
         Qs = (Q - center) / scale
+        mu_q = float(Qs.mean())
+        Qsc = Qs - mu_q
         engine = MassEngine(prep, normalize=False)
-        QT = engine.sliding_dot_products(mx.array(Qs.astype(np.float32))[None, :])
+        QT = engine.sliding_dot_products(mx.array(Qsc.astype(np.float32))[None, :])
         D2 = engine.absolute_sq_distances(
             QT,
-            mx.array([float(np.sum(Qs * Qs))], dtype=mx.float32),
+            mx.array([float(np.sum(Qsc * Qsc))], dtype=mx.float32),
+            mx.array([mu_q], dtype=mx.float32),
             mx.array([True]),
         )
 

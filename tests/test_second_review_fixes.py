@@ -168,29 +168,193 @@ def test_query_idx_out_of_range_raises():
 
 # ----------------------------------------------------------- 4: memory budget
 class _FakeEngine:
-    def __init__(self, l, tile_rows=1):
+    def __init__(self, l, m=200, tile_rows=1):
         self.l = l
+        self.m = m
         self.tile_rows = tile_rows
 
 
-@pytest.mark.parametrize("l", [65_337, 2_000_000, 10_000_000])
+@pytest.mark.parametrize(
+    "l,m", [(65_337, 200), (2_000_000, 200), (10_000_000, 200), (16_385, 16_384)]
+)
 @pytest.mark.parametrize("k,self_join", [(1, True), (2, True), (4, False)])
-def test_default_chunk_size_respects_budget(l, k, self_join):
-    """The budget is a real ceiling now: no 16-row floor. A single row may
-    exceed the budget only when even chunk_size=1 does (b == 1)."""
-    eng = _FakeEngine(l)
+def test_default_chunk_size_respects_budget(l, m, k, self_join):
+    """The budget is a real ceiling now: no 16-row floor, and the per-row
+    query-window batch (which grows with m) is accounted for. A single row
+    may exceed the budget only when even chunk_size=1 does (b == 1)."""
+    eng = _FakeEngine(l, m)
     b = default_chunk_size(eng, l_q=l, k=k, self_join=self_join)
-    per_row = l * (16 if k == 1 else (48 if self_join else 40))
+    per_row = l * (16 if k == 1 else (48 if self_join else 40)) + m * 24
     assert b >= 1
     assert b * per_row <= _CHUNK_MEM_BUDGET or b == 1
 
 
 def test_tiled_chunk_size_respects_budget():
-    eng = _FakeEngine(10_000_000, tile_rows=327_680)
-    for k, self_join, cell in [(1, True, 16), (2, True, 48), (2, False, 40)]:
-        b = tiled_chunk_size(eng, l_q=10_000_000, k=k, self_join=self_join)
-        assert b >= 1
-        assert b * eng.tile_rows * cell <= _CHUNK_MEM_BUDGET or b == 1
+    for l, m, tile_rows in [(10_000_000, 200, 327_680), (65_537, 32_768, 2_048)]:
+        eng = _FakeEngine(l, m, tile_rows=tile_rows)
+        for k, self_join, cell in [(1, True, 16), (2, True, 48), (2, False, 40)]:
+            b = tiled_chunk_size(eng, l_q=l, k=k, self_join=self_join)
+            assert b >= 1
+            assert b * (eng.tile_rows * cell + m * 24) <= _CHUNK_MEM_BUDGET or b == 1
+
+
+# --------------------------------------- adversarial-verification round two
+def _fsum_znorm(T, m, i, j):
+    import math
+
+    a, b = T[i : i + m].astype(float), T[j : j + m].astype(float)
+    ca = a - math.fsum(a) / m
+    cb = b - math.fsum(b) / m
+    sa = math.sqrt(math.fsum(ca * ca) / m)
+    sb = math.sqrt(math.fsum(cb * cb) / m)
+    if sa == 0.0 or sb == 0.0:
+        return 0.0 if sa == sb else math.sqrt(m)
+    return math.sqrt(math.fsum(((ca / sa) - (cb / sb)) ** 2))
+
+
+def _assert_exact_and_no_bad_neighbors(T, m, mp, ref, p_tol, gap_tol=0.08):
+    """Reported P must equal the fsum ground truth at its own chosen index,
+    and every index disagreement with STUMPY must be a true near-tie."""
+    worst_p = 0.0
+    for i in range(len(mp.P_)):
+        if not np.isfinite(ref.P_[i]):
+            continue
+        worst_p = max(worst_p, abs(mp.P_[i] - _fsum_znorm(T, m, i, mp.I_[i])))
+        if mp.I_[i] != ref.I_[i]:
+            gap = _fsum_znorm(T, m, i, mp.I_[i]) - _fsum_znorm(T, m, i, ref.I_[i])
+            assert gap <= gap_tol, f"row {i}: our neighbor is {gap:.4f} worse"
+    assert worst_p <= p_tol, f"worst |P - truth at chosen index| = {worst_p:.3g}"
+
+
+def test_sigma_repair_headroom_offset_segment():
+    """A huge constant segment crushes ordinary windows' variance toward the
+    cumsum noise floor; without relative headroom on the sigma-repair bound,
+    windows just above it kept ~percent-level sigma error (205 rows chose
+    neighbors up to 0.37 worse than STUMPY's here, and reported P was off by
+    up to 0.045 at its own chosen pair)."""
+    rng = np.random.default_rng(1)
+    T = rng.standard_normal(2000)
+    T[100:300] = 1e5
+    m = 3
+    _assert_exact_and_no_bad_neighbors(T, m, mlx_stump.stump(T, m), stumpy.stump(T, m), 1e-9)
+
+
+@pytest.mark.slow
+def test_refine_exact_at_extreme_amplitude():
+    """An extreme-amplitude segment used to leave the refinement consuming
+    ~1e-2-relative sigma (max profile error 9.4e-3, 29 rows with neighbors
+    up to 0.21 worse); refinement now recomputes exact two-pass stats."""
+    rng = np.random.default_rng(2)
+    T = rng.standard_normal(1000).cumsum()
+    T[800:900] = 1e7 * np.sin(np.linspace(0, 3, 100))
+    m = 50
+    _assert_exact_and_no_bad_neighbors(T, m, mlx_stump.stump(T, m), stumpy.stump(T, m), 1e-8)
+
+
+@pytest.mark.slow
+def test_refine_exact_large_walk():
+    """Reported P at the chosen index was drifting linearly with n through
+    the cumsum rolling stats (2.4e-8 at n=131072); with self-contained
+    two-pass refinement stats it sits at machine epsilon."""
+    rng = np.random.default_rng(5)
+    T = rng.standard_normal(32768).cumsum()
+    m = 200
+    mp = mlx_stump.stump(T, m)
+    rows = np.linspace(0, len(mp.P_) - 1, 200).astype(int)
+    worst = max(
+        abs(mp.P_[i] - _fsum_znorm(T, m, i, mp.I_[i])) for i in rows if np.isfinite(mp.P_[i])
+    )
+    assert worst <= 1e-10, f"worst sampled |P - truth| = {worst:.3g}"
+
+
+def test_aamp_mixed_scale_centered():
+    """normalize=False used to compute ssq_q + ssq_t - 2*QT uncentered in
+    float32: on a series with a huge segment, 83% of rows chose neighbors
+    >0.2 raw units worse than STUMPY's (worst 4x). The centered form
+    (||qc - tc||^2 + m*(mu_q - mu_t)^2) removes the cancellation."""
+    import math
+
+    rng = np.random.default_rng(3)
+    T = rng.standard_normal(1500)
+    T[100:350] = 1e5
+    m = 7
+    mp = mlx_stump.stump(T, m, normalize=False)
+    ref = stumpy.aamp(T, m)
+
+    def dist(i, j):
+        d = T[i : i + m] - T[j : j + m]
+        return math.sqrt(math.fsum(d * d))
+
+    worst_p = worst_gap = 0.0
+    for i in range(len(mp.P_)):
+        if not np.isfinite(ref.P_[i]):
+            continue
+        worst_p = max(worst_p, abs(mp.P_[i] - dist(i, mp.I_[i])))
+        if mp.I_[i] != ref.I_[i]:
+            worst_gap = max(worst_gap, dist(i, mp.I_[i]) - dist(i, ref.I_[i]))
+    assert worst_p <= 1e-8
+    assert worst_gap <= 0.01, f"worst raw-unit gap vs STUMPY's neighbor: {worst_gap:.4f}"
+
+    # planted occurrences must survive a raw-unit max_distance like STUMPY's
+    Q = T[500:520].copy()
+    M = mlx_stump.match(Q, T, normalize=False, max_distance=5.0)
+    Mr = stumpy.match(Q, T, normalize=False, max_distance=5.0)
+    assert sorted(int(i) for _, i in M) == sorted(int(i) for _, i in Mr)
+
+
+def test_match_refinement_is_chunked():
+    """max_distance=inf selects every finite entry for refinement; that must
+    stream in byte-budgeted chunks (it used to materialize all l*m float64
+    windows at once — ~GiBs for long series), with identical results."""
+    import mlx_stump._stump as st
+
+    rng = np.random.default_rng(11)
+    T = rng.standard_normal(3000)
+    Q = rng.standard_normal(21)
+    expected = mlx_stump.match(Q, T, max_distance=float("inf"))
+    orig = st._REFINE_MEM_BUDGET
+    st._REFINE_MEM_BUDGET = 21 * 8 * 4 * 7  # ~7 rows per chunk
+    try:
+        got = mlx_stump.match(Q, T, max_distance=float("inf"))
+    finally:
+        st._REFINE_MEM_BUDGET = orig
+    np.testing.assert_array_equal(expected.astype(float), got.astype(float))
+
+
+def test_match_reports_true_near_duplicate_distances():
+    """STUMPY's mass/match do not apply the stump P-norm zero-snap; matches a
+    hair above zero must report their true distances (they used to snap to
+    0.0 and inflate the returned match set)."""
+    rng = np.random.default_rng(4)
+    T = rng.standard_normal(400)
+    pat = rng.standard_normal(12)
+    for p in (50, 150, 300):
+        T[p : p + 12] = pat * (1 + 1e-7 * rng.standard_normal(12))
+    M = mlx_stump.match(pat.copy(), T)
+    Mr = stumpy.match(pat.copy(), T)
+    assert M.shape == Mr.shape
+    near = M[:, 0].astype(float)[:3]
+    assert np.all(near > 0.0) and np.all(near < 1e-5)
+
+
+def test_target_blocks_evenly_split(monkeypatch):
+    """Tiled column blocks are split evenly: a narrow (especially 1-column)
+    trailing block would hit a different matmul kernel whose accumulation
+    can flip float32 near-ties to a different neighbor."""
+    import mlx_stump._engine as eng
+    from mlx_stump._preprocess import preprocess_series
+
+    rng = np.random.default_rng(6)
+    m = 64
+    monkeypatch.setattr(eng, "_MATMUL_WINDOW_BYTES", 0)
+    for n, tile_bytes in [(1093, 4 * m * 256), (2500, 4 * m * 337), (801, 4 * m * 736)]:
+        monkeypatch.setattr(eng, "_TILE_WINDOW_BYTES", tile_bytes)
+        engine = eng.MassEngine(preprocess_series(rng.standard_normal(n), m))
+        widths = [j1 - j0 for j0, j1, _ in engine.target_blocks()]
+        assert sum(widths) == engine.l
+        assert max(widths) <= engine.tile_rows
+        assert max(widths) - min(widths) <= 1
+        assert min(widths) >= 2
 
 
 @pytest.mark.gpu
