@@ -7,11 +7,16 @@ import warnings
 import numpy as np
 
 from ._mass import _as_flag, mass
-from ._preprocess import EXCL_ZONE_DENOM, process_isconstant, rolling_isfinite
+from ._preprocess import (
+    EXCL_ZONE_DENOM,
+    process_isconstant,
+    rolling_isfinite,
+    rolling_mean_sigma,
+)
 from ._stump import _refine_chunk_rows
 
 
-def _refine_candidates(Q, T, D, cutoff, normalize, q_const, t_const):
+def _refine_candidates(Q, T, D, cutoff, normalize, q_const, t_const, M_T=None, Σ_T=None):
     """Float64 re-evaluation of finite profile entries at or below ``cutoff``.
 
     The GPU profile is float32, so a perfect occurrence reads ~1e-3 instead
@@ -30,6 +35,11 @@ def _refine_candidates(Q, T, D, cutoff, normalize, q_const, t_const):
     ``stump``, no P-norm zero-snap is applied: STUMPY's mass/match report
     raw float64 distances (exact duplicates still read 0.0 here because the
     sum of squares is exactly 0 for identical normalized windows).
+
+    ``cutoff`` may be a scalar or per-window array (the non-normalized path
+    widens it for high-energy windows). When the caller supplied precomputed
+    ``M_T``/``Σ_T``, those are honored with STUMPY's own formula — the user
+    asked for distances *under those stats*, exact window stats be damned.
     """
     js = np.nonzero((D <= cutoff) & np.isfinite(D))[0]
     if js.size == 0:
@@ -39,24 +49,34 @@ def _refine_candidates(Q, T, D, cutoff, normalize, q_const, t_const):
     chunk = _refine_chunk_rows(m)
     if normalize:
         Wfull = np.lib.stride_tricks.sliding_window_view(T, m)
-        Qc = Q - Q.mean()
+        mu_q = float(Q.mean())
+        Qc = Q - mu_q
         sig_q = float(np.sqrt(Qc @ Qc / m))
         sig_inv_q = 0.0 if (q_const or sig_q == 0.0) else 1.0 / sig_q
         u = Qc * sig_inv_q
+        user_stats = M_T is not None and Σ_T is not None
         for s in range(0, js.size, chunk):
             idx = js[s : s + chunk]
             W = Wfull[idx].astype(np.float64)
-            W -= W.mean(axis=1)[:, None]
-            sig_t = np.sqrt(np.einsum("ij,ij->i", W, W) / m)
             tc = t_const[idx]
-            pos = (sig_t > 0.0) & ~tc
-            sig_inv_t = np.where(pos, 1.0 / np.where(sig_t > 0.0, sig_t, 1.0), 0.0)
-            W *= sig_inv_t[:, None]
-            W -= u[None, :]
-            d2 = np.einsum("ij,ij->i", W, W)
-            # zero sig_inv on either side means rho == 0 on the GPU; mirror
-            # it, then let the constant-flag rules overwrite as needed
-            d2 = np.where((sig_inv_t == 0.0) | (sig_inv_q == 0.0), 2.0 * m, d2)
+            if user_stats:
+                mu_t = np.asarray(M_T, dtype=np.float64)[idx]
+                sig_t = np.asarray(Σ_T, dtype=np.float64)[idx]
+                pos = (sig_t > 0.0) & ~tc & (sig_inv_q > 0.0)
+                denom = np.where(pos, m * sig_q * sig_t, 1.0)
+                rho = (W @ Q - m * mu_q * mu_t) / denom
+                d2 = np.where(pos, np.maximum(2.0 * m * (1.0 - rho), 0.0), 2.0 * m)
+            else:
+                W -= W.mean(axis=1)[:, None]
+                sig_t = np.sqrt(np.einsum("ij,ij->i", W, W) / m)
+                pos = (sig_t > 0.0) & ~tc
+                sig_inv_t = np.where(pos, 1.0 / np.where(sig_t > 0.0, sig_t, 1.0), 0.0)
+                W *= sig_inv_t[:, None]
+                W -= u[None, :]
+                d2 = np.einsum("ij,ij->i", W, W)
+                # zero sig_inv on either side means rho == 0 on the GPU;
+                # mirror it, the constant-flag rules overwrite as needed
+                d2 = np.where((sig_inv_t == 0.0) | (sig_inv_q == 0.0), 2.0 * m, d2)
             d = np.sqrt(d2)
             D[idx] = np.where(q_const & tc, 0.0, np.where(q_const ^ tc, np.sqrt(m), d))
     else:
@@ -206,12 +226,20 @@ def match(
         scale = float(finite.std()) if finite.size else 1.0
         if not np.isfinite(scale) or scale == 0.0:
             scale = 1.0
-        margin *= scale
+        # the engine's float32 cancellation noise also scales with each
+        # window's OWN energy: an extreme-amplitude window's exact match can
+        # read thousands above zero, so widen its refinement cutoff
+        # per-window or it would never be re-evaluated
+        _, sig_t_raw = rolling_mean_sigma(np.where(np.isfinite(Tf), Tf, 0.0), m)
+        noise = 3.0 * np.sqrt(np.finfo(np.float32).eps * m)
+        margin = margin * scale + noise * (sig_t_raw + float(Qf.std()))
     md = _threshold(D)
-    D = _refine_candidates(Qf, Tf, D, md + atol + margin, normalize, q_const, t_const)
+    D = _refine_candidates(Qf, Tf, D, md + atol + margin, normalize, q_const, t_const, M_T, Σ_T)
     if not isinstance(max_distance, float):
         md = _threshold(D)
-        D = _refine_candidates(Qf, Tf, D, md + atol + margin, normalize, q_const, t_const)
+        D = _refine_candidates(
+            Qf, Tf, D, md + atol + margin, normalize, q_const, t_const, M_T, Σ_T
+        )
     if query_idx is not None:
         D[query_idx] = 0.0
 

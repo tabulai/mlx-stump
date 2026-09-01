@@ -237,6 +237,18 @@ def preprocess_series(
     with np.errstate(divide="ignore"):
         sig_inv = np.where(sigma > 0.0, 1.0 / sigma, 0.0)
 
+    pos = sigma[sigma > 0.0]
+    if pos.size and pos.min() < 1e-13 * max(1.0, float(np.max(np.abs(Ts)))):
+        # e.g. a 1e17-amplitude segment next to unit noise: standardization
+        # then re-rounds the noise below its own variation (float64 has ~16
+        # digits total), so no downstream arithmetic can recover it
+        warnings.warn(
+            "The amplitude dynamic range of this series approaches the float64 "
+            "standardization limit; distances involving its smallest-variance "
+            "windows are unreliable.",
+            stacklevel=3,
+        )
+
     ssq = None
     if not normalize:
         # centered sum of squares: the engine computes the non-normalized

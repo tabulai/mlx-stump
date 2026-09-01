@@ -52,15 +52,18 @@ def _refine_znorm(
     cancellation at all and is relatively accurate down to 0. Stats are
     recomputed here rather than reusing the O(n) cumsum rolling stats: those
     are only ~1e-6-relative after the suspect repair, fine for the float32
-    search but visible in a float64-exact reported value.
+    search but visible in a float64-exact reported value. The windows come
+    from the RAW series (z-normalized distance is affine-invariant): the
+    standardized copy quietly re-rounds every value by eps64 * scale, which
+    a window whose own sigma is far below the global scale cannot afford.
     """
     m = query.m
     out = np.full(I.shape, np.inf)
     valid = np.nonzero(I >= 0)[0]
     if valid.size == 0:
         return out
-    WQ = np.lib.stride_tricks.sliding_window_view(query.Ts, m)
-    WT = np.lib.stride_tricks.sliding_window_view(target.Ts, m)
+    WQ = np.lib.stride_tricks.sliding_window_view(query.T, m)
+    WT = np.lib.stride_tricks.sliding_window_view(target.T, m)
     dmax = 2.0 * np.sqrt(m)  # rho >= -1; sqrt rounding can overshoot 1 ulp
     chunk = _refine_chunk_rows(m)
     for s in range(0, valid.size, chunk):
@@ -68,24 +71,28 @@ def _refine_znorm(
         tj = I[qi]
         qc = query.isconstant[qi]
         tc = target.isconstant[tj]
-        qw = WQ[qi]  # fancy indexing copies, so everything can be in place
-        qw -= qw.mean(axis=1)[:, None]
-        sq = np.sqrt(np.einsum("ij,ij->i", qw, qw) / m)
-        tw = WT[tj]
-        tw -= tw.mean(axis=1)[:, None]
-        st = np.sqrt(np.einsum("ij,ij->i", tw, tw) / m)
-        sq_inv = np.where((sq > 0.0) & ~qc, 1.0 / np.where(sq > 0.0, sq, 1.0), 0.0)
-        st_inv = np.where((st > 0.0) & ~tc, 1.0 / np.where(st > 0.0, st, 1.0), 0.0)
-        qw *= sq_inv[:, None]
-        tw *= st_inv[:, None]
-        qw -= tw
-        d2 = np.einsum("ij,ij->i", qw, qw)
-        # a zero sig_inv on either side (constant flag, or a truly flat
-        # window flagged non-constant) means rho == 0 on the GPU; mirror
-        # that, and let the constant-flag rules below overwrite as needed
-        d2 = np.where((sq_inv == 0.0) | (st_inv == 0.0), 2.0 * m, d2)
-        d2[d2 < P_NORM_THRESHOLD] = 0.0
-        d = np.minimum(np.sqrt(d2), dmax)
+        # raw windows may hold NaN/inf; those rows are overwritten with inf
+        # below, so let the intermediate arithmetic run silently
+        with np.errstate(invalid="ignore", over="ignore", divide="ignore"):
+            qw = WQ[qi]  # fancy indexing copies, so everything can be in place
+            qw -= qw.mean(axis=1)[:, None]
+            sq = np.sqrt(np.einsum("ij,ij->i", qw, qw) / m)
+            tw = WT[tj]
+            tw -= tw.mean(axis=1)[:, None]
+            st = np.sqrt(np.einsum("ij,ij->i", tw, tw) / m)
+            sq_inv = np.where((sq > 0.0) & ~qc, 1.0 / np.where(sq > 0.0, sq, 1.0), 0.0)
+            st_inv = np.where((st > 0.0) & ~tc, 1.0 / np.where(st > 0.0, st, 1.0), 0.0)
+            qw *= sq_inv[:, None]
+            tw *= st_inv[:, None]
+            qw -= tw
+            d2 = np.einsum("ij,ij->i", qw, qw)
+            # a zero sig_inv on either side (constant flag, or a truly flat
+            # window flagged non-constant) means rho == 0 on the GPU; mirror
+            # that, and let the constant-flag rules below overwrite as needed
+            d2 = np.where((sq_inv == 0.0) | (st_inv == 0.0), 2.0 * m, d2)
+            d2[~np.isfinite(d2)] = 2.0 * m  # NaN/inf windows: masked below
+            d2[d2 < P_NORM_THRESHOLD] = 0.0
+            d = np.minimum(np.sqrt(d2), dmax)
         d = np.where(qc & tc, 0.0, np.where(qc ^ tc, np.sqrt(m), d))
         d[~(query.isfinite[qi] & target.isfinite[tj])] = np.inf
         out[qi] = d

@@ -24,7 +24,7 @@ classification on the same silicon.
 ## Status
 
 **v0.1 development — the batched-MASS engine is implemented and golden-tested
-against STUMPY** (123 golden and regression tests). Distance profiles are
+against STUMPY** (128 golden and regression tests). Distance profiles are
 computed in bulk on the GPU as dense matmuls against the doubly-centered
 subsequence matrix — materialized in one piece for moderate `n*m`, streamed
 as column blocks beyond that — with a fused `mx.compile` distance+argmin
@@ -196,6 +196,16 @@ python bench/bench_stump.py --sizes 16384 65536 262144 --m 200
 - With `normalize=False`, a `T_subseq_isfinite` override marking a
   NaN-containing window as finite computes its distance against the
   zero-filled series; STUMPY propagates NaN there.
+- `normalize=False` searches in float32: within one series, an amplitude
+  dynamic range beyond ~1e7 between segments can push the search noise for
+  windows overlapping the extreme segment past near-tie level (reported `P`
+  stays float64-exact for the chosen neighbor, and `match` widens its
+  re-evaluation cutoff per-window so true matches are not dropped). STUMPY's
+  CPU `aamp` computes in float64 and is exact there.
+- A series whose amplitude dynamic range approaches float64's ~16 digits
+  (≳1e13 between its largest values and its smallest window variation)
+  triggers a warning: global standardization cannot faithfully represent
+  the smallest-variance windows at all.
 - Like STUMPY's `gpu_stump`, streaming (`stumpi`) is out of scope for the GPU
   path for now.
 

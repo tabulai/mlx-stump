@@ -104,7 +104,11 @@ class MassEngine:
         self.m = target.m
         self.l = target.l
         self.tiled = self.l * self.m * 4 > _MATMUL_WINDOW_BYTES
-        self.tile_rows = self.l if not self.tiled else max(1, _TILE_WINDOW_BYTES // (4 * self.m))
+        # floor of 4 rows: 1-2-wide blocks hit GEMV-style kernels whose
+        # accumulation differs from the wide-block GEMM in the last float32
+        # bit and flips near-ties (costs at most ~4x _TILE_WINDOW_BYTES per
+        # block for gigantic m, where a single window dwarfs the tile anyway)
+        self.tile_rows = self.l if not self.tiled else max(4, _TILE_WINDOW_BYTES // (4 * self.m))
         self.W_T = None
         if not self.tiled:
             self.W_T = self._build_block_T(0, self.l)

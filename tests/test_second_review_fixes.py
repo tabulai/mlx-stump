@@ -357,6 +357,91 @@ def test_target_blocks_evenly_split(monkeypatch):
         assert min(widths) >= 2
 
 
+# ------------------------------------- adversarial-verification round three
+def test_refine_raw_frame_exact():
+    """Refinement runs on the RAW series: the standardized copy re-rounds
+    every value by eps64 * scale, so a huge segment elsewhere in the series
+    used to cost ordinary windows ~5 digits of reported-P accuracy
+    (2.7e-5 error on perfectly representable windows)."""
+    rng = np.random.default_rng(0)
+    T = np.concatenate([np.full(2000, 2e9), 1.0 + 0.01 * rng.standard_normal(2000)])
+    m = 50
+    mp = mlx_stump.stump(T, m)
+    rows = range(2100, 3951, 25)
+    worst = max(
+        abs(mp.P_[i] - _fsum_znorm(T, m, i, mp.I_[i])) for i in rows if np.isfinite(mp.P_[i])
+    )
+    assert worst <= 1e-9, f"worst |P - truth| = {worst:.3g}"
+
+
+@pytest.mark.slow
+def test_aamp_extreme_spike_match_not_dropped():
+    """normalize=False float32 noise scales with each window's own energy:
+    a 1e6-amplitude pattern in unit noise used to read ~4700 at its own
+    exact occurrence, past the global-scale refinement cutoff, silently
+    dropping the match. The cutoff is per-window now."""
+    rng = np.random.default_rng(31337)
+    T = rng.standard_normal(400_000)
+    pat = rng.standard_normal(100) * 1e6
+    T[50_000:50_100] = pat
+    T[300_000:300_100] = pat + 1e-3 * rng.standard_normal(100)
+    Q = T[50_000:50_100].copy()
+    M = mlx_stump.match(Q, T, normalize=False, max_distance=10.0)
+    Mr = stumpy.match(Q, T, normalize=False, max_distance=10.0)
+    assert sorted(int(i) for _, i in M) == sorted(int(i) for _, i in Mr) == [50_000, 300_000]
+
+
+def test_match_precomputed_stats_honored_in_refinement():
+    """User-supplied M_T/Σ_T define the distances (STUMPY computes from them
+    verbatim); the float64 refinement used to silently recompute exact stats
+    and report a hybrid profile."""
+    rng = np.random.default_rng(12)
+    T = rng.standard_normal(400)
+    Q = rng.standard_normal(21)
+    M_T, Σ_T = stumpy.core.compute_mean_std(T, 21)
+    M = mlx_stump.match(Q, T, M_T=M_T, Σ_T=Σ_T * 2.0, max_distance=float("inf"), max_matches=5)
+    Mr = stumpy.match(Q, T, M_T=M_T, Σ_T=Σ_T * 2.0, max_distance=float("inf"), max_matches=5)
+    np.testing.assert_array_equal(M[:, 1].astype(int), Mr[:, 1].astype(int))
+    np.testing.assert_allclose(M[:, 0].astype(float), Mr[:, 0].astype(float), atol=1e-9)
+
+
+def test_dynamic_range_warning():
+    """Amplitude ratios near float64's ~16 digits destroy small windows at
+    standardization itself; that must warn — and ordinary flatline-with-
+    jitter data must not."""
+    rng = np.random.default_rng(7)
+    T = np.concatenate([rng.standard_normal(2048) * 1e18, rng.standard_normal(4096)])
+    with pytest.warns(UserWarning, match="dynamic range"):
+        mlx_stump.stump(T, 64)
+    T2 = rng.standard_normal(2000)
+    T2[900:1100] = 5.0 + 1e-9 * rng.standard_normal(200)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        mlx_stump.stump(T2, 64)
+
+
+def test_tiny_tiles_floor_at_four_rows(monkeypatch):
+    """tile_rows floors at 4: 1-2-wide blocks would hit GEMV-style kernels
+    whose accumulation flips float32 ties (verified bit-equal at width>=3 on
+    a tie-dense pure sine)."""
+    import mlx_stump._engine as eng
+    from mlx_stump._preprocess import preprocess_series
+
+    T = np.sin(0.11 * np.arange(3000))
+    m = 100
+    ref = mlx_stump.stump(T, m)
+    monkeypatch.setattr(eng, "_MATMUL_WINDOW_BYTES", 0)
+    monkeypatch.setattr(eng, "_TILE_WINDOW_BYTES", 8 * m)  # would be tile_rows=2
+    engine = eng.MassEngine(preprocess_series(T, m))
+    widths = [j1 - j0 for j0, j1, _ in engine.target_blocks()]
+    assert engine.tile_rows == 4
+    assert min(widths) >= 3
+    mp = mlx_stump.stump(T, m)
+    np.testing.assert_array_equal(mp.I_, ref.I_)
+    np.testing.assert_allclose(mp.P_, ref.P_, atol=0, rtol=0)
+    np.testing.assert_array_equal(mp.right_I_, ref.right_I_)
+
+
 @pytest.mark.gpu
 @pytest.mark.slow
 def test_topk_peak_memory_bounded():
