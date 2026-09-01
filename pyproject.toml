@@ -1,0 +1,85 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mlx-stump"
+dynamic = ["version"]
+description = "Matrix profile on Apple Silicon GPUs via MLX, with a STUMPY-compatible API"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Bojan Tunguz" }]
+keywords = [
+    "mlx",
+    "metal",
+    "matrix-profile",
+    "time-series",
+    "apple-silicon",
+    "anomaly-detection",
+    "motif-discovery",
+    "stumpy",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "mlx>=0.30",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+# golden-test oracle and CPU benchmark baseline; the test harness needs the
+# mparray attributes introduced in stumpy 1.13 (1.12 fails 32 tests)
+dev = ["pytest>=8", "ruff>=0.5", "stumpy>=1.13"]
+bench = ["stumpy>=1.13"]
+
+[project.urls]
+Homepage = "https://github.com/tabulai/mlx-stump"
+Documentation = "https://github.com/tabulai/mlx-stump#readme"
+Issues = "https://github.com/tabulai/mlx-stump/issues"
+Source = "https://github.com/tabulai/mlx-stump"
+
+[tool.hatch.version]
+path = "src/mlx_stump/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mlx_stump"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/LICENSE",
+    "/README.md",
+    "/pyproject.toml",
+    "/src",
+    "/tests",
+    "/bench",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+# E741: single-letter names like `l`/`I` are matrix-profile convention (STUMPY uses them)
+ignore = ["E741"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: test requires a Metal GPU (skipped on CPU-only runners)",
+    "slow: long-running test",
+]
