@@ -56,6 +56,10 @@ def _refine_znorm(
     from the RAW series (z-normalized distance is affine-invariant): the
     standardized copy quietly re-rounds every value by eps64 * scale, which
     a window whose own sigma is far below the global scale cannot afford.
+    Each window is first shifted by its own first element — `x - x0` errs at
+    most eps64 * |x - x0|, proportional to the window's SPREAD — so a large
+    common offset (timestamps at 1e12, say) cannot poison the window mean,
+    whose rounding would otherwise scale with eps64 * |offset|.
     """
     m = query.m
     out = np.full(I.shape, np.inf)
@@ -75,9 +79,11 @@ def _refine_znorm(
         # below, so let the intermediate arithmetic run silently
         with np.errstate(invalid="ignore", over="ignore", divide="ignore"):
             qw = WQ[qi]  # fancy indexing copies, so everything can be in place
+            qw -= qw[:, 0].copy()[:, None]
             qw -= qw.mean(axis=1)[:, None]
             sq = np.sqrt(np.einsum("ij,ij->i", qw, qw) / m)
             tw = WT[tj]
+            tw -= tw[:, 0].copy()[:, None]
             tw -= tw.mean(axis=1)[:, None]
             st = np.sqrt(np.einsum("ij,ij->i", tw, tw) / m)
             sq_inv = np.where((sq > 0.0) & ~qc, 1.0 / np.where(sq > 0.0, sq, 1.0), 0.0)

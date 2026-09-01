@@ -442,6 +442,35 @@ def test_tiny_tiles_floor_at_four_rows(monkeypatch):
     np.testing.assert_array_equal(mp.right_I_, ref.right_I_)
 
 
+def test_refine_exact_at_large_common_offset():
+    """Raw-frame refinement must shift each window by its own first element:
+    a large common offset (unix-ms timestamps, say) otherwise rounds the
+    two-pass window mean at eps64*offset and cost ~9 digits of reported P
+    (7e-7 error at offset 1e12; the exact truth costs nothing)."""
+    rng = np.random.default_rng(42)
+    base = rng.standard_normal(3000)
+    m = 50
+    for offset in (1e9, 1.7e12):
+        T = offset + base
+        # ground truth from T itself, shifted exactly (all values share one
+        # binade, so T - T[0] is Sterbenz-exact); comparing against `base`
+        # would ignore that T's own representation quantized the data
+        Tshift = T - T[0]
+        mp = mlx_stump.stump(T, m)
+        rows = range(0, len(mp.P_), 37)
+        worst = max(
+            abs(mp.P_[i] - _fsum_znorm(Tshift, m, i, mp.I_[i]))
+            for i in rows
+            if np.isfinite(mp.P_[i])
+        )
+        assert worst <= 1e-10, f"offset {offset}: worst |P - truth| = {worst:.3g}"
+    # match's refinement shares the mechanism
+    T = 1.7e12 + base
+    Q = T[100:121].copy()
+    M = mlx_stump.match(Q, T, max_distance=1e-3)
+    assert int(M[0, 1]) == 100 and float(M[0, 0]) == 0.0
+
+
 @pytest.mark.gpu
 @pytest.mark.slow
 def test_topk_peak_memory_bounded():

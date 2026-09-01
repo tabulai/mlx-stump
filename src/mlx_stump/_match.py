@@ -50,7 +50,10 @@ def _refine_candidates(Q, T, D, cutoff, normalize, q_const, t_const, M_T=None, Î
     if normalize:
         Wfull = np.lib.stride_tricks.sliding_window_view(T, m)
         mu_q = float(Q.mean())
-        Qc = Q - mu_q
+        # shift by the first element: `x - x0` errs with the window's SPREAD,
+        # so a large common offset cannot poison the two-pass mean below
+        Qs = Q - Q[0]
+        Qc = Qs - Qs.mean()
         sig_q = float(np.sqrt(Qc @ Qc / m))
         sig_inv_q = 0.0 if (q_const or sig_q == 0.0) else 1.0 / sig_q
         u = Qc * sig_inv_q
@@ -67,6 +70,7 @@ def _refine_candidates(Q, T, D, cutoff, normalize, q_const, t_const, M_T=None, Î
                 rho = (W @ Q - m * mu_q * mu_t) / denom
                 d2 = np.where(pos, np.maximum(2.0 * m * (1.0 - rho), 0.0), 2.0 * m)
             else:
+                W -= W[:, 0].copy()[:, None]
                 W -= W.mean(axis=1)[:, None]
                 sig_t = np.sqrt(np.einsum("ij,ij->i", W, W) / m)
                 pos = (sig_t > 0.0) & ~tc

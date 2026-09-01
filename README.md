@@ -24,7 +24,7 @@ classification on the same silicon.
 ## Status
 
 **v0.1 development — the batched-MASS engine is implemented and golden-tested
-against STUMPY** (128 golden and regression tests). Distance profiles are
+against STUMPY** (129 golden and regression tests). Distance profiles are
 computed in bulk on the GPU as dense matmuls against the doubly-centered
 subsequence matrix — materialized in one piece for moderate `n*m`, streamed
 as column blocks beyond that — with a fused `mx.compile` distance+argmin
@@ -189,10 +189,12 @@ python bench/bench_stump.py --sizes 16384 65536 262144 --m 200
 - A callable `max_distance` passed to `match` is invoked twice (once on the
   float32 profile, once on the float64-refined one); STUMPY calls it once on
   its exact profile.
-- A truly constant window that a user flag array explicitly marks
-  non-constant is ranked and reported at `sqrt(2m)` (its `1/σ` is taken as
-  0, so `ρ = 0`); STUMPY's `σ = 0 → 1` clamp yields a slightly different
-  convention for the same undefined quantity.
+- A window whose sigma is 0 without being flagged constant — a truly
+  constant window that a user flag array marks non-constant, or a
+  user-supplied `Σ_T` entry of 0 on a non-constant window — is ranked and
+  reported at `sqrt(2m)` (its `1/σ` is taken as 0, so `ρ = 0`). STUMPY's
+  denominator clamp yields a different convention (0 or a huge value) for
+  the same undefined quantity.
 - With `normalize=False`, a `T_subseq_isfinite` override marking a
   NaN-containing window as finite computes its distance against the
   zero-filled series; STUMPY propagates NaN there.
