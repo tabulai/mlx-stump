@@ -87,8 +87,11 @@ def mass(
     Precomputed ``M_T``/``Σ_T`` (both required, shape ``(l,)``): ``Σ_T`` is
     honored as the per-window scale of the z-normalized distance, so passing
     STUMPY's ``compute_mean_std`` output reproduces its ranking; a window
-    whose stats are not finite is reported as inf (STUMPY's ``M_T == inf``
-    convention). ``M_T`` is *not* used to form the covariance: every window
+    whose ``M_T`` is not finite is reported as inf (STUMPY's ``M_T == inf``
+    convention, applied ahead of the constant-window rules), and a
+    non-finite ``Σ_T`` entry acts as a zero sigma (``sqrt(2m)``, or the
+    constant-window value when the window is flagged constant, as STUMPY
+    does for ``inf``). ``M_T`` is *not* used to form the covariance: every window
     is centered by its own exact float64 mean, which is what keeps the
     product cancellation-free — STUMPY's ``QT - m·μ_Q·M_T`` form amplifies
     the float64 rounding of ``M_T`` by ``(μ/σ)²`` and collapses on offset
@@ -162,12 +165,17 @@ def mass(
             sigma = Σ_T / prep.scale  # raw-frame sigma -> standardized frame
             sigma[prep.isconstant] = 0.0
             with np.errstate(divide="ignore", invalid="ignore"):
-                sig_inv = np.where(sigma > 0.0, 1.0 / sigma, 0.0)
+                # a non-finite Σ_T entry acts as a zero sigma: rho = 0 and
+                # sqrt(2m), unless a constant flag applies first (STUMPY:
+                # inf -> sqrt(2m), NaN -> NaN, constant rules before both)
+                sig_inv = np.where(np.isfinite(sigma) & (sigma > 0.0), 1.0 / sigma, 0.0)
             prep.sig_inv = sig_inv
             prep.sig_inv_mx = mx.array(sig_inv.astype(np.float32))
-            usable = np.isfinite(M_T) & np.isfinite(Σ_T)
-            if not usable.all():
-                prep.isfinite = prep.isfinite & usable
+            # STUMPY reports inf wherever M_T is inf, ahead of the constant
+            # rules; a NaN M_T (NaN in STUMPY) is folded into that convention
+            bad_mean = ~np.isfinite(M_T)
+            if bad_mean.any():
+                prep.isfinite = prep.isfinite & ~bad_mean
                 prep.isfinite_mx = mx.array(prep.isfinite)
 
         # standardize Q by its own moments (the window then has mean 0, sigma
@@ -194,6 +202,7 @@ def mass(
             mx.synchronize()  # completion handler returns the block's buffers
             D2[j0:j1] = np.array(d2[0], dtype=np.float64)
             del W, d2  # release this block before the next one is built
+        del Qb, sig_inv_q, isconst_q, isfinite_q
     else:
         finite = np.concatenate([Q, T[np.isfinite(T)]])
         center = float(finite.mean())
@@ -219,10 +228,13 @@ def mass(
             mx.synchronize()
             D2[j0:j1] = np.array(d2[0], dtype=np.float64)
             del W, d2
+        del Qb, ssq_q, mu_q_mx, isfinite_q
 
-    # hand the window block(s) MLX cached back to the system: nothing of the
-    # GPU phase is needed any more, and nothing should stay resident after
+    # nothing of the GPU phase is needed any more: drop every device array
+    # (window block, query batch, per-window stats) BEFORE clearing MLX's
+    # buffer cache, or they would enter it when this function returns
     del engine
+    prep.release_device()
     mx.clear_cache()
     profile = np.sqrt(D2)
     if not normalize:

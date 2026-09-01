@@ -93,20 +93,33 @@ def resident_block_bytes(l: int, m: int) -> int:
     return -(-l // nblocks) * m * 4
 
 
-def estimated_peak_bytes(l: int, m: int) -> int:
-    """Ceiling on the bytes one join needs beyond its O(n) per-series arrays.
+def estimated_peak_bytes(l: int, m: int, k: int = 1, self_join: bool = True) -> int:
+    """Estimate of the bytes one join needs beyond its O(n) per-series arrays.
 
     The larger of the upload transient (the block staged in numpy plus its
     device copy plus the centering temporary) and the sweep phase (the
-    resident block plus the per-batch intermediates budget). The budget is
-    enforced batch by batch: each batch is synchronized before the next one
-    allocates and the trailing batch is computed at full width, so exactly
-    one set of intermediates exists. ``stump`` releases the block and MLX's
-    cached buffers before its float64 refinement (whose chunk budget, 256
-    MiB, is below the intermediates budget), and ``mass`` on return.
+    resident block plus the per-batch intermediates budget — or one batch
+    row, when even a single row exceeds the budget), plus the host-side
+    outputs (float64 profile and int64 indices per neighbor, left/right
+    indices). The budget is enforced batch by batch: each batch is
+    synchronized before the next one allocates and the trailing batch is
+    computed at full width, so exactly one set of intermediates exists;
+    ``stump`` releases the block and MLX's cached buffers before its float64
+    refinement (whose chunk budget, 256 MiB, is below the intermediates
+    budget), and ``mass`` on return.
+
+    It is an estimate, not a hard cap: MLX's allocator rounds buffers up
+    (about +0.5% observed), the O(n) series and stat arrays are not
+    included, and the numbers are MLX's own active-memory peak plus host
+    memory (GPU-written buffers are invisible to RSS on macOS).
     """
     block = resident_block_bytes(l, m)
-    return max(2 * block + _CENTER_BYTES, block + _CHUNK_MEM_BUDGET)
+    width = block // (m * 4)  # columns of the resident block
+    cell = 16 if k == 1 else (48 if self_join else 40)
+    one_row = width * cell + _query_batch_bytes(m)
+    sweep = block + max(_CHUNK_MEM_BUDGET, one_row)
+    outputs = l * (16 * k + 16)
+    return max(2 * block + _CENTER_BYTES, sweep) + outputs
 
 
 def _query_batch_bytes(m: int) -> int:

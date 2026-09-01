@@ -45,6 +45,35 @@ def _discord_topk(P: np.ndarray, excl: int, k: int = 10) -> set[int]:
     return set(out)
 
 
+def provenance() -> str:
+    """One line naming the machine, software and commit the numbers came from."""
+    import datetime
+    import platform
+    import subprocess
+
+    import mlx.core as mx
+
+    def _run(*cmd):
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout.strip()
+        except Exception:  # noqa: BLE001 - provenance is best effort
+            return "unknown"
+
+    chip = _run("sysctl", "-n", "machdep.cpu.brand_string")
+    commit = _run("git", "rev-parse", "--short", "HEAD")
+    try:
+        import stumpy
+
+        stumpy_v = stumpy.__version__
+    except ImportError:
+        stumpy_v = "not installed"
+    return (
+        f"{chip}, macOS {platform.mac_ver()[0]}, Python {platform.python_version()}, "
+        f"mlx {mx.__version__}, numpy {np.__version__}, stumpy {stumpy_v}, "
+        f"mlx-stump {mlx_stump.__version__} @ {commit}, {datetime.date.today().isoformat()}"
+    )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--sizes", type=int, nargs="+", default=[16384, 65536, 131072])
@@ -78,7 +107,8 @@ def main() -> None:
         "| max dP | idx agree | top-10 discords |"
     )
     rule = "|---|---|---|---|---|---|---|"
-    print(f"\nrandom walk, m={m}, best of {args.repeat}\n")
+    print(f"\n{provenance()}")
+    print(f"random walk, m={m}, best of {args.repeat}\n")
     print(header)
     print(rule)
 

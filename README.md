@@ -24,7 +24,7 @@ classification on the same silicon.
 ## Status
 
 **v0.1 development — the batched-MASS engine is implemented and golden-tested
-against STUMPY** (200 golden and regression tests). Distance profiles are
+against STUMPY** (207 golden and regression tests). Distance profiles are
 computed in bulk on the GPU as dense matmuls against the doubly-centered
 subsequence matrix — materialized in one piece for moderate `n*m`, streamed
 as column blocks beyond that — with a fused `mx.compile` distance+argmin
@@ -51,9 +51,14 @@ optional extra used only for golden tests and CPU benchmarking (`pip install
 
 Pushing a `v<version>` tag builds the wheel and sdist, tests the *built
 wheel* in a clean environment, and publishes to PyPI via trusted publishing.
-The workflow refuses a tag that does not exactly match `__version__` in
-`src/mlx_stump/__init__.py`, and refuses `.dev`/local versions — so bump the
-version (e.g. to `0.1.0`), commit, then tag `v0.1.0`.
+The workflow refuses a tag whose commit is not on `main`, one that does not
+exactly match `__version__` in `src/mlx_stump/__init__.py` (in canonical
+PEP 440 form), and `.dev`/local versions — so bump the version (e.g. to
+`0.1.0`) on `main`, let CI pass, then tag that commit `v0.1.0`. Two
+repository settings should back the workflow up and are not yet
+configured: a tag ruleset restricting who may create `v*` tags, and
+required reviewers on the `pypi` environment that the PyPI trusted
+publisher is scoped to.
 
 ## Quickstart
 
@@ -207,15 +212,20 @@ python bench/bench_stump.py --sizes 16384 65536 262144 --m 200
   stage (block centering, sigma repair; the refinement chunk is ≤ 256 MiB
   and runs after the window matrix and MLX's cached batch buffers have been
   released). Each block exists twice while it is uploaded (numpy staging
-  plus the device copy), so the process-wide ceiling for one call is about
-  `2·block + 64 MiB` during upload or `block + 384 MiB` during the sweep,
-  plus the O(n) per-series arrays — ~640 MiB for the largest dense block,
-  ~512 MiB in tiled mode (`mlx_stump._engine.estimated_peak_bytes` gives
-  the number for a given `l`, `m`; measured with MLX's own peak counter
-  plus host RSS — note that GPU-written buffers do not show up in RSS on
-  macOS, only in the process footprint). `mass`/`match` evaluate one block
-  at a time and never hold more, and nothing stays cached in MLX after a
-  call returns. Pass `chunk_size` to trade memory for larger batches.
+  plus the device copy), so the process-wide peak for one call is
+  estimated as `2·block + 64 MiB` during upload or `block + 384 MiB`
+  during the sweep, plus the O(l·k) outputs and the O(n) per-series arrays
+  — ~640 MiB for the largest dense block, ~512 MiB in tiled mode
+  (`mlx_stump._engine.estimated_peak_bytes(l, m, k)` gives the number).
+  That is an estimate with headroom, not a literal cap: MLX's allocator
+  rounds buffers up (about +0.5% observed), a gigantic `l` can make even a
+  one-row batch exceed the intermediates budget, and the figures are MLX's
+  own active-memory peak plus host memory (GPU-written buffers do not show
+  up in RSS on macOS, only in the process footprint). `mass`/`match`
+  evaluate one block at a time and never hold more, and every device array
+  is dropped before the cache is cleared, so nothing stays cached in MLX
+  after a call returns. Pass `chunk_size` to trade memory for larger
+  batches.
 - Out-of-range `query_idx` values (including negative ones) raise
   `ValueError`. STUMPY silently wraps `query_idx <= -m` through numpy
   negative indexing and fabricates a zero-distance match at a negative
@@ -233,16 +243,23 @@ python bench/bench_stump.py --sizes 16384 65536 262144 --m 200
   profile; a callable with side effects would observe the difference.
 - Precomputed `M_T`/`Σ_T` for `mass`/`match`: `Σ_T` is honored as the
   per-window scale of the distance (STUMPY's ranking is reproduced from its
-  own `compute_mean_std` output), and a window with non-finite stats is
-  reported as inf, but `M_T` does not enter the covariance — every window
+  own `compute_mean_std` output), but `M_T` does not enter the covariance — every window
   is centered by its own exact float64 mean, because STUMPY's
   `QT − m·μ_Q·M_T` form amplifies `M_T`'s rounding by `(μ/σ)²` and collapses
   on offset data (self-match errors up to ~0.1 at offset 1e6, seed-dependent,
   and a meaningless ranking at 1e9). A deliberately biased `M_T` therefore
   changes nothing here, whereas it changes STUMPY's result. With a
-  user-supplied `Σ_T`, a perfect match is reported through `2m(1 − ρ)` and
-  can read up to ~`sqrt(2m·ε)` (≈ 1e-7) rather than exactly 0, like STUMPY;
-  the exact-stats path reports exactly 0.
+  user-supplied `Σ_T`, a near-perfect match is reported through STUMPY's
+  `2m(1 − ρ)`, so `Σ_T`'s own relative rounding δ surfaces as a floor of
+  `sqrt(2m·δ)`: ≈ 1e-7 at unit scale, but ~8e-4 at offset 1e12 and ~0.06 at
+  offset 1e14 even with `compute_mean_std`'s own output. Windows
+  bitwise-identical to the query are reported as exactly 0 regardless;
+  for jittered near-duplicates under thresholds tighter than that floor,
+  omit `M_T`/`Σ_T` (the exact-stats path has no such floor). A window
+  whose `M_T` is not finite is reported as inf ahead of the constant-window
+  rules, as in STUMPY; a non-finite `Σ_T` entry acts as a zero sigma
+  (`sqrt(2m)`, or the constant-window value when the window is flagged
+  constant — STUMPY's behavior for `inf`; it yields NaN for a NaN `Σ_T`).
 - `Q_subseq_isconstant` must be a boolean (Python/NumPy bool, or a boolean
   array of size 1): non-boolean values such as `"False"` or `0` raise
   `ValueError` rather than being coerced. Plain booleans and boolean *lists*

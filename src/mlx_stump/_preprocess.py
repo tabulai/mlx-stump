@@ -209,12 +209,22 @@ class PreprocessedSeries:
     # (hi_q - hi_t) is exact for nearby means (Sterbenz) and lo carries the
     # residual, so the device difference is accurate to float32 of the
     # difference itself.
-    Ts_mx: mx.array = field(repr=False, default=None)
     sig_inv_mx: mx.array = field(repr=False, default=None)
     isfinite_mx: mx.array = field(repr=False, default=None)
     isconstant_mx: mx.array = field(repr=False, default=None)
     ssq_mx: mx.array = field(repr=False, default=None)
     mu_mx: mx.array = field(repr=False, default=None)  # (l, 2) float32 [hi, lo]
+
+    def release_device(self) -> None:
+        """Drop the device-side copies (the CPU arrays stay).
+
+        Call once the GPU phase is over and before ``mx.clear_cache()``:
+        arrays still referenced when the cache is cleared land in it when
+        this object is garbage-collected later (17 MiB after a
+        ``mass(n=1e6)`` call, 86 MiB at n=5e6).
+        """
+        self.sig_inv_mx = self.isfinite_mx = self.isconstant_mx = None
+        self.ssq_mx = self.mu_mx = None
 
 
 def preprocess_series(
@@ -310,7 +320,6 @@ def preprocess_series(
         mu=mu,
         sig_inv=sig_inv,
         ssq=ssq,
-        Ts_mx=mx.array(Ts.astype(np.float32)),
         sig_inv_mx=mx.array(sig_inv.astype(np.float32)),
         isfinite_mx=mx.array(isfinite),
         isconstant_mx=mx.array(isconstant),

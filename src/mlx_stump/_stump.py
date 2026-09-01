@@ -445,6 +445,8 @@ def stump(
     # float64 chunks, so the documented ceiling holds one phase at a time and
     # nothing stays cached after the call
     del engine
+    A.release_device()
+    Bs.release_device()  # the same object for self-joins; idempotent
     mx.clear_cache()
 
     # float64 re-evaluation of the profile values at the chosen indices

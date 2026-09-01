@@ -6,10 +6,13 @@ name: Release
 # token is stored in the repo.
 #
 # Release procedure: bump `__version__` in src/mlx_stump/__init__.py to the
-# final/pre-release version, commit, then push the tag `v<version>`. The
-# build job refuses a tag that does not name that exact version (or a
-# `.dev`/local version), and it tests the wheel it is about to upload, not
-# the source tree.
+# final/pre-release version, commit on main, let CI pass, then push the tag
+# `v<version>` at that commit. The build job refuses a tag whose commit is
+# not on main, or that does not name that exact version (or a `.dev`/local
+# version), and it tests the wheel it is about to upload, not the source
+# tree. Repository settings should back this up: a tag ruleset restricting
+# who may create `v*` tags, and required reviewers on the `pypi`
+# environment the trusted publisher is scoped to.
 
 on:
   push:
@@ -20,6 +23,15 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # merge-base needs history
+      - name: Check that the tagged commit is on main
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$(git rev-parse HEAD^{commit})" origin/main; then
+            echo "release refused: ${GITHUB_REF_NAME} points at a commit that is not on main" >&2
+            exit 1
+          fi
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

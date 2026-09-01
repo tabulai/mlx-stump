@@ -39,12 +39,15 @@ def _refine_candidates(Q, T, js, normalize, q_const, t_const, Σ_T=None):
     0); with a user-supplied ``Σ_T`` it is STUMPY's ``2m(1 - rho)`` with
     ``rho = cov / (m*sigma_q*Σ_T)`` from that same exact centered
     covariance, so the user's per-window scale is honored without the
-    cancellation. ``q_const``/``t_const`` are the resolved constant flags
+    cancellation; ``Σ_T``'s own relative rounding ``delta`` then surfaces
+    as a floor of ``sqrt(2m*delta)`` on near-perfect matches, so windows
+    bitwise-identical to ``Q`` are snapped to 0 (their distance is 0 by
+    definition). ``q_const``/``t_const`` are the resolved constant flags
     (including any user overrides), applied exactly like the GPU path
     applies them. Unlike ``stump``, no P-norm zero-snap is applied: STUMPY's
     mass/match report raw float64 distances (exact duplicates still read
-    0.0 here because the sum of squares is exactly 0 for identical
-    normalized windows).
+    0.0 in the exact-stats branch because the sum of squares is exactly 0
+    for identical normalized windows).
     """
     js = np.asarray(js, dtype=np.int64)
     out = np.empty(js.size, dtype=np.float64)
@@ -65,6 +68,13 @@ def _refine_candidates(Q, T, js, normalize, q_const, t_const, Σ_T=None):
             idx = js[s : s + chunk]
             W = Wfull[idx].astype(np.float64)
             tc = t_const[idx]
+            if Σ_T is not None:
+                # a window bitwise-identical to Q is at distance 0 by
+                # definition; under the user's Σ_T the 2m(1 - rho) form
+                # below would report sqrt(2m*delta) for Σ_T's own relative
+                # rounding delta instead (8e-4 at offset 1e12 with STUMPY's
+                # compute_mean_std, 0.06 at 1e14)
+                dup = np.all(W == Q[None, :], axis=1)
             W -= W[:, 0].copy()[:, None]
             W -= W.mean(axis=1)[:, None]
             if Σ_T is not None:
@@ -73,6 +83,7 @@ def _refine_candidates(Q, T, js, normalize, q_const, t_const, Σ_T=None):
                 denom = np.where(pos, m * sig_q * sig_t, 1.0)
                 rho = (W @ Qc) / denom
                 d2 = np.where(pos, np.maximum(2.0 * m * (1.0 - rho), 0.0), 2.0 * m)
+                d2[dup] = 0.0
             else:
                 sig_t = np.sqrt(np.einsum("ij,ij->i", W, W) / m)
                 pos = (sig_t > 0.0) & ~tc
@@ -251,6 +262,22 @@ def match(
         _, sig_t_raw = rolling_mean_sigma(np.where(np.isfinite(Tf), Tf, 0.0), m)
         noise = 3.0 * np.sqrt(np.finfo(np.float32).eps * m)
         margin = margin * scale + noise * (sig_t_raw + float(Qf.std()))
+    if Σ_user is not None:
+        # a user Σ_T carries its own relative rounding delta, which STUMPY's
+        # 2m(1 - rho) form turns into a floor of sqrt(2m*delta) on perfect
+        # matches (GPU search and refinement alike); widen each window's
+        # cutoff by that floor so a bitwise duplicate is still re-evaluated
+        # (and snapped to 0) when the threshold is tighter than the floor.
+        # The exact sigma is taken on the series shifted into the bulk of its
+        # values, where the two-pass mean is not rounded at eps*offset.
+        finite_t = np.isfinite(Tf)
+        shift = float(np.median(Tf[finite_t])) if finite_t.any() else 0.0
+        _, sig_exact = rolling_mean_sigma(np.where(finite_t, Tf - shift, 0.0), m)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ratio = np.where((Σ_user > 0.0) & (sig_exact > 0.0), sig_exact / Σ_user, 1.0)
+        delta = np.abs(1.0 - ratio)
+        delta[~np.isfinite(delta)] = 0.0
+        margin = margin + np.sqrt(2.0 * m * delta)
 
     refined = np.zeros(l, dtype=bool)
     if query_idx is not None:
