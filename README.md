@@ -28,7 +28,7 @@ against STUMPY** (207 golden and regression tests). Distance profiles are
 computed in bulk on the GPU as dense matmuls against the doubly-centered
 subsequence matrix — materialized in one piece for moderate `n*m`, streamed
 as column blocks beyond that — with a fused `mx.compile` distance+argmin
-step per chunk. It is already 1.2–2.6x faster
+step per chunk. It is already 1.3–2.0x faster
 than STUMPY using all CPU cores on the same machine, with a max profile error
 around 1e-5 (see [Benchmarks](#benchmarks)). The SCAMP-style diagonal Metal
 kernel — the headline speed path, O(1) work per cell instead of O(m) — is the
@@ -144,20 +144,25 @@ Honesty rules (see `bench/`):
   host↔GPU transfer, and float64 profile refinement.
 - Precision metrics are published next to the speed numbers.
 
-Self-join on a random walk, `m=200`, best of 2 (M-series Mac, mlx 0.32.2,
-STUMPY 1.14.1 with numba parallel on all cores):
+Self-join on a random walk, `m=200`, best of 2. Provenance (the script
+prints this line above its table): Apple M4 Max, macOS 26.2, Python 3.12.12,
+mlx 0.32.2, numpy 2.5.2, STUMPY 1.14.1 with numba parallel on all 16 cores,
+mlx-stump 0.1.0.dev0 at commit `4755d34`, 2026-09-01. Timings on a laptop
+vary by tens of percent with thermal state and background load; compare
+runs from the same session.
 
 | n | mlx-stump (s) | stumpy all-cores (s) | speedup | max \|ΔP\| | idx agree | top-10 discords |
 |---|---|---|---|---|---|---|
-| 16,384 | 0.039 | 0.102 | 2.6x | 1.5e-05 | 99.99% | 10/10 |
-| 65,536 | 0.548 | 0.759 | 1.4x | 2.5e-05 | 99.99% | 10/10 |
-| 131,072 | 2.142 | 2.567 | 1.2x | 3.6e-05 | 99.99% | 10/10 |
-| 262,144 | 9.080 | 11.698 | 1.3x | 2.9e-05 | 99.99% | 10/10 |
+| 16,384 | 0.051 | 0.104 | 2.0x | 1.5e-05 | 99.99% | 10/10 |
+| 65,536 | 0.573 | 0.718 | 1.3x | 2.5e-05 | 99.99% | 10/10 |
+| 131,072 | 2.145 | 2.695 | 1.3x | 3.6e-05 | 99.99% | 10/10 |
+| 262,144 | 9.328 | 12.393 | 1.3x | 2.9e-05 | 99.99% | 10/10 |
 
 The MASS engine does O(m) work per distance-matrix cell where STUMPY's
 recurrence does O(1), so the current speedup is structural, not a tuning
 gap — the planned diagonal Metal kernel removes that factor. At `m=50` the
-same benchmark shows 1.7x with 100% index agreement and max |ΔP| of 1.5e-08.
+same benchmark (same provenance) shows 1.5–2.5x with 100% index agreement
+and max |ΔP| ≤ 6e-6.
 Above a 256 MiB subsequence matrix (n ≈ 335k at `m=200`) the target is
 streamed in 128 MiB column blocks through the same compiled kernel: at
 n=524,288 that path measured as fast as or faster than the dense sweep
