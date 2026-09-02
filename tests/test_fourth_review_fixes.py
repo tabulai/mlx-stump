@@ -107,15 +107,33 @@ def test_nothing_cached_after_large_calls():
     import mlx.core as mx
 
     rng = np.random.default_rng(4)
+    # MLX retains a small, version/runner-dependent kernel/allocator baseline
+    # even after clear_cache (2.6 MiB on GitHub's macos-15 image, <1 MiB on
+    # the development host). The regression is that per-series buffers must
+    # not scale that baseline with n: the old ordering left 17/86+ MiB behind.
+    mx.clear_cache()
+    warm = rng.standard_normal(2_000).cumsum()
+    mlx_stump.mass(warm[:100].copy(), warm)
+    mass_baseline = mx.get_cache_memory()
+
     T = rng.standard_normal(1_000_000).cumsum()
     Q = T[100:200].copy()
     mlx_stump.mass(Q, T)
     del T, Q
-    assert mx.get_cache_memory() < MIB, f"{mx.get_cache_memory() / MIB:.1f} MiB cached after mass"
+    mass_cached = mx.get_cache_memory()
+    assert mass_cached <= mass_baseline + 4 * MIB, (
+        f"mass cache grew by {(mass_cached - mass_baseline) / MIB:.1f} MiB"
+    )
+
+    mlx_stump.stump(warm, 50)
+    stump_baseline = mx.get_cache_memory()
     T = rng.standard_normal(200_000).cumsum()
     mlx_stump.stump(T, 50)
-    del T
-    assert mx.get_cache_memory() < MIB, f"{mx.get_cache_memory() / MIB:.1f} MiB cached after stump"
+    del T, warm
+    stump_cached = mx.get_cache_memory()
+    assert stump_cached <= stump_baseline + 4 * MIB, (
+        f"stump cache grew by {(stump_cached - stump_baseline) / MIB:.1f} MiB"
+    )
     assert mx.get_active_memory() < MIB
 
 
@@ -169,9 +187,12 @@ def test_release_workflow_is_manual_main_only_and_tags_before_publish():
     assert '"${GITHUB_REF}" != "refs/heads/main"' in text
     guard = text.index("Refuse to release from anything but main")
     assert guard < text.index("check_tag_version.py")
-    assert text.index('"repos/${GITHUB_REPOSITORY}/git/refs"') < text.index(
-        "pypa/gh-action-pypi-publish"
-    )
+    # The reviewed environment exposes the sole tag-bypass deploy key to the
+    # tag job; the ordinary workflow token stays read-only.  The verified tag
+    # must exist before the separate OIDC-only publish job can run.
+    tag_push = text.index('"git@github.com:${GITHUB_REPOSITORY}.git" "refs/tags/${tag}"')
+    assert "environment: pypi-release-v2" in text[text.index("  tag:") : text.index("  publish:")]
+    assert tag_push < text.index("pypa/gh-action-pypi-publish")
     # the version input reaches shell steps only through an environment variable
     assert "VERSION: ${{ inputs.version }}" in text
     assert "${{ inputs.version }}" not in text.replace("VERSION: ${{ inputs.version }}", "")

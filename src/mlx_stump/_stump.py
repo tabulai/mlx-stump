@@ -53,11 +53,11 @@ def _refine_znorm(
     which cancels catastrophically for near-constant windows at an offset
     even in float64 — and unlike `2m(1-rho)` — whose ~2m*eps noise floor
     keeps exact duplicates from snapping to 0 — a sum of squares avoids
-    those cancellation-dominated formulas and remains accurate near 0. Stats are
-    recomputed here rather than reusing the O(n) cumsum rolling stats: those
-    are only ~1e-6-relative after the suspect repair, fine for the float32
-    search but visible in a directly recomputed float64 value. The windows come
-    from the RAW series (z-normalized distance is affine-invariant): the
+    those cancellation-dominated formulas and remains accurate near 0. The
+    local stats are recomputed here rather than derived from the float32 search
+    windows: their cast is sufficient for ranking but visible in a directly
+    recomputed reported value. The windows come from the RAW series
+    (z-normalized distance is affine-invariant): the
     standardized copy quietly re-rounds every value by eps64 * scale, which
     a window whose own sigma is far below the global scale cannot afford.
     Each window is first mapped into its own midpoint/max-deviation frame and
@@ -196,7 +196,7 @@ def _compute_profile_tiled(
         j_row = mx.arange(j0, j1)[None, :]
         for s0, s, e in _batches(l_q, B):
             off = s - s0
-            Q = query_windows(query, s0, e)
+            Q = query_windows(query, s0, e, normalize=normalize)
             if normalize:
                 a, b = query.sig_inv_mx[s0:e], query.isconstant_mx[s0:e]
             else:
@@ -294,7 +294,7 @@ def _compute_profile(
     step = ReduceStep(engine, normalize=normalize, self_join=self_join, excl=excl, k=k)
     for s0, s, e in _batches(l_q, B):
         off = s - s0
-        Q = query_windows(query, s0, e)
+        Q = query_windows(query, s0, e, normalize=normalize)
         QT = engine.sliding_dot_products(Q)
         if normalize:
             a, b = query.sig_inv_mx[s0:e], query.isconstant_mx[s0:e]

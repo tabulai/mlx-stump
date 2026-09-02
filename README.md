@@ -10,7 +10,8 @@ segmentation of time series — on the Metal GPU of any Apple Silicon Mac, via
 STUMPY's GPU path (`gpu_stump`) requires an NVIDIA GPU, so on a Mac it simply
 does not exist: Mac users are limited to the multi-core CPU path. `mlx-stump`
 is the missing Mac GPU backend. It is a drop-in for `stumpy.stump`: same
-parameters, same output layout (columns `P`, `I`, `I_left`, `I_right`), and
+parameters, same output layout (profile value/index, then left/right profile
+indices), and
 the same `P_`/`I_` accessors used by STUMPY's downstream functions. Pass the
 appropriate accessor—for example, `mp.I_` to `fluss` or `mp.P_` to `motifs`—
 without conversion. Because the computation happens in Apple Silicon's
@@ -25,11 +26,12 @@ anomaly classification on the same silicon.
 ## Status
 
 **v0.1 development — the batched-MASS engine is implemented and golden-tested
-against STUMPY** (270 golden and regression tests). Distance profiles are
-computed in bulk on the GPU as dense matmuls against the doubly-centered
-subsequence matrix — materialized in one piece for moderate `n*m`, streamed
-as column blocks beyond that — with a fused `mx.compile` distance+argmin
-step per chunk. It is already 1.1–2.1x faster
+against STUMPY** (280 golden and regression tests). Distance profiles are
+computed in bulk on the GPU as dense matmuls against a locally z-normalized
+subsequence matrix (or a doubly-centered shared-frame matrix for raw
+distances) — materialized in one piece for moderate `n*m`, streamed as column
+blocks beyond that — with a fused `mx.compile` distance+argmin step per chunk.
+It is already 1.1–2.1x faster
 than STUMPY using all CPU cores on the same machine, with a max profile error
 around 1e-5 (see [Benchmarks](#benchmarks)). The SCAMP-style diagonal Metal
 kernel — the headline speed path, O(1) work per cell instead of O(m) — is the
@@ -58,12 +60,16 @@ committing on `main`, and letting CI pass:
 gh workflow run publish-pypi.yml --ref main -f version=0.1.0
 ```
 
-The workflow refuses to run from any other branch and refuses a version
-that does not equal `__version__` (in canonical PEP 440 form, never a
-`.dev`/local version). It serializes releases, builds the wheel and sdist,
-tests the *built wheel* in a clean environment, creates (or verifies) an
-annotated `v<version>` tag at the exact tested commit, and only then hands
-the artifacts to a minimal OIDC-only PyPI job. A failed upload can therefore
+The workflow refuses to run from any other branch, requires a successful CI
+run for that exact `main` commit, and refuses a version that does not equal
+`__version__` (in canonical PEP 440 form, never a `.dev`/local version). It
+serializes releases, installs fully transitive
+hash-locked build/test environments, builds the wheel and sdist twice from
+independent archives of the commit, and requires byte-identical artifacts.
+It installs and tests both the wheel and the sdist in separate clean
+environments, creates (or verifies) an annotated `v<version>` tag at the exact
+tested commit, and only then hands the artifacts to a minimal OIDC-only PyPI
+job. A failed upload can therefore
 be retried against the same verified tag; an immutable PyPI release cannot
 be left without its source tag. If PyPI accepts only part of an upload, use
 GitHub's **Re-run all jobs** action (not **Re-run failed jobs**): the full
@@ -105,8 +111,8 @@ The result also exposes STUMPY-style attributes: `mp.P_`, `mp.I_`,
 | Function | STUMPY equivalent | Notes |
 |---|---|---|
 | `stump(T_A, m, T_B=None, …, T_A_subseq_isconstant=None, T_B_subseq_isconstant=None, *, chunk_size=None)` | `stumpy.stump` / `stumpy.aamp` | self-joins and AB-joins; `normalize=False` supports `p=2.0` only; `chunk_size` is an mlx-stump extension |
-| `mass(Q, T, ...)` | `stumpy.mass` | z-normalized distance profile of one query |
-| `match(Q, T, max_distance=..., max_matches=...)` | `stumpy.match` | all matches of a query, nearest first |
+| `mass(Q, T, ...)` | `stumpy.mass` | normalized or raw (`p=2`) distance profile of one query |
+| `match(Q, T, max_distance=..., max_matches=...)` | `stumpy.match` | normalized or raw (`p=2`) matches of a query, nearest first |
 
 The typed accessors feed downstream STUMPY functions directly: for example,
 `stumpy.fluss(mp.I_, ...)` and `stumpy.motifs(T, mp.P_, ...)`. The full 2-D
@@ -117,27 +123,24 @@ The typed accessors feed downstream STUMPY functions directly: for example,
 STUMPY computes in float64; Apple GPUs are float32-only. `mlx-stump` keeps the
 error negligible in practice by:
 
-1. **Scale-safe global standardization** before upload — mean and standard
-   deviation are computed only after a midpoint/max-deviation preconditioner,
-   so uniformly tiny or huge finite units cannot underflow or overflow; the
-   transform is exactly invariant for the z-normalized profile and removes
-   large-offset cancellation.
-2. **Float64 rolling statistics** — per-window mean and inverse standard deviation are
-   computed on the CPU in float64 (O(n), trivial cost), then uploaded as float32.
-3. **Doubly-centered covariance** — every window on *both* sides has its
-   float64 mean subtracted *before* the float32 cast, so the sliding dot
-   product IS the centered cross-covariance and the catastrophic
-   `QT - m·μ_Q·μ_T` subtraction never happens in float32 — at any series
-   length (the streamed column blocks of the large-`n` path are centered
-   identically). The non-normalized (`aamp`) profile uses the same
-   centering — `d² = ‖q_c − t_c‖² + m·(μ_q − μ_t)²` — so mixed-scale data
+1. **Scale-safe affine frames** — midpoint/max-deviation preconditioners keep
+   uniformly tiny or huge finite units from underflowing or overflowing.
+2. **Local float64 z-normalization** — every normalized query and target
+   window is read from the raw series, placed in its own bounded frame,
+   centered, and divided by its own RMS *before* the float32 cast. The GPU
+   product is therefore `m·ρ` directly. A tiny exact window embedded beside
+   values 10¹⁶ times larger is not re-rounded by one global standardized
+   copy, and `QT - m·μ_Q·μ_T` never occurs.
+3. **Doubly-centered raw covariance** — the non-normalized (`aamp`) profile
+   uses one shared scale-safe frame and
+   `d² = ‖q_c − t_c‖² + m·(μ_q − μ_t)²`, so mixed-scale data
    doesn't hit the `ssq_q + ssq_t − 2·QT` cancellation either, and the
    window means travel to the GPU as float32 (hi, lo) pairs so their
    difference is not limited to the ulp of the global offset. Each profile
    also comes from a fresh product rather than a long floating-point
    recurrence, so error does not accumulate along the series.
 4. **Float64 refinement** — profile values at the chosen indices are
-   re-evaluated on the CPU in float64 (O(n·m), a few percent of runtime) as
+   re-evaluated on the CPU in float64 (O(n·m), a modest fraction of runtime) as
    sums of squared differences of the z-normalized windows, with each
    window's mean and sigma freshly recomputed two-pass — a cancellation-free
    form that stays relatively accurate down to distance 0 — so reported `P`
@@ -204,7 +207,7 @@ the peak memory.
 Run them yourself:
 
 ```bash
-python bench/bench_stump.py --sizes 16384 65536 262144 --m 200
+python bench/bench_stump.py --sizes 16384 65536 131072 262144 --m 200 --repeat 2 --seed 0
 ```
 
 ## Roadmap
@@ -233,10 +236,10 @@ python bench/bench_stump.py --sizes 16384 65536 262144 --m 200
 - One deliberate accuracy divergence: for near-constant windows (rolling σ
   below ~1e-7 of the data scale — e.g. a flatlined sensor with tiny jitter),
   STUMPY's denominator clamp turns flat-vs-flat pairs into spurious
-  zero-distance matches; mlx-stump directly recomputes cancellation-prone
-  rolling variances in two-pass float64 and its doubly-centered covariance
-  resolves their true distances.
-- A raw `mass` profile is the float32 GPU result: near-perfect matches read
+  zero-distance matches; mlx-stump instead centers and RMS-normalizes each raw
+  window in its own bounded float64 frame before the GPU cast, resolving their
+  true distances.
+- The unrefined `mass` output is the float32 GPU result: near-perfect matches read
   ~1e-3 rather than ~1e-8. `stump` and `match` re-evaluate their reported
   distances in float64, so their outputs don't carry this floor.
 - Memory is bounded by three fixed budgets rather than by `n·m`: the
@@ -254,13 +257,16 @@ python bench/bench_stump.py --sizes 16384 65536 262144 --m 200
   need a batch-sized host merge workspace for concatenation, stable sorting,
   and gathering; it scales with `batch_rows·k` and is included in the peak
   estimate. Each block exists twice while it is uploaded (numpy staging
-  plus the device copy), so the process-wide peak for one call is
-  estimated as `2·block + 64 MiB` during upload or `block + 384 MiB`
+  plus the device copy), so the dominant modeled peak beyond the O(n)
+  series arrays is estimated as `2·block + max(64 MiB, 8·m + 128 B)` during
+  upload (the second term includes the documented one-window float64 floor)
+  or `block + 384 MiB`
   during the sweep, plus numeric/object outputs —
   ~640 MiB for the largest dense block, ~512 MiB in tiled mode at `k=1`
   (`mlx_stump._engine.estimated_peak_bytes(l, m, k, self_join, l_q,
-  chunk_size)` gives that phase estimate). The O(n) input-series and rolling
-  statistics arrays are additional and deliberately excluded from the helper.
+  chunk_size)` gives that phase estimate). The O(n) input series and window
+  masks are additional; raw mode also retains its standardized series and
+  rolling statistics. Those arrays are deliberately excluded from the helper.
   For large `k` the output itself dominates:
   STUMPY's
   object-dtype `mparray` layout costs a pointer plus a CPython allocator
@@ -275,18 +281,22 @@ python bench/bench_stump.py --sizes 16384 65536 262144 --m 200
   memory (GPU-written buffers do not show up in RSS on macOS, only in the
   process footprint). `mass`/`match`
   evaluate one block at a time and never hold more, and every device array
-  is dropped before the cache is cleared, so nothing stays cached in MLX
-  after a call returns. Pass `chunk_size` to trade memory for larger batches;
-  pass the same value to `estimated_peak_bytes` because an explicit batch is
-  allowed to exceed the automatic 384 MiB budget.
+  is dropped before the cache is cleared, so no per-series allocation stays
+  cached after a call returns. MLX may retain a small runtime/allocator
+  baseline (2.6 MiB on one hosted-runner image). For `stump`, pass
+  `chunk_size` to trade memory for larger batches, and pass the same value to
+  `estimated_peak_bytes` because an explicit batch is allowed to exceed the
+  automatic 384 MiB budget. `mass` and `match` always use automatic block
+  streaming.
 - Out-of-range `query_idx` values (including negative ones) raise
   `ValueError`. STUMPY silently wraps `query_idx <= -m` through numpy
   negative indexing and fabricates a zero-distance match at a negative
   index; rejecting is a deliberate, stricter divergence. With
   `normalize=False`, `match` zeroes `D[query_idx]` the way
   `stumpy.mass_absolute` does (when the window is finite); `stumpy.aamp_match`
-  leaves that entry at its true distance, so a *mismatched* `query_idx`
-  yields a zero-distance first match here and an empty result there.
+  leaves that entry at its true distance. A *mismatched* `query_idx` is
+  therefore the first zero-distance match here but retains its true distance
+  in STUMPY; with a threshold below that true distance, STUMPY omits it.
 - A data-dependent `max_distance` in `match` (the default, or a callable)
   is evaluated on successively refined profiles until it stops moving —
   the float32 profile first, then once per float64 refinement round,
@@ -298,9 +308,9 @@ python bench/bench_stump.py --sizes 16384 65536 262144 --m 200
   compatibility metadata, not used as a computational cache or as an input
   to the arithmetic: they are validated (shape `(l,)`), an infinite `M_T`
   marks its window non-finite (STUMPY's convention for windows containing
-  NaN), and finite entries otherwise use the same internally recomputed
-  float64 rolling statistics (with two-pass cancellation repair) as the
-  no-stats call, so the two results are identical. Refined `match` output
+  NaN), and finite entries otherwise use the same raw-window local float64
+  centering and RMS normalization as the no-stats call, so the two results
+  are identical. Refined `match` output
   reports bitwise, shifted, and exactly representable positive-affine
   duplicates at exactly 0. A tiny numerical
   residual is zeroed only after exact dyadic-rational collinearity proves
@@ -309,7 +319,7 @@ python bench/bench_stump.py --sizes 16384 65536 262144 --m 200
   with intervening rounding is still affine in its stored values. A
   non-affine row inside that roundoff band (even a one-ULP perturbation)
   remains non-zero; if ordinary float64 normalization collapses it all the
-  way to zero, it is re-evaluated at high precision. A raw `mass` profile
+  way to zero, it is re-evaluated at high precision. `mass` in either mode
   remains float32 and retains the small floor described above.
   This is a deliberate choice of mathematical semantics over STUMPY's
   literal use of the supplied values, whose rounding STUMPY lets into the
@@ -380,15 +390,13 @@ python bench/bench_stump.py --sizes 16384 65536 262144 --m 200
   gaps are within the golden-suite tie tolerance in absolute terms (≤ 3e-3
   on nearest distances of ~1e-2) but can be tens of percent of those small
   distances; `P` is directly recomputed in float64 for the chosen index.
-- A series whose *within-series relative* amplitude dynamic range approaches
-  float64's ~16 digits (≳1e13 between its largest variation and its smallest
-  window variation) triggers a warning: one global standardized copy cannot
-  faithfully represent the smallest-variance windows at all. This is not an
-  absolute-units limit: uniformly rescaling an ordinary finite series from
-  subnormal-scale values through ~1e300 is handled by the scale-safe affine
-  frame. Refined `match`/`stump` results remain invariant; at the coarsest
-  subnormal lattice, raw float32 `mass` can move within its documented ~1e-3
-  search floor.
+- Normalized search has no global-standardization dynamic-range limit: each
+  raw window is centered and scaled independently before upload. Raw-distance
+  search necessarily uses one shared affine frame for cross-window units; a
+  series with ≳1e13 between its largest variation and its smallest window
+  variation warns that those smallest raw distances may be unreliable. This
+  is not an absolute-units limit: uniformly rescaling an ordinary finite
+  series from subnormal-scale values through ~1e300 remains scale-safe.
 - Like STUMPY's `gpu_stump`, streaming (`stumpi`) is out of scope for the GPU
   path for now.
 

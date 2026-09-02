@@ -1,0 +1,7 @@
+# Direct inputs for the reproducible CPython 3.12 release-build environment.
+# Regenerate release-build.txt with pip-tools 7.6.1 on macOS arm64.
+pip==26.2.1
+build==1.6.0
+hatchling==1.32.0
+ruff==0.16.5
+twine==7.0.0

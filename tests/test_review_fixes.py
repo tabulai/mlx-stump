@@ -36,15 +36,15 @@ def _true_row_distances(T, m, i, excl):
 
 def test_flatlined_sensor_sigma_not_zeroed():
     """Near-constant windows (flatline + tiny jitter) must keep their true
-    sigma: the one-pass cumsum variance cancels below the float64 noise floor
-    and, unrepaired, poisons the whole profile with sqrt(2m) distances.
+    variation: deriving sigma from one-pass cumsums would cancel below the
+    float64 noise floor and poison the profile with sqrt(2m) distances.
 
     STUMPY itself is NOT the oracle for the flatline rows: its denominator
     clamp (max(sigma*sigma*m, 1e-14)) plus the rho<=1 cap turn flat-vs-flat
-    pairs into spurious zero-distance matches. mlx-stump's doubly-centered
-    covariance resolves these windows exactly, so flatline rows are checked
-    against a brute-force float64 ground truth, and every other row against
-    STUMPY as usual.
+    pairs into spurious zero-distance matches. mlx-stump locally centers and
+    RMS-normalizes every raw window in a bounded float64 frame before upload,
+    so flatline rows are checked against a brute-force float64 ground truth,
+    and every other row against STUMPY as usual.
     """
     rng = np.random.default_rng(0)
     T = rng.standard_normal(2000)

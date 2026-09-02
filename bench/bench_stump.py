@@ -95,7 +95,7 @@ def main() -> None:
         try:
             import stumpy  # noqa: F811
         except ImportError:
-            print("stumpy not installed - GPU-only run (pip install 'mlx-stump[bench]')")
+            print("stumpy not installed - GPU-only run (from a checkout: pip install '.[bench]')")
             use_stumpy = False
         else:
             import numba
@@ -111,10 +111,17 @@ def main() -> None:
 
     rng = np.random.default_rng(args.seed)
     m = args.m
+    if args.repeat < 1:
+        ap.error("--repeat must be at least 1")
+    if m < 3:
+        ap.error("--m must be at least 3")
+    too_short = [n for n in args.sizes if n < m]
+    if too_short:
+        ap.error(f"every --sizes value must be at least m={m}; found {too_short}")
     excl = int(np.ceil(m / 4))
 
     # warm up: Metal kernel compilation and numba JIT are one-time costs
-    T_warm = rng.standard_normal(4096).cumsum()
+    T_warm = rng.standard_normal(max(4096, 2 * m + 10)).cumsum()
     mlx_stump.stump(T_warm, m)
     if use_stumpy:
         stumpy.stump(T_warm, m)

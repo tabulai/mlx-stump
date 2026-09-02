@@ -7,7 +7,9 @@ fresh product rather than a long floating-point recurrence, so error does not
 accumulate along the series.
 
 EVERY window on both sides is mean-centered in float64 before the float32
-cast, so the matmul product IS the mean-centered cross-covariance:
+cast. Normalized windows are also divided by their own locally computed RMS,
+so their matmul is ``m * rho`` directly; raw windows retain the shared affine
+frame and their product is the mean-centered cross-covariance:
 
 - z-normalized: near-constant windows sitting at a large offset (a flatlined
   sensor) don't have their tiny covariance swamped by float32 rounding of
@@ -57,7 +59,7 @@ from collections.abc import Iterator
 import mlx.core as mx
 import numpy as np
 
-from ._preprocess import PreprocessedSeries
+from ._preprocess import PreprocessedSeries, center_rows_stable
 
 _INF = float("inf")
 
@@ -75,8 +77,12 @@ _CHUNK_MEM_BUDGET = 3 << 27  # ~384 MiB
 _MATMUL_WINDOW_BYTES = 1 << 28  # ~256 MiB
 # size of one materialized target window block in tiled mode
 _TILE_WINDOW_BYTES = 1 << 27  # ~128 MiB
-# byte bound on the float64 centering temporary while building window blocks
+# Byte bound on the complete CPU centering stage while building window blocks.
+# Besides the rows*m float64 work matrix, center_rows_stable holds midpoint,
+# scale, reduction, and mask vectors. 128 bytes per row conservatively covers
+# their observed allocator peak (72-80 B/row) and ufunc transients.
 _CENTER_BYTES = 1 << 26  # ~64 MiB
+_CENTER_ROW_BYTES = 128
 # byte budget for the float64 window copies held live by one refinement
 # chunk (two fancy-indexed window blocks plus their centered copies); the
 # refinement runs after the device memory has been released
@@ -89,7 +95,7 @@ def refine_chunk_rows(m: int) -> int:
 
 def _center_rows(m: int) -> int:
     """Window rows centered per float64 step so the temporary fits ``_CENTER_BYTES``."""
-    return max(1, _CENTER_BYTES // (m * 8))
+    return max(1, _CENTER_BYTES // (m * 8 + _CENTER_ROW_BYTES))
 
 
 def resident_block_bytes(l: int, m: int) -> int:
@@ -224,12 +230,17 @@ def estimated_peak_bytes(
     # undercounted the canonical k=100 process peak by ~25 MiB.
     boxed = l_q * (2 * k + 2) * (8 + 32)
     assembly = refine + numeric + reorder + boxed
-    return max(2 * block + _CENTER_BYTES, sweep, assembly)
+    # _center_rows has a one-row floor when a single float64 window plus its
+    # rowwise scratch exceeds the nominal centering budget. Model it too.
+    upload = 2 * block + max(_CENTER_BYTES, m * 8 + _CENTER_ROW_BYTES)
+    return max(upload, sweep, assembly)
 
 
 def _query_batch_bytes(m: int) -> int:
-    # float64 window copy + centered copy + float32 cast + device upload
-    return m * 24
+    # Float64 window copy + float32 cast/upload, plus the row reductions,
+    # midpoint/scale vectors, masks, and ufunc transients held by local
+    # normalization. Raw mode uses less, so this is conservative there.
+    return m * 24 + _CENTER_ROW_BYTES
 
 
 def default_chunk_size(engine: MassEngine, l_q: int, k: int = 1, self_join: bool = False) -> int:
@@ -286,15 +297,34 @@ class MassEngine:
             mx.eval(self.W_T)
 
     def _build_block_T(self, j0: int, j1: int) -> mx.array:
-        """(m, j1-j0) float32 transposed window block for target windows
-        ``j0:j1``, each window centered by its float64 rolling mean before
-        the cast."""
-        w = np.lib.stride_tricks.sliding_window_view(self.target.Ts, self.m)[j0:j1]
+        """Build one transposed float32 target-window block.
+
+        Z-normalized windows are copied from the raw series, put into their
+        own bounded frame, mean-centered, and divided by their own RMS before
+        the cast.  A single global standardized copy can re-round a tiny
+        window embedded in a much larger-range series enough to change its
+        nearest neighbor; local normalization removes that conditioning.
+        Raw-distance windows keep the shared affine frame and rolling mean.
+        """
+        source = self.target.T if self.normalize else self.target.Ts
+        w = np.lib.stride_tricks.sliding_window_view(source, self.m)[j0:j1]
         out = np.empty((j1 - j0, self.m), dtype=np.float32)
         step = _center_rows(self.m)
         for s in range(0, j1 - j0, step):
             e = min(s + step, j1 - j0)
-            out[s:e] = w[s:e] - self.target.mu[j0 + s : j0 + e, None]
+            if self.normalize:
+                work = w[s:e].copy()
+                center_rows_stable(work)
+                rms = np.sqrt(np.einsum("ij,ij->i", work, work) / self.m)
+                rows = slice(j0 + s, j0 + e)
+                active = self.target.isfinite[rows] & ~self.target.isconstant[rows]
+                safe_rms = np.where(active & (rms > 0.0), rms, 1.0)
+                work /= safe_rms[:, None]
+                work[~active] = 0.0
+                out[s:e] = work
+                del active, rms, safe_rms, work
+            else:
+                out[s:e] = w[s:e] - self.target.mu[j0 + s : j0 + e, None]
         return mx.array(out).T
 
     def target_blocks(self) -> Iterator[tuple[int, int, mx.array]]:
@@ -356,12 +386,10 @@ class MassEngine:
     ) -> mx.array:
         """(B, j1-j0) *squared* z-normalized distances with STUMPY's special cases.
 
-        ``QT`` must come from *mean-centered* query windows against
-        *mean-centered* target windows: the doubly-centered product IS the
-        mean-centered cross-covariance, so no catastrophic `QT - m*mu_q*mu_t`
-        subtraction ever happens in float32. Query-side stats live in the
-        query series' own standardized frame; mixing frames is algebraically
-        valid because the covariance is bilinear.
+        ``QT`` comes from query and target windows that were independently
+        centered and scaled to unit RMS in float64 before their float32 cast,
+        so it is ``m * rho`` directly. No global-frame cancellation or
+        ``QT - m*mu_q*mu_t`` subtraction occurs in float32.
 
         Squared distances are what the search runs on (sqrt is monotonic and
         the reported profile values are re-evaluated in float64 anyway).
@@ -540,13 +568,19 @@ class ReduceStep:
         )
 
 
-def query_windows(query: PreprocessedSeries, start: int, stop: int) -> mx.array:
-    """Float32 (B, m) centered window batch from the standardized series.
-
-    Each window's float64 rolling mean is subtracted *before* the float32
-    cast, which is what keeps both the covariance (z-normalized) and the
-    centered difference norm (absolute) well-conditioned on the GPU.
-    """
-    w = np.lib.stride_tricks.sliding_window_view(query.Ts, query.m)[start:stop]
-    w = w - query.mu[start:stop, None]
+def query_windows(
+    query: PreprocessedSeries, start: int, stop: int, *, normalize: bool
+) -> mx.array:
+    """Return one float32 query-window batch for the selected distance mode."""
+    if normalize:
+        w = np.lib.stride_tricks.sliding_window_view(query.T, query.m)[start:stop].copy()
+        center_rows_stable(w)
+        rms = np.sqrt(np.einsum("ij,ij->i", w, w) / query.m)
+        active = query.isfinite[start:stop] & ~query.isconstant[start:stop]
+        safe_rms = np.where(active & (rms > 0.0), rms, 1.0)
+        w /= safe_rms[:, None]
+        w[~active] = 0.0
+    else:
+        source = np.lib.stride_tricks.sliding_window_view(query.Ts, query.m)[start:stop]
+        w = source - query.mu[start:stop, None]
     return mx.array(w.astype(np.float32))

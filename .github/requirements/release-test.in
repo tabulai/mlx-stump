@@ -1,0 +1,8 @@
+# Direct inputs for the reproducible CPython 3.12 artifact-test environment.
+# Regenerate release-test.txt with pip-tools 7.6.1 on macOS arm64.
+pip==26.2.1
+hatchling==1.32.0
+mlx==0.32.2
+numpy==2.5.2
+pytest==9.1.1
+stumpy==1.14.1

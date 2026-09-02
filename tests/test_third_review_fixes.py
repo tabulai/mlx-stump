@@ -34,6 +34,7 @@ import mlx_stump._engine as eng
 import mlx_stump._preprocess as prep_mod
 from mlx_stump._engine import (
     _CENTER_BYTES,
+    _CENTER_ROW_BYTES,
     _CHUNK_MEM_BUDGET,
     _center_rows,
     estimated_peak_bytes,
@@ -55,7 +56,7 @@ def _offset_flatlines(seed=0):
 
 def test_match_precomputed_stats_no_cancellation():
     """With STUMPY's own sliding stats on a flatline at an offset, the two
-    exact occurrences must come first at ~0 and nothing may exceed the
+    exact occurrences must come first at zero and nothing may exceed the
     z-normalized maximum (the cancelling form reported 8+ at unrelated
     indices and ranked them first)."""
     T = _offset_flatlines()
@@ -64,14 +65,14 @@ def test_match_precomputed_stats_no_cancellation():
     M_T, Σ_T = stumpy.core.compute_mean_std(T, m)
     M = mlx_stump.match(Q, T, M_T=M_T, Σ_T=Σ_T, max_distance=float("inf"), max_matches=3)
     assert [int(i) for _, i in M[:2]] == [520, 2020]
-    # the user's Σ_T carries ~eps*(mu/sigma) relative rounding; that is the
-    # only thing separating these from exact zeros
-    assert all(float(d) < 1e-2 for d, _ in M[:2])
+    # Cached statistics are compatibility metadata, so their rounding cannot
+    # leak into either exact occurrence.
+    assert all(float(d) == 0.0 for d, _ in M[:2])
     assert all(float(d) <= 2.0 * np.sqrt(m) + 1e-9 for d, _ in M)
     M0 = mlx_stump.match(Q, T, max_distance=float("inf"), max_matches=3)
     np.testing.assert_array_equal(M[:, 1].astype(int), M0[:, 1].astype(int))
-    # the default (data-dependent) threshold path shares the refinement:
-    # same match set as the exact-stats path, distances apart by Σ_T's rounding
+    # The default (data-dependent) threshold path is identical with or without
+    # the compatibility metadata.
     M = mlx_stump.match(Q, T, M_T=M_T, Σ_T=Σ_T)
     M0 = mlx_stump.match(Q, T)
     assert [int(i) for _, i in M[:2]] == [520, 2020]
@@ -81,8 +82,8 @@ def test_match_precomputed_stats_no_cancellation():
 
 @pytest.mark.parametrize("offset", [0.0, 1e3, 1e6, 1e9])
 def test_mass_precomputed_stats_offset_data(offset):
-    """The GPU profile under user stats must stay a Σ_T-scaled version of
-    the exact profile at any offset. STUMPY's formula itself degrades here
+    """The GPU profile under user stats must equal the no-stats profile at
+    every offset. STUMPY's formula itself degrades here
     (0.08 for a self-match at 1e6, total collapse at 1e9), so parity with
     STUMPY is asserted only where its formula is well-conditioned."""
     rng = np.random.default_rng(1)
@@ -119,8 +120,8 @@ def test_mass_stats_validation_and_nonfinite_windows():
     assert np.isfinite(D[99]) and np.isfinite(D[101])
     M = mlx_stump.match(Q, T, M_T=M2, Σ_T=Σ_T, max_distance=float("inf"))
     assert 100 not in {int(i) for _, i in M}
-    # the contract: cached stats are a cache — neither value enters the
-    # arithmetic, so the profile equals the no-stats call exactly
+    # The contract: finite metadata never enters the arithmetic, so the
+    # profile equals the no-stats call exactly.
     D0 = mlx_stump.mass(Q, T)
     np.testing.assert_array_equal(mlx_stump.mass(Q, T, M_T=M_T + 0.5, Σ_T=Σ_T), D0)
     np.testing.assert_array_equal(mlx_stump.mass(Q, T, M_T=M_T, Σ_T=Σ_T * 2.0), D0)
@@ -212,7 +213,7 @@ def test_constant_series_preprocessing_is_cheap():
     before, rss, _ = _run_isolated(
         f"""
         before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * _unit
-        preprocess_series(np.full({n}, 7.0), {m})
+        preprocess_series(np.full({n}, 7.0), {m}, normalize=False)
         """
     )
     assert rss - before < 96, f"constant-series preprocessing grew RSS by {rss - before:.0f} MiB"
@@ -249,7 +250,7 @@ def test_center_rows_respects_byte_budget():
     for m in (3, 200, 2_200, 16_384, 1 << 20):
         rows = _center_rows(m)
         assert rows >= 1
-        assert rows * m * 8 <= _CENTER_BYTES or rows == 1
+        assert rows * (m * 8 + _CENTER_ROW_BYTES) <= _CENTER_BYTES or rows == 1
 
 
 def test_small_center_budget_is_bit_identical(monkeypatch):
@@ -258,7 +259,9 @@ def test_small_center_budget_is_bit_identical(monkeypatch):
     T[1000:1200] = 5.0 + 1e-9 * rng.standard_normal(200)
     m = 64
     ref = mlx_stump.stump(T, m)
-    monkeypatch.setattr(eng, "_CENTER_BYTES", 64 * 8 * 37)  # 37 rows per step
+    monkeypatch.setattr(
+        eng, "_CENTER_BYTES", (64 * 8 + _CENTER_ROW_BYTES) * 37
+    )  # 37 rows per step
     mp = mlx_stump.stump(T, m)
     np.testing.assert_array_equal(mp.I_, ref.I_)
     np.testing.assert_allclose(mp.P_, ref.P_, atol=0, rtol=0)
@@ -286,7 +289,7 @@ def test_sigma_repair_known_constant_shortcut(monkeypatch):
     # a constant window a user flags non-constant still gets sigma 0
     # (the shortcut uses detected constancy, not the user's flags)
     flags = np.zeros(a.shape[0] - w + 1, dtype=bool)
-    p = preprocess_series(a, w, isconstant=flags)
+    p = preprocess_series(a, w, normalize=False, isconstant=flags)
     assert np.all(p.sig_inv[detected] == 0.0)
 
 

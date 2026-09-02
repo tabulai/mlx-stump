@@ -1,13 +1,10 @@
 """Input validation and float64 CPU-side preprocessing.
 
-STUMPY computes everything in float64; Apple GPUs are float32-only. The
-precision strategy starts here:
-
-- the series is globally standardized before upload (exactly invariant for
-  the z-normalized profile — the centered cross-covariance is bilinear, so
-  per-series affine changes cancel even in AB-joins);
-- per-window rolling mean and inverse standard deviation are computed on the
-  CPU in float64 (O(n)) and only then cast to float32 for the GPU.
+STUMPY computes everything in float64; Apple GPUs are float32-only. Normalized
+search copies every raw window into a bounded local frame, centers it, and
+divides by its own RMS in float64 before the float32 upload. Raw-distance
+search instead uses one shared, scale-safe affine frame for both join series
+and carries its rolling statistics in float64/float32 high-low form.
 
 Semantics mirror STUMPY: float64 1-D input required, m >= 3, subsequences
 containing NaN/inf get an infinite profile value and are never neighbors,
@@ -316,13 +313,13 @@ class PreprocessedSeries:
     m: int
     n: int
     l: int  # number of subsequences: n - m + 1
-    center: float  # global standardization offset
-    scale: float  # global standardization divisor
-    Ts: np.ndarray  # standardized series, non-finite values zero-filled first
+    center: float  # shared-frame offset (raw mode; 0 in normalized mode)
+    scale: float  # shared-frame divisor (raw mode; 1 in normalized mode)
+    Ts: np.ndarray | None  # standardized series (raw mode only)
     isfinite: np.ndarray  # (l,) window all-finite
     isconstant: np.ndarray  # (l,) window min == max
-    mu: np.ndarray  # (l,) float64 rolling mean of Ts
-    sig_inv: np.ndarray  # (l,) float64 1/sigma of Ts windows (0 where constant)
+    mu: np.ndarray | None  # (l,) rolling mean of Ts (raw mode only)
+    sig_inv: np.ndarray | None  # (l,) inverse sigma of Ts (raw mode only)
     ssq: np.ndarray | None  # (l,) CENTERED sum of squares m*sigma^2 (normalize=False only)
     # device-side float32 copies. Windows are centered in float64 before
     # upload, so the GPU never re-derives the mean — but the non-normalized
@@ -335,6 +332,9 @@ class PreprocessedSeries:
     # (hi_q - hi_t) is exact for nearby means (Sterbenz) and lo carries the
     # residual, so the device difference is accurate to float32 of the
     # difference itself.
+    # In normalized mode the device windows are already divided by their
+    # locally recomputed RMS, so this is a 1/0 varying-window mask rather
+    # than the CPU rolling inverse sigma. Raw mode does not consume it.
     sig_inv_mx: mx.array = field(repr=False, default=None)
     isfinite_mx: mx.array = field(repr=False, default=None)
     isconstant_mx: mx.array = field(repr=False, default=None)
@@ -346,8 +346,8 @@ class PreprocessedSeries:
 
         Call once the GPU phase is over and before ``mx.clear_cache()``:
         arrays still referenced when the cache is cleared land in it when
-        this object is garbage-collected later (17 MiB after a
-        ``mass(n=1e6)`` call, 86 MiB at n=5e6).
+        this object is garbage-collected later instead of being returned to
+        the system with the rest of the search phase.
         """
         self.sig_inv_mx = self.isfinite_mx = self.isconstant_mx = None
         self.ssq_mx = self.mu_mx = None
@@ -357,8 +357,8 @@ class PreprocessedSeries:
 
         The raw series plus finite/constant flags remain available for the
         float64 profile refinement. Calling this between the GPU sweep and
-        refinement avoids retaining standardized series and rolling-stat
-        arrays while a large object-dtype result is assembled.
+        refinement avoids retaining the raw-mode standardized series and
+        rolling-stat arrays while a large object-dtype result is assembled.
         """
         self.Ts = self.mu = self.sig_inv = self.ssq = None
 
@@ -378,6 +378,9 @@ def preprocess_series(
     ``center``/``scale`` override the global standardization parameters; the
     non-normalized (aamp) path uses this to put both join series in one shared
     affine frame, which keeps their cross distances exactly invariant.
+    Normalized search needs only the raw series and finite/constant masks:
+    every window is centered and scaled locally by the engine, so no global
+    series copy or rolling statistics are built or retained in that mode.
     """
     n = T.shape[0]
     l = n - m + 1
@@ -405,6 +408,28 @@ def preprocess_series(
         )
     isconstant = fixed
 
+    if normalize:
+        active = isfinite & ~isconstant
+        return PreprocessedSeries(
+            T=T,
+            m=m,
+            n=n,
+            l=l,
+            center=0.0,
+            scale=1.0,
+            Ts=None,
+            isfinite=isfinite,
+            isconstant=isconstant,
+            mu=None,
+            sig_inv=None,
+            ssq=None,
+            sig_inv_mx=mx.array(active.astype(np.float32)),
+            isfinite_mx=mx.array(isfinite),
+            isconstant_mx=mx.array(isconstant),
+            ssq_mx=None,
+            mu_mx=None,
+        )
+
     if center is None or scale is None:
         c, s = stable_center_scale(T)
         center = c if center is None else center
@@ -429,16 +454,17 @@ def preprocess_series(
     # that global standardization lost the window's variation. Warn only for
     # windows that neither the data nor the resolved user flags call constant.
     lost_variation = isfinite & ~detected & ~isconstant & (sigma == 0.0)
-    if np.any(lost_variation) or (
+    precision_limited = np.any(lost_variation) or (
         pos.size and pos.min() < 1e-13 * max(1.0, float(np.max(np.abs(Ts))))
-    ):
+    )
+    if precision_limited:
         # e.g. a 1e17-amplitude segment next to unit noise: standardization
         # then re-rounds the noise below its own variation (float64 has ~16
         # digits total), so no downstream arithmetic can recover it
         warnings.warn(
             "The amplitude dynamic range of this series approaches the float64 "
-            "standardization limit; distances involving its smallest-variance "
-            "windows are unreliable.",
+            "standardization limit for raw-distance search; distances involving "
+            "its smallest-variance windows may be unreliable.",
             stacklevel=3,
         )
 

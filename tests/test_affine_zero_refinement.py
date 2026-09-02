@@ -76,6 +76,93 @@ def test_strict_match_snaps_only_roundoff_not_near_or_negative_affine_rows():
     np.testing.assert_array_equal(got.astype(np.float64), np.array([[0.0, exact_idx]]))
 
 
+def test_local_normalized_search_preserves_tiny_exact_window_in_large_range():
+    """Global standardization must not re-round away a tiny exact match."""
+    u = np.spacing(1.0)
+    Q = np.array([0.0, u, -u])
+    background = np.array(
+        [
+            1.0757937597341474,
+            0.5921040871780917,
+            -1.2174679563370514,
+            1.4268670549102678,
+            0.7834191059710589,
+            0.8581929158308614,
+            -1.1156591019733624,
+            -0.1488421863132986,
+            -0.3876059273022563,
+            1.2802949665458054,
+            0.43159536024199363,
+            0.9682848398124899,
+        ]
+    )
+    exact_idx = 6
+    for exact in (Q, Q + 1.0):
+        T = np.concatenate((background[:exact_idx], exact, background[exact_idx:]))
+        # `mass` exposes the float32 search profile, whose identical-vector
+        # self-dot may land an ulp below m. It must stay inside the ordinary
+        # admission margin; the public refined APIs below guarantee exact 0.
+        assert mlx_stump.mass(exact, T)[exact_idx] < 0.05
+        matches = mlx_stump.match(exact, T, max_distance=0.0, atol=0.0)
+        np.testing.assert_array_equal(
+            matches.astype(np.float64), np.array([[0.0, exact_idx]])
+        )
+
+
+def test_local_normalized_stump_does_not_discard_tiny_exact_neighbor():
+    """The GPU top-k search must retain the exact row before refinement."""
+    u = np.spacing(1.0)
+    Q = np.array([0.0, u, -u])
+    decoy = np.array([0.0, 2.0 * u, -3.0 * u])
+    background = np.array(
+        [
+            1.0757937597341474,
+            0.5921040871780917,
+            -1.2174679563370514,
+            1.4268670549102678,
+            0.7834191059710589,
+            0.8581929158308614,
+            -1.1156591019733624,
+            -0.1488421863132986,
+            -0.3876059273022563,
+            1.2802949665458054,
+            0.43159536024199363,
+            0.9682848398124899,
+        ]
+    )
+    T = np.concatenate((background[:6], Q, [-0.5], decoy, background[6:]))
+    with pytest.warns(UserWarning, match="large number of values"):
+        profile = mlx_stump.stump(Q, 3, T_B=T, ignore_trivial=False)
+    assert float(profile[0, 0]) == 0.0
+    assert int(profile[0, 1]) == 6
+
+
+def test_decimal_subnormal_result_ignores_caller_underflow_policy():
+    """A positive Decimal result below binary64 range stays non-zero, not an error."""
+    rng = np.random.default_rng(8888)
+    for _ in range(5):
+        m = int(rng.choice([3, 4, 8, 17, 33]))
+        n = int(rng.integers(2 * m + 10, 150))
+        with np.errstate(all="ignore"):
+            T = np.ldexp(
+                rng.uniform(-1.0, 1.0, n), rng.integers(-1074, 1024, size=n)
+            )
+        T = np.where(np.isfinite(T), T, np.sign(T) * np.finfo(float).max)
+        query_idx = int(rng.integers(0, n - m + 1))
+    assert (m, n, query_idx) == (3, 134, 93)
+    Q = T[query_idx : query_idx + m].copy()
+
+    previous = np.seterr(all="raise")
+    try:
+        matches = mlx_stump.match(Q, T, max_distance=np.inf, max_matches=3)
+    finally:
+        np.seterr(**previous)
+    assert matches.shape == (3, 2)
+    distances = np.asarray(matches[:, 0], dtype=np.float64)
+    assert distances[0] == 0.0
+    np.testing.assert_array_equal(distances[1:], np.full(2, np.nextafter(0.0, 1.0)))
+
+
 @pytest.mark.parametrize("m", [3, 8, 64, 1_024])
 def test_one_ulp_non_affine_row_is_not_zero(m):
     """The roundoff envelope alone must never certify an affine match.

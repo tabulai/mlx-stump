@@ -46,10 +46,10 @@ def test_rolling_isfinite():
     np.testing.assert_array_equal(ours, W.all(axis=1))
 
 
-def test_preprocess_standardization_and_masks():
+def test_raw_preprocess_standardization_and_masks():
     T = DATASETS["with_constants"](600, seed=43)
     m = 12
-    prep = preprocess_series(T, m)
+    prep = preprocess_series(T, m, normalize=False)
     assert prep.l == T.shape[0] - m + 1
     # standardized series has ~zero mean / unit variance over finite values
     assert abs(prep.Ts.mean()) < 1e-9
@@ -57,6 +57,20 @@ def test_preprocess_standardization_and_masks():
     # constant windows get sigma_inv == 0
     assert np.all(prep.sig_inv[prep.isconstant] == 0.0)
     # original series is untouched
+    np.testing.assert_array_equal(prep.T, T)
+
+
+def test_normalized_preprocess_keeps_only_locally_consumed_arrays():
+    """Local window normalization must not retain obsolete global stats."""
+    T = DATASETS["with_constants"](600, seed=43)
+    prep = preprocess_series(T, 12)
+
+    assert prep.Ts is None
+    assert prep.mu is None
+    assert prep.sig_inv is None
+    assert prep.ssq is None
+    assert prep.mu_mx is None
+    assert prep.sig_inv_mx is not None
     np.testing.assert_array_equal(prep.T, T)
 
 

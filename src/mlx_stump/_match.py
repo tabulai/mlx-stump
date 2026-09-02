@@ -314,17 +314,28 @@ def _high_precision_znorm_rows(
     m = Q.size
     out = np.empty(rows.size, dtype=np.float64)
 
-    # Find the exponent span with O(m) scratch, not an O(rows*m)
-    # concatenate/frexp pair. A single extreme row must still set enough
-    # Decimal precision for the shared query representation below.
+    # Find the exponent span in fixed-size blocks. A single extreme row must
+    # still set enough Decimal precision for the shared query representation,
+    # but a million-sample exceptional row must not allocate million-element
+    # masks/copies merely for this prepass.
     min_exponent = np.iinfo(np.int16).max
     max_exponent = np.iinfo(np.int16).min
-    for values in (Q, *(W[row] for row in rows)):
-        nonzero = values[values != 0.0]
-        if nonzero.size:
-            exponents = np.frexp(nonzero)[1]
-            min_exponent = min(min_exponent, int(exponents.min()))
-            max_exponent = max(max_exponent, int(exponents.max()))
+    exponent_chunk = 1 << 16
+
+    def update_exponent_span(values: np.ndarray) -> None:
+        nonlocal min_exponent, max_exponent
+        for start in range(0, values.size, exponent_chunk):
+            block = values[start : start + exponent_chunk]
+            nonzero = block != 0.0
+            if np.any(nonzero):
+                exponents = np.frexp(block)[1]
+                selected = exponents[nonzero]
+                min_exponent = min(min_exponent, int(selected.min()))
+                max_exponent = max(max_exponent, int(selected.max()))
+
+    update_exponent_span(Q)
+    for row in rows:
+        update_exponent_span(W[row])
     exponent_span = 0 if min_exponent > max_exponent else max_exponent - min_exponent
     # Ordinary binary64 rows need only ~17 significant decimal digits.  A
     # mixed-exponent row can encode a much smaller non-affine residual; two
@@ -338,27 +349,50 @@ def _high_precision_znorm_rows(
         ctx.prec = decimal_precision
         md = Decimal(m)
         q0 = Decimal.from_float(float(Q[0]))
-        qd = [Decimal.from_float(float(v)) - q0 for v in Q]
-        qmean = sum(qd, Decimal(0)) / md
-        qc = [v - qmean for v in qd]
-        qsig = (sum((v * v for v in qc), Decimal(0)) / md).sqrt()
+
+        # Three streaming passes replace the former qd/qc/wd/wc Decimal
+        # lists. Those lists retained roughly 500 MiB for m=1,000,000 and
+        # escaped the NumPy refinement budget. This path is deliberately
+        # slower but exceptional; its auxiliary memory is now constant.
+        def shifted_mean(values: np.ndarray, origin: Decimal) -> Decimal:
+            total = Decimal(0)
+            for raw in values:
+                total += Decimal.from_float(float(raw)) - origin
+            return total / md
+
+        def centered_sigma(
+            values: np.ndarray, origin: Decimal, mean: Decimal
+        ) -> Decimal:
+            total = Decimal(0)
+            for raw in values:
+                value = Decimal.from_float(float(raw)) - origin - mean
+                total += value * value
+            return (total / md).sqrt()
+
+        qmean = shifted_mean(Q, q0)
+        qsig = centered_sigma(Q, q0, qmean)
         for out_idx, row_idx in enumerate(rows):
             row = W[row_idx]
             w0 = Decimal.from_float(float(row[0]))
-            wd = [Decimal.from_float(float(v)) - w0 for v in row]
-            wmean = sum(wd, Decimal(0)) / md
-            wc = [v - wmean for v in wd]
-            wsig = (sum((v * v for v in wc), Decimal(0)) / md).sqrt()
+            wmean = shifted_mean(row, w0)
+            wsig = centered_sigma(row, w0, wmean)
             if qsig == 0 or wsig == 0:
                 dist = Decimal(0) if qsig == wsig else md.sqrt()
             else:
-                dist = sum(
-                    ((qv / qsig - wv / wsig) ** 2 for qv, wv in zip(qc, wc, strict=True)),
-                    Decimal(0),
-                ).sqrt()
+                distance_sq = Decimal(0)
+                for q_raw, w_raw in zip(Q, row, strict=True):
+                    qv = Decimal.from_float(float(q_raw)) - q0 - qmean
+                    wv = Decimal.from_float(float(w_raw)) - w0 - wmean
+                    delta = qv / qsig - wv / wsig
+                    distance_sq += delta * delta
+                dist = distance_sq.sqrt()
             value = float(dist)
             if dist > 0 and value == 0.0:
-                value = np.nextafter(0.0, 1.0)
+                # Returning the smallest positive binary64 value is
+                # intentional; do not let a caller's global underflow policy
+                # turn that representation choice into an exception.
+                with np.errstate(under="ignore"):
+                    value = np.nextafter(0.0, 1.0)
             out[out_idx] = value
     return out
 
@@ -595,7 +629,8 @@ def match(
     ``normalize=False`` supports ``p=2.0`` only. Precomputed ``M_T``/``Σ_T``
     follow the ``mass`` contract. In normalized mode they are compatibility
     metadata: an infinite ``M_T`` marks its window non-finite, while finite
-    statistics use the same repaired float64 rolling path as a no-stats call.
+    statistics leave every raw window on the same local float64 centering and
+    RMS-normalization path as a no-stats call.
     In raw mode the pair is only
     shape-validated and is otherwise ignored. It never skips preprocessing.
     """

@@ -89,13 +89,14 @@ def mass(
     ``normalize=False`` supports ``p=2.0`` only.
     ``T_subseq_isfinite`` is ignored when ``normalize=True``, like STUMPY.
 
-    With ``normalize=True``, precomputed ``M_T``/``Σ_T`` (both required,
-    shape ``(l,)``) are accepted as STUMPY-compatibility metadata, not as a
-    computational cache or an input to the arithmetic: they are validated,
+    With ``normalize=True``, precomputed ``M_T``/``Σ_T`` (when both are
+    supplied, each with shape ``(l,)``) are accepted as STUMPY-compatibility
+    metadata, not as a computational cache or an input to the arithmetic:
+    they are validated,
     an infinite ``M_T`` marks its window non-finite (STUMPY's convention for
-    windows containing NaN), and otherwise the same internal float64 rolling
-    means/sigmas (with two-pass cancellation repair where needed) are used as
-    in the no-stats call, so both profiles are identical. This is a deliberate choice
+    windows containing NaN), and otherwise every raw window is locally
+    centered and RMS-normalized in float64 exactly as in the no-stats call,
+    so both profiles are identical. This is a deliberate choice
     of mathematical semantics over STUMPY's literal use of the supplied
     values, whose rounding STUMPY lets into the distance: its
     ``QT - m·μ_Q·M_T`` amplifies ``M_T``'s rounding by ``(μ/σ)²`` and
@@ -110,9 +111,9 @@ def mass(
     The target window matrix is streamed in bounded column blocks, so the
     profile costs one block of GPU memory at a time regardless of ``n·m``.
 
-    Note the profile is the float32 GPU result: near-perfect matches read
+    Note the unrefined profile is the float32 GPU result: near-perfect matches read
     ~1e-3 rather than ~1e-8 (``stump`` and ``match`` re-evaluate their
-    reported distances in float64; a raw ``mass`` profile is not refined).
+    reported distances in float64; ``mass`` itself is not refined in either mode).
     """
     Q = np.asarray(Q)
     if Q.ndim == 2 and Q.shape[1] == 1:
@@ -185,10 +186,10 @@ def mass(
         # it as ignored when normalize=True (it only feeds mass_absolute)
         prep = preprocess_series(T, m, isconstant=T_subseq_isconstant)
         if user_stats:
-            # The supplied arrays are compatibility metadata: every window
-            # still uses the internally recomputed float64 rolling statistics,
-            # including two-pass repair near the cancellation floor, so the
-            # profile equals the no-stats call exactly. STUMPY's literal
+            # The supplied arrays are compatibility metadata: every raw window
+            # still goes through the same local float64 centering and RMS
+            # normalization, so the profile equals the no-stats call exactly.
+            # STUMPY's literal
             # use of the supplied values (`QT - m*mu_Q*M_T`, `1/(sigma_Q*Σ_T)`)
             # lets their rounding into the distance — amplified by
             # (mu/sigma)^2 for M_T, and as a sqrt(2m*delta) floor on perfect

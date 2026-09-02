@@ -122,7 +122,9 @@ def test_normalized_apis_handle_opposite_sign_near_float64_max():
         mp = mlx_stump.stump(T, m)
 
     assert np.all(np.isfinite(D))
-    assert D[10] == D[50] == 0.0
+    # MASS is the float32 search profile; an identical-vector dot may round
+    # one ulp below m. Refined match/stump semantics below remain exact.
+    assert D[10] < 2e-3 and D[50] < 2e-3
     np.testing.assert_array_equal(
         matches.astype(np.float64), np.array([[0.0, 10.0], [0.0, 50.0]])
     )

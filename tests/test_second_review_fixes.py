@@ -391,11 +391,11 @@ def test_aamp_extreme_spike_match_not_dropped():
     assert sorted(int(i) for _, i in M) == sorted(int(i) for _, i in Mr) == [50_000, 300_000]
 
 
-def test_match_precomputed_stats_are_a_cache():
-    """Cached M_T/Σ_T are validated and otherwise unused — the float32 search
-    and the float64 refinement both use exact statistics, so there is no
-    hybrid profile (the refinement once recomputed exact stats while the
-    search ranked by the supplied ones). STUMPY's own compute_mean_std
+def test_match_precomputed_stats_are_compatibility_metadata():
+    """M_T/Σ_T are validated compatibility metadata — the float32 search and
+    float64 refinement both use raw-window local normalization, so there is no
+    hybrid profile (the refinement once recomputed exact stats while the search
+    ranked by the supplied ones). STUMPY's own compute_mean_std
     output reproduces STUMPY's ranking; a deliberately doubled Σ_T changes
     STUMPY's result and not this one (the documented divergence)."""
     rng = np.random.default_rng(12)
@@ -415,13 +415,19 @@ def test_match_precomputed_stats_are_a_cache():
 
 
 def test_dynamic_range_warning():
-    """Amplitude ratios near float64's ~16 digits destroy small windows at
-    standardization itself; that must warn — and ordinary flatline-with-
-    jitter data must not."""
+    """Local z-normalization removes the global-frame precision limit.
+
+    Raw-distance search still uses one shared affine frame and warns at the
+    float64 dynamic-range boundary; ordinary flatline-with-jitter data does
+    not warn in either mode.
+    """
     rng = np.random.default_rng(7)
     T = np.concatenate([rng.standard_normal(2048) * 1e18, rng.standard_normal(4096)])
-    with pytest.warns(UserWarning, match="dynamic range"):
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
         mlx_stump.stump(T, 64)
+    with pytest.warns(UserWarning, match="dynamic range"):
+        mlx_stump.stump(T, 64, normalize=False)
     T2 = rng.standard_normal(2000)
     T2[900:1100] = 5.0 + 1e-9 * rng.standard_normal(200)
     with warnings.catch_warnings():

@@ -11,10 +11,11 @@ name: Publish to PyPI
 # Revoke the historical release.yml / pypi identity as well. Otherwise a tag
 # aimed at an old commit could still run that commit's workflow and obtain an
 # OIDC publishing token. Protect pypi-release-v2 with required reviewers and
-# restrict v* tag creation with a repository ruleset whose sole bypass actor
-# is a dedicated write-enabled deploy key. Store that key's private half as
-# the RELEASE_TAG_DEPLOY_KEY secret on pypi-release-v2; this workflow can read
-# it only after environment approval and only when dispatched from main.
+# restrict v* tag creation with a repository ruleset whose DeployKey actor
+# class can bypass it. Keep the dedicated release key as the repository's
+# only deploy key, and store its private half as RELEASE_TAG_DEPLOY_KEY on
+# pypi-release-v2; this workflow can read it only after environment approval
+# and only when dispatched from main.
 #
 # Run this workflow manually from main after updating __version__, committing,
 # and letting CI pass:
@@ -36,6 +37,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
+  actions: read  # query the exact-SHA CI result before release
   contents: read
 
 jobs:
@@ -45,6 +47,9 @@ jobs:
     timeout-minutes: 45
     env:
       VERSION: ${{ inputs.version }}
+      PYTHONHASHSEED: "0"
+      TZ: UTC
+      COPYFILE_DISABLE: "1"
     steps:
       - name: Refuse to release from anything but main
         shell: bash
@@ -58,20 +63,97 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
-          python-version: "3.12"
+          python-version: "3.12.10"
+          architecture: arm64
+      - name: Require successful CI for this exact commit
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import urllib.parse
+          import urllib.request
+
+          repository = os.environ["GITHUB_REPOSITORY"]
+          sha = os.environ["GITHUB_SHA"]
+          query = urllib.parse.urlencode(
+              {
+                  "head_sha": sha,
+                  "event": "push",
+                  "status": "success",
+                  "per_page": 100,
+              }
+          )
+          request = urllib.request.Request(
+              f"https://api.github.com/repos/{repository}/actions/workflows/ci.yml/runs?{query}",
+              headers={
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              },
+          )
+          with urllib.request.urlopen(request, timeout=30) as response:
+              runs = json.load(response).get("workflow_runs", [])
+          exact = [
+              run
+              for run in runs
+              if run.get("head_sha") == sha
+              and run.get("head_branch") == "main"
+              and run.get("event") == "push"
+              and run.get("conclusion") == "success"
+          ]
+          if not exact:
+              raise SystemExit(
+                  f"release refused: CI has not passed for exact main commit {sha}"
+              )
+          print(f"verified successful CI run {exact[0]['html_url']} for {sha}")
+          PY
       - name: Check that the requested version is the package version
         run: python .github/scripts/check_tag_version.py "v${VERSION}"
-      - run: python -m pip install build twine "ruff>=0.5"
+      - name: Install the hash-locked build toolchain
+        shell: bash
+        run: |
+          python -m venv "${RUNNER_TEMP}/build-venv"
+          "${RUNNER_TEMP}/build-venv/bin/python" -m pip install \
+            --require-hashes --only-binary=:all: \
+            -r .github/requirements/release-build.txt
+          echo "${RUNNER_TEMP}/build-venv/bin" >> "${GITHUB_PATH}"
+      - name: Fix reproducible build inputs to the release commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          epoch="$(git show -s --format=%ct "${GITHUB_SHA}")"
+          if [[ ! "${epoch}" =~ ^[0-9]+$ ]]; then
+            echo "release refused: invalid commit timestamp ${epoch}" >&2
+            exit 1
+          fi
+          echo "SOURCE_DATE_EPOCH=${epoch}" >> "${GITHUB_ENV}"
       - run: ruff check src tests bench .github/scripts
-      - run: python -m build
+      - name: Build twice and require byte-identical distributions
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/source-a" "${RUNNER_TEMP}/source-b"
+          mkdir -p "${RUNNER_TEMP}/dist-a" "${RUNNER_TEMP}/dist-b"
+          git archive "${GITHUB_SHA}" | tar -x -C "${RUNNER_TEMP}/source-a"
+          git archive "${GITHUB_SHA}" | tar -x -C "${RUNNER_TEMP}/source-b"
+          python -m build --no-isolation --outdir "${RUNNER_TEMP}/dist-a" \
+            "${RUNNER_TEMP}/source-a"
+          python -m build --no-isolation --outdir "${RUNNER_TEMP}/dist-b" \
+            "${RUNNER_TEMP}/source-b"
+          python .github/scripts/verify_reproducible_dist.py \
+            "${RUNNER_TEMP}/dist-a" "${RUNNER_TEMP}/dist-b" dist
       - run: twine check --strict dist/*
       - name: Test the built wheel in a clean environment
         shell: bash
         run: |
           python -m venv "${RUNNER_TEMP}/wheel-venv"
-          "${RUNNER_TEMP}/wheel-venv/bin/python" -m pip install --upgrade pip
           "${RUNNER_TEMP}/wheel-venv/bin/python" -m pip install \
-            dist/*.whl "pytest>=8" "stumpy>=1.13"
+            --require-hashes --only-binary=:all: \
+            -r .github/requirements/release-test.txt
+          "${RUNNER_TEMP}/wheel-venv/bin/python" -m pip install --no-deps dist/*.whl
+          "${RUNNER_TEMP}/wheel-venv/bin/python" -m pip check
           "${RUNNER_TEMP}/wheel-venv/bin/python" - <<'PY'
           import pathlib
           import sys
@@ -85,6 +167,35 @@ jobs:
           print("testing", module, mlx_stump.__version__)
           PY
           "${RUNNER_TEMP}/wheel-venv/bin/python" -m pytest tests/ -q
+      - name: Build, install, and test from the sdist in a clean environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdist_file="$(find "${GITHUB_WORKSPACE}/dist" -maxdepth 1 -name '*.tar.gz' -print -quit)"
+          test -n "${sdist_file}"
+          mkdir -p "${RUNNER_TEMP}/sdist"
+          tar xzf "${sdist_file}" -C "${RUNNER_TEMP}/sdist"
+          python -m venv "${RUNNER_TEMP}/sdist-venv"
+          "${RUNNER_TEMP}/sdist-venv/bin/python" -m pip install \
+            --require-hashes --only-binary=:all: \
+            -r .github/requirements/release-test.txt
+          "${RUNNER_TEMP}/sdist-venv/bin/python" -m pip install \
+            --no-deps --no-build-isolation "${sdist_file}"
+          "${RUNNER_TEMP}/sdist-venv/bin/python" -m pip check
+          cd "${RUNNER_TEMP}"/sdist/mlx_stump-*
+          "${RUNNER_TEMP}/sdist-venv/bin/python" - <<'PY'
+          import pathlib
+          import sys
+
+          import mlx_stump
+
+          module = pathlib.Path(mlx_stump.__file__).resolve()
+          prefix = pathlib.Path(sys.prefix).resolve()
+          assert module.is_relative_to(prefix), (module, prefix)
+          assert "site-packages" in module.as_posix(), module
+          print("testing sdist installation", module, mlx_stump.__version__)
+          PY
+          "${RUNNER_TEMP}/sdist-venv/bin/python" -m pytest tests -q -p no:cacheprovider
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-dist
@@ -198,8 +309,8 @@ jobs:
     timeout-minutes: 10
     environment: pypi-release-v2
     # GITHUB_TOKEN remains read-only. The environment-gated release deploy key
-    # is the tag ruleset's sole bypass actor and can reach this job only after
-    # reviewer approval.
+    # is the repository's only member of the ruleset's DeployKey bypass class
+    # and can reach this job only after reviewer approval.
     permissions:
       contents: read
     env:
@@ -248,8 +359,19 @@ jobs:
             echo "reusing existing ${tag} at verified commit ${target}"
           }
 
-          if git show-ref --verify --quiet "refs/tags/${tag}"; then
+          verify_remote_tag() {
+            # Do not trust an SSH push's exit status as proof that GitHub now
+            # holds the tag. Fetch that exact remote ref over independently
+            # authenticated HTTPS; an absent ref makes this command fail even
+            # if a same-named local tag still exists.
+            git fetch --force --quiet \
+              "https://github.com/${GITHUB_REPOSITORY}.git" \
+              "refs/tags/${tag}:refs/tags/${tag}"
             verify_existing_tag
+          }
+
+          if git show-ref --verify --quiet "refs/tags/${tag}"; then
+            verify_remote_tag
             exit 0
           fi
 
@@ -258,14 +380,14 @@ jobs:
           git tag --annotate "${tag}" "${GITHUB_SHA}" --message "mlx-stump ${VERSION}"
           if GIT_SSH_COMMAND="${ssh_command}" git push \
             "git@github.com:${GITHUB_REPOSITORY}.git" "refs/tags/${tag}"; then
+            verify_remote_tag
             exit 0
           fi
 
           # A concurrent/manual creator may have won the race. Accept only the
           # same annotated tag at the exact commit whose artifacts we tested.
           git tag --delete "${tag}"
-          git fetch --force --tags --quiet origin
-          verify_existing_tag
+          verify_remote_tag
 
   publish:
     name: Publish verified distributions
