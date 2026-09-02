@@ -50,8 +50,8 @@ def test_slicing_preserves_attrs():
     assert sliced.P_.shape == (10,)
 
 
-def test_fluss_consumes_output():
-    """The week-1 end-to-end contract: our profile feeds stumpy.fluss unchanged."""
+def test_fluss_consumes_output_indices():
+    """The STUMPY-style index accessor feeds ``fluss`` directly."""
     rng = np.random.default_rng(53)
     # two clearly different regimes
     a = np.sin(np.linspace(0, 20 * np.pi, 1500)) + 0.1 * rng.standard_normal(1500)
@@ -60,14 +60,14 @@ def test_fluss_consumes_output():
     m = 50
     mp = mlx_stump.stump(T, m)
     ref = stumpy.stump(T, m)
-    cac, regimes = stumpy.fluss(mp[:, 1], L=m, n_regimes=2, excl_factor=1)
-    cac_ref, regimes_ref = stumpy.fluss(ref[:, 1], L=m, n_regimes=2, excl_factor=1)
+    cac, regimes = stumpy.fluss(mp.I_, L=m, n_regimes=2, excl_factor=1)
+    cac_ref, regimes_ref = stumpy.fluss(ref.I_, L=m, n_regimes=2, excl_factor=1)
     assert cac.shape == cac_ref.shape
     # the detected regime boundary should agree closely with STUMPY's
     assert abs(int(regimes[0]) - int(regimes_ref[0])) <= m
 
 
-def test_motifs_consumes_output():
+def test_motifs_consumes_output_profile():
     rng = np.random.default_rng(54)
     T = rng.standard_normal(2000)
     m = 50

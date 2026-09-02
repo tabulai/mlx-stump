@@ -87,6 +87,17 @@ def test_all_nan_series():
     np.testing.assert_array_equal(mp.I_, ref.I_)
 
 
+def test_small_profile_warning_matches_stumpy_diagnostic():
+    T = np.arange(20, dtype=np.float64)
+    message = (
+        "A large number of values in `P` are smaller than 1e-06.\n"
+        "For a self-join, try setting `ignore_trivial=True`."
+    )
+    with pytest.warns(UserWarning, match="A large number of values") as caught:
+        mlx_stump.stump(T, 4)
+    assert str(caught[0].message) == message
+
+
 def test_isconstant_override():
     T = DATASETS["white_noise"](800, seed=5)
     m = 16

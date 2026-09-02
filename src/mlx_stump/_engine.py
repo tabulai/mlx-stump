@@ -1,4 +1,4 @@
-"""Batched-MASS GPU engine: exact distance profiles via doubly-centered matmul.
+"""Batched-MASS GPU engine: matrix profiles via doubly-centered matmul.
 
 For a query batch Q (B, m) and a target series T (n,), the sliding dot
 products QT[b, j] = sum_k Q[b, k] * T[j + k] are one dense matmul against the
@@ -27,8 +27,9 @@ any length. (An FFT cross-correlation fallback was used here previously; it
 operated on the raw float32 series, could not center per-window, and was
 numerically wrong for near-constant data.)
 
-Memory ceiling. Three byte budgets bound the whole computation, at any
-``n``/``m``:
+Memory accounting. Three byte budgets bound each ordinary computation;
+documented one-row/one-block floors can exceed a nominal budget at extreme
+``m``:
 
 - the resident window block: the whole ``(m, l)`` float32 matrix when it fits
   ``_MATMUL_WINDOW_BYTES``, else one ``_TILE_WINDOW_BYTES`` column block at a
@@ -43,7 +44,7 @@ Building a block stages it in numpy before the device copy, so the block
 exists twice for the duration of the upload. ``estimated_peak_bytes`` puts
 the pieces together; the O(n) per-series arrays are on top of it.
 
-Distances follow STUMPY's semantics exactly:
+Distance special cases follow STUMPY's semantics:
 - z-normalized: d = sqrt(2m(1 - rho)), rho from the mean-centered covariance;
 - both windows constant -> 0; exactly one constant -> sqrt(m);
 - either window non-finite -> inf.
@@ -93,6 +94,14 @@ def _center_rows(m: int) -> int:
 
 def resident_block_bytes(l: int, m: int) -> int:
     """Bytes of the float32 window block the engine keeps on the device."""
+    for name, value in (("l", l), ("m", m)):
+        if not (
+            isinstance(value, (int, np.integer))
+            and not isinstance(value, (bool, np.bool_))
+            and value >= 1
+        ):
+            raise ValueError(f"`{name}` must be a positive integer.")
+    l, m = int(l), int(m)
     full = l * m * 4
     if full <= _MATMUL_WINDOW_BYTES:
         return full
@@ -102,13 +111,22 @@ def resident_block_bytes(l: int, m: int) -> int:
 
 
 def estimated_peak_bytes(
-    l: int, m: int, k: int = 1, self_join: bool = True, l_q: int | None = None
+    l: int,
+    m: int,
+    k: int = 1,
+    self_join: bool = True,
+    l_q: int | None = None,
+    chunk_size: int | None = None,
 ) -> int:
     """Estimate of the bytes one join needs beyond its O(n) per-series arrays.
 
     ``l`` is the number of target windows (the side the engine
     materializes), ``l_q`` the number of query windows (the output rows;
-    defaults to ``l``). The largest of three phases:
+    defaults to ``l``), and ``chunk_size`` has the same meaning as in
+    :func:`mlx_stump.stump`. With no explicit chunk size, the automatic
+    byte-budgeted batch is modeled; with one, the requested batch (clamped
+    to ``l_q``) is modeled, including requests that deliberately exceed the
+    automatic ~384 MiB device budget. The largest of three phases:
 
     - upload: the block staged in numpy plus its device copy plus the
       centering temporary;
@@ -118,31 +136,93 @@ def estimated_peak_bytes(
       left/right indices; the tiled sweep also keeps float32/int64 top-k
       accumulators). The budget is enforced batch by batch — each batch is
       synchronized before the next allocates and the trailing batch is
-      computed at full width — so exactly one set of intermediates exists;
+      computed at full width — so exactly one set of intermediates exists.
+      Tiled top-k joins also merge each device result into the running set
+      on the host; the two concatenations, full stable-argsort permutation,
+      gather results, and sorting workspace are included here;
     - assembly: after the device memory is released, the float64
       refinement chunk plus the numeric outputs, the top-k reordering
       temporaries, and the object-dtype ``mparray`` STUMPY's output layout
-      requires: an 8-byte pointer plus a boxed Python float/int (24/28
-      bytes) per cell, ~68 bytes per neighbor per row, which dominates for
-      large ``k`` (n=50,000, m=50, k=100: ~330 MiB for the output alone).
+      requires: an 8-byte pointer plus one CPython small-object allocation
+      per cell. Although ``sys.getsizeof`` reports 24/28 bytes for a
+      float/int, both occupy a 32-byte pymalloc size class, so the resident
+      footprint is ~80 bytes per neighbor per row. This dominates for large
+      ``k`` (n=50,000, m=50, k=100: ~385 MiB for the output alone).
 
     It is an estimate with headroom, not a hard cap: MLX's allocator rounds
     buffers up (about +0.5% observed), the O(n) series and stat arrays are
     not included, and the figures are MLX's own active-memory peak plus
     host memory (GPU-written buffers are invisible to RSS on macOS).
     """
+    for name, value in (("l", l), ("m", m), ("k", k)):
+        if not (
+            isinstance(value, (int, np.integer))
+            and not isinstance(value, (bool, np.bool_))
+            and value >= 1
+        ):
+            raise ValueError(f"`{name}` must be a positive integer.")
     if l_q is None:
         l_q = l
+    elif not (
+        isinstance(l_q, (int, np.integer))
+        and not isinstance(l_q, (bool, np.bool_))
+        and l_q >= 1
+    ):
+        raise ValueError("`l_q` must be a positive integer.")
+    if not isinstance(self_join, (bool, np.bool_)):
+        raise ValueError("`self_join` must be a boolean.")
+    if chunk_size is not None and not (
+        isinstance(chunk_size, (int, np.integer))
+        and not isinstance(chunk_size, (bool, np.bool_))
+        and chunk_size >= 1
+    ):
+        raise ValueError("`chunk_size` must be a positive integer.")
+    l, m, k, l_q = int(l), int(m), int(k), int(l_q)
+    self_join = bool(self_join)
     block = resident_block_bytes(l, m)
+    full = l * m * 4
+    tiled = full > _MATMUL_WINDOW_BYTES
     width = block // (m * 4)  # columns of the resident block
     cell = 16 if k == 1 else (48 if self_join else 40)
     one_row = width * cell + _query_batch_bytes(m)
+    if chunk_size is None:
+        # Match the actual sizing helpers. Tiled batches are sized against
+        # MassEngine.tile_rows (the nominal upper bound), while blocks are
+        # subsequently balanced and can be narrower than that bound.
+        sizing_width = max(4, _TILE_WINDOW_BYTES // (4 * m)) if tiled else l
+        sizing_row = sizing_width * cell + _query_batch_bytes(m)
+        batch_cap = 4096 if tiled else 1024
+        batch = max(1, min(batch_cap, _CHUNK_MEM_BUDGET // sizing_row))
+        batch = min(batch, max(1, l_q))
+        # Keep the whole advertised device budget as conservative headroom
+        # when automatic sizing is used. A one-row floor can exceed it.
+        device_batch = max(_CHUNK_MEM_BUDGET, one_row)
+    else:
+        batch = min(int(chunk_size), max(1, l_q))
+        device_batch = batch * one_row
     numeric = l_q * (16 * k + 16)  # P (float64) and I (int64) per neighbor, IL/IR
-    accum = l_q * 12 * k if (block < l * m * 4 and k > 1) else 0  # tiled top-k merge state
-    sweep = block + max(_CHUNK_MEM_BUDGET, one_row) + numeric + accum
+    accum = l_q * 12 * k if (tiled and k > 1) else 0  # tiled top-k merge state
+    if tiled and k > 1:
+        # _merge_topk holds the float32/int64 block result, two 2k-wide
+        # concatenations, the full int64 stable-argsort result, both gathered
+        # outputs, and NumPy's stable-sort workspace. 64 B/cell covers the
+        # named arrays; 80 B/cell leaves headroom for the sort implementation.
+        host_batch = batch * k * 80
+    elif k > 1:
+        # Dense output conversion holds one float64 value copy and one int64
+        # index copy for the current batch alongside the persistent outputs.
+        host_batch = batch * k * 16
+    else:
+        # Value/index and (for self-joins) left/right conversion vectors.
+        host_batch = batch * 32
+    sweep = block + device_batch + numeric + accum + host_batch
     refine = refine_chunk_rows(m) * m * 8 * 4
     reorder = l_q * 16 * k if k > 1 else 0  # argsort order + one reordered copy live
-    boxed = l_q * ((2 * k + 2) * 8 + k * (24 + 28) + 2 * 28)
+    # Object-array pointers plus CPython's allocation-size footprint for the
+    # boxed float/int in every cell. Both 24-byte floats and 28-byte ints use
+    # the 32-byte pymalloc class; modeling logical `getsizeof` values
+    # undercounted the canonical k=100 process peak by ~25 MiB.
+    boxed = l_q * (2 * k + 2) * (8 + 32)
     assembly = refine + numeric + reorder + boxed
     return max(2 * block + _CENTER_BYTES, sweep, assembly)
 
@@ -280,8 +360,8 @@ class MassEngine:
         *mean-centered* target windows: the doubly-centered product IS the
         mean-centered cross-covariance, so no catastrophic `QT - m*mu_q*mu_t`
         subtraction ever happens in float32. Query-side stats live in the
-        query series' own standardized frame; mixing frames is exact because
-        the covariance is bilinear.
+        query series' own standardized frame; mixing frames is algebraically
+        valid because the covariance is bilinear.
 
         Squared distances are what the search runs on (sqrt is monotonic and
         the reported profile values are re-evaluated in float64 anyway).
@@ -313,7 +393,7 @@ class MassEngine:
 
         ``QT`` comes from centered windows and ``ssq`` values are centered
         sums of squares, so d2 = ||qc - tc||^2 + m*(mu_q - mu_t)^2 with the
-        offset carried exactly by the mean term; ``mu_q`` is a ``(B, 2)``
+        offset carried stably by the mean term; ``mu_q`` is a ``(B, 2)``
         float32 ``[hi, lo]`` split (see ``_preprocess.split_float32``).
         Multiply distances by the shared ``scale`` to return to original
         units.
@@ -334,7 +414,10 @@ class MassEngine:
 
 def _znorm_sq(QT, sig_inv_q, isconstant_q, isfinite_q, sig_inv_t, isconst_t, isfinite_t, m):
     rho = QT * (sig_inv_q[:, None] * sig_inv_t[None, :] * (1.0 / m))
-    d2 = mx.maximum(2.0 * m * (1.0 - rho), 0.0)
+    # Correlation is mathematically in [-1, 1]. Float32 covariance/stat
+    # rounding can stray by an ulp on either side, so enforce both distance
+    # bounds; a lower-only clamp allowed raw MASS to exceed 2*sqrt(m).
+    d2 = mx.minimum(mx.maximum(2.0 * m * (1.0 - rho), 0.0), 4.0 * m)
     q_const = isconstant_q[:, None]
     c_const = isconst_t[None, :]
     both = mx.logical_and(q_const, c_const)

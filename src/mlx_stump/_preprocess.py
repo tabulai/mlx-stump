@@ -27,6 +27,132 @@ import numpy as np
 EXCL_ZONE_DENOM = 4
 
 
+def stable_center_scale(a: np.ndarray) -> tuple[float, float]:
+    """Return a finite affine frame for finite values without squaring.
+
+    The values are first mapped by a midpoint/max-deviation frame, then their
+    mean and standard deviation are computed while bounded near one. Unlike
+    raw ``mean/std``, this cannot overflow for huge finite values or
+    underflow merely because all values use tiny units. Any positive affine
+    frame is sufficient for the GPU arithmetic: normalized distances are
+    invariant to it, while the absolute path multiplies by ``scale`` on
+    return.
+    """
+    a = np.asarray(a, dtype=np.float64)
+    finite_mask = np.isfinite(a)
+    # Keep an already-finite input as a view.  In particular, non-normalized
+    # joins deliberately assemble one shared finite frame; copying that whole
+    # array again here would add a needless O(n) memory peak.  Genuinely
+    # non-finite inputs are compacted exactly once.
+    all_finite = bool(np.all(finite_mask))
+    finite = a if all_finite else a[finite_mask]
+    del finite_mask
+    if finite.size == 0:
+        return 0.0, 1.0
+    lo = float(np.min(finite))
+    hi = float(np.max(finite))
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        if np.signbit(lo) == np.signbit(hi):
+            midpoint = lo + (hi - lo) * 0.5
+        else:
+            midpoint = lo * 0.5 + hi * 0.5
+        radius = max(abs(lo - midpoint), abs(hi - midpoint))
+    if not np.isfinite(midpoint):  # finite endpoints imply a finite midpoint
+        midpoint = 0.0
+    if not np.isfinite(radius) or radius == 0.0:
+        return float(midpoint), 1.0
+
+    # Recover mean/std semantics in the bounded frame (some callers and
+    # diagnostics rely on standardized data having mean 0 and sigma 1).
+    # No raw value is squared until it is O(1).
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        if all_finite:
+            bounded = np.subtract(finite, midpoint)
+        else:
+            # Boolean compaction already made `finite` a private writable
+            # copy, so reuse it rather than holding two O(n) float64 arrays.
+            bounded = finite
+            bounded -= midpoint
+        bounded /= radius
+        mean_bounded = float(bounded.mean())
+        bounded -= mean_bounded
+        # Values are bounded near one, so a dot product cannot overflow or
+        # underflow merely because the raw input units were extreme. Unlike
+        # np.std, this does not allocate another n-wide centered temporary.
+        std_bounded = float(np.sqrt((bounded @ bounded) / bounded.size))
+        center = midpoint + radius * mean_bounded
+        scale = radius * std_bounded
+    if not np.isfinite(center):
+        center = midpoint
+    if not np.isfinite(scale) or scale == 0.0:
+        scale = radius
+    return float(center), float(scale)
+
+
+def apply_affine_frame(a: np.ndarray, center: float, scale: float) -> np.ndarray:
+    """Return ``(a - center) / scale`` without avoidable overflow.
+
+    The direct subtraction is the accurate path for a large common offset,
+    but it can overflow when two finite values have opposite signs near
+    float64's maximum.  Division first is safe in exactly that case because
+    the scale from :func:`stable_center_scale` is correspondingly large.
+    Compute directly for every ordinary value and repair only the exceptional
+    finite entries, preserving both precision and the common O(n) memory path.
+    """
+    a = np.asarray(a, dtype=np.float64)
+    with np.errstate(over="ignore", under="ignore", invalid="ignore", divide="ignore"):
+        out = np.subtract(a, center)
+        out /= scale
+        repair = np.isfinite(a) & ~np.isfinite(out)
+        if np.any(repair):
+            out[repair] = a[repair] / scale - center / scale
+    return out
+
+
+def center_rows_stable(a: np.ndarray) -> np.ndarray:
+    """Center writable float64 rows in place after range preconditioning.
+
+    A row is first mapped into a bounded midpoint/max-deviation frame and
+    only then mean-centered.  Subsequent sums of squares therefore cannot
+    overflow or underflow solely because the original units were huge or
+    tiny.  Constant rows become exact zeros.
+    """
+    if a.ndim != 2:
+        raise ValueError("`a` must be a 2-dimensional row matrix.")
+    lo = np.min(a, axis=1)
+    hi = np.max(a, axis=1)
+    same_sign = np.signbit(lo) == np.signbit(hi)
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        midpoint_same = lo + (hi - lo) * 0.5
+        midpoint_cross = lo * 0.5 + hi * 0.5
+        midpoint = np.where(same_sign, midpoint_same, midpoint_cross)
+        scale = np.maximum(np.abs(lo - midpoint), np.abs(hi - midpoint))
+        safe_scale = np.where((scale > 0.0) & np.isfinite(scale), scale, 1.0)
+        a -= midpoint[:, None]
+        a /= safe_scale[:, None]
+    a -= a.mean(axis=1)[:, None]
+    return a
+
+
+def rowwise_l2_inplace(a: np.ndarray) -> np.ndarray:
+    """Scale-safe Euclidean norm of writable float64 rows.
+
+    The input is used as scratch space.  Finite norms are preserved in the
+    original units; a mathematically unrepresentable result becomes ``inf``
+    without emitting NumPy overflow/underflow warnings.
+    """
+    if a.ndim != 2:
+        raise ValueError("`a` must be a 2-dimensional row matrix.")
+    with np.errstate(over="ignore", under="ignore", invalid="ignore", divide="ignore"):
+        scale = np.max(np.abs(a), axis=1)
+        finite = np.isfinite(scale)
+        safe_scale = np.where((scale > 0.0) & finite, scale, 1.0)
+        a /= safe_scale[:, None]
+        norm = np.sqrt(np.sum(a * a, axis=1)) * scale
+    norm = np.where(scale == 0.0, 0.0, norm)
+    return np.where(finite, norm, np.inf)
+
+
 def check_series(T, name: str) -> np.ndarray:
     """Validate a time series the way STUMPY does; return a float64 copy."""
     T = np.asarray(T)
@@ -115,7 +241,7 @@ def rolling_mean_sigma(
     noise floor), where ``E[x^2] - mu^2`` cancels and leaves large relative
     error. Windows whose computed variance falls within
     ``_SIGMA_REPAIR_HEADROOM`` of a per-window error bound are therefore
-    recomputed exactly, two-pass, from the raw window values — an
+    recomputed directly, two-pass, from the raw window values — an
     O(suspects * w) repair, streamed in byte-budgeted chunks, that caps the
     surviving relative variance error at ~1/headroom (~1e-6).
 
@@ -226,6 +352,16 @@ class PreprocessedSeries:
         self.sig_inv_mx = self.isfinite_mx = self.isconstant_mx = None
         self.ssq_mx = self.mu_mx = None
 
+    def release_search_arrays(self) -> None:
+        """Drop CPU arrays needed only by the GPU search.
+
+        The raw series plus finite/constant flags remain available for the
+        float64 profile refinement. Calling this between the GPU sweep and
+        refinement avoids retaining standardized series and rolling-stat
+        arrays while a large object-dtype result is assembled.
+        """
+        self.Ts = self.mu = self.sig_inv = self.ssq = None
+
 
 def preprocess_series(
     T: np.ndarray,
@@ -269,18 +405,18 @@ def preprocess_series(
         )
     isconstant = fixed
 
-    T_filled = np.where(np.isnan(T_nan), 0.0, T_nan)
-
     if center is None or scale is None:
-        finite_vals = T[isfinite_pt]
-        c = float(finite_vals.mean()) if finite_vals.size else 0.0
-        s = float(finite_vals.std()) if finite_vals.size else 1.0
-        if not np.isfinite(s) or s == 0.0:
-            s = 1.0
+        c, s = stable_center_scale(T)
         center = c if center is None else center
         scale = s if scale is None else scale
 
-    Ts = (T_filled - center) / scale
+    # Invalid windows are masked from every ordinary result.  Represent their
+    # bad points by the affine frame's center (standardized zero), not raw
+    # zero: on a huge-offset, small-spread series, raw zero would become an
+    # enormous sentinel whose contribution poisons cumulative rolling stats
+    # for otherwise finite windows long after the bad point has left them.
+    T_filled = np.where(isfinite_pt, T, center)
+    Ts = apply_affine_frame(T_filled, center, scale)
 
     mu, sigma = rolling_mean_sigma(Ts, m, known_constant=detected)
     sigma[isconstant] = 0.0
@@ -288,7 +424,14 @@ def preprocess_series(
         sig_inv = np.where(sigma > 0.0, 1.0 / sigma, 0.0)
 
     pos = sigma[sigma > 0.0]
-    if pos.size and pos.min() < 1e-13 * max(1.0, float(np.max(np.abs(Ts)))):
+    # A user may deliberately mark a varying window as constant; we set its
+    # sigma to zero above to implement that override, so it is not evidence
+    # that global standardization lost the window's variation. Warn only for
+    # windows that neither the data nor the resolved user flags call constant.
+    lost_variation = isfinite & ~detected & ~isconstant & (sigma == 0.0)
+    if np.any(lost_variation) or (
+        pos.size and pos.min() < 1e-13 * max(1.0, float(np.max(np.abs(Ts))))
+    ):
         # e.g. a 1e17-amplitude segment next to unit noise: standardization
         # then re-rounds the noise below its own variation (float64 has ~16
         # digits total), so no downstream arithmetic can recover it

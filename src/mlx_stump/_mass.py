@@ -7,12 +7,17 @@ import warnings
 import mlx.core as mx
 import numpy as np
 
-from ._engine import MassEngine
+from ._engine import MassEngine, refine_chunk_rows
 from ._preprocess import (
+    apply_affine_frame,
+    center_rows_stable,
     check_series,
     check_window_size,
     preprocess_series,
+    process_isconstant,
+    rowwise_l2_inplace,
     split_float32,
+    stable_center_scale,
 )
 
 
@@ -84,12 +89,13 @@ def mass(
     ``normalize=False`` supports ``p=2.0`` only.
     ``T_subseq_isfinite`` is ignored when ``normalize=True``, like STUMPY.
 
-    Precomputed ``M_T``/``Σ_T`` (both required, shape ``(l,)``) are a
-    *cache*, not an input to the arithmetic: they are validated, an
-    infinite ``M_T`` marks its window non-finite (STUMPY's convention for
-    windows containing NaN), and otherwise every window is centered by its
-    own exact float64 mean and scaled by its own exact sigma, so the
-    profile equals the no-stats call exactly. This is a deliberate choice
+    With ``normalize=True``, precomputed ``M_T``/``Σ_T`` (both required,
+    shape ``(l,)``) are accepted as STUMPY-compatibility metadata, not as a
+    computational cache or an input to the arithmetic: they are validated,
+    an infinite ``M_T`` marks its window non-finite (STUMPY's convention for
+    windows containing NaN), and otherwise the same internal float64 rolling
+    means/sigmas (with two-pass cancellation repair where needed) are used as
+    in the no-stats call, so both profiles are identical. This is a deliberate choice
     of mathematical semantics over STUMPY's literal use of the supplied
     values, whose rounding STUMPY lets into the distance: its
     ``QT - m·μ_Q·M_T`` amplifies ``M_T``'s rounding by ``(μ/σ)²`` and
@@ -97,8 +103,9 @@ def mass(
     ``sqrt(2m·δ)`` floor on perfect matches from ``Σ_T``'s own relative
     rounding ``δ``. A deliberately scaled or biased ``M_T``/``Σ_T``
     therefore changes STUMPY's result but not this one; passing
-    ``compute_mean_std``'s output reproduces STUMPY's ranking to within
-    its own rounding.
+    ``compute_mean_std``'s output reproduces STUMPY's ranking to within its
+    own rounding. With ``normalize=False``, the pair is shape-validated and
+    otherwise ignored, including non-finite entries.
 
     The target window matrix is streamed in bounded column blocks, so the
     profile costs one block of GPU memory at a time regardless of ``n·m``.
@@ -146,28 +153,42 @@ def mass(
                 stacklevel=2,
             )
 
-    # validate eagerly (STUMPY would fail on a shape mismatch too), even for
-    # the all-inf early return below
-    user_stats = M_T is not None and Σ_T is not None
-    if user_stats:
-        M_T, Σ_T = _check_stats(M_T, Σ_T, l)
-    q_const = _as_flag(Q_subseq_isconstant, "Q_subseq_isconstant")
-
+    # STUMPY returns immediately for an invalid query before consulting
+    # optional cached statistics or constant flags. Preserve the simple
+    # documented contract even when those otherwise-validated inputs are bad.
     if not np.all(np.isfinite(Q)):
         return np.full(l, np.inf)
 
+    user_stats = M_T is not None and Σ_T is not None
+    if user_stats:
+        M_T, Σ_T = _check_stats(M_T, Σ_T, l)
+    else:
+        # Like STUMPY, an incomplete pair means "recompute both". Drop a
+        # lone temporary array now instead of pinning it through the GPU call.
+        del M_T, Σ_T
+    q_const = _as_flag(Q_subseq_isconstant, "Q_subseq_isconstant")
+
+    if not normalize and T_subseq_isconstant is not None:
+        # Constant flags have no role in Euclidean distance, but accepting a
+        # malformed value in only some raw APIs is hazardous. Validate the
+        # compatibility control consistently, then deliberately ignore it.
+        T_nan = np.where(np.isinf(T), np.nan, T)
+        process_isconstant(T_nan, m, T_subseq_isconstant, "T_subseq_isconstant")
+
     if q_const is None:
-        q_const = bool(np.ptp(Q) == 0.0)
+        q_const = bool(np.min(Q) == np.max(Q))
 
     D2 = np.empty(l, dtype=np.float64)
+    forced_zero_fill = None
     if normalize:
         # T_subseq_isfinite is deliberately NOT applied here: STUMPY documents
         # it as ignored when normalize=True (it only feeds mass_absolute)
         prep = preprocess_series(T, m, isconstant=T_subseq_isconstant)
         if user_stats:
-            # cached statistics are a cache: every window is centered by its
-            # own exact float64 mean and scaled by its own exact sigma, so
-            # the profile equals the no-stats call exactly. STUMPY's literal
+            # The supplied arrays are compatibility metadata: every window
+            # still uses the internally recomputed float64 rolling statistics,
+            # including two-pass repair near the cancellation floor, so the
+            # profile equals the no-stats call exactly. STUMPY's literal
             # use of the supplied values (`QT - m*mu_Q*M_T`, `1/(sigma_Q*Σ_T)`)
             # lets their rounding into the distance — amplified by
             # (mu/sigma)^2 for M_T, and as a sqrt(2m*delta) floor on perfect
@@ -177,20 +198,23 @@ def mass(
             if bad_mean.any():
                 prep.isfinite = prep.isfinite & ~bad_mean
                 prep.isfinite_mx = mx.array(prep.isfinite)
+            del bad_mean, M_T, Σ_T
 
-        # standardize Q by its own moments (the window then has mean 0, sigma
-        # 1), shifted by its first element first: `x - x0` errs with the
-        # window's SPREAD, so a large common offset cannot bias the mean and,
-        # through it, sigma_q (an unshifted Q.std() left an exact self-match
-        # reading ~1 instead of ~1e-3 for flat-jitter queries at offset 1e12)
-        Qs0 = Q - Q[0]
-        Qc = Qs0 - Qs0.mean()
+        # Put Q in a bounded midpoint/range frame before its two-pass stats:
+        # shifting by the first element alone avoids large common-offset
+        # cancellation but can still overflow for opposite-sign extremes,
+        # while squaring raw tiny values can underflow to zero.
+        Qc = Q.copy()[None, :]
+        center_rows_stable(Qc)
+        Qc = Qc[0]
         sigma_q = float(np.sqrt(Qc @ Qc / m))
         s = sigma_q if (np.isfinite(sigma_q) and sigma_q > 0.0) else 1.0
         Qs = Qc / s
+        del Qc
 
         engine = MassEngine(prep)
         Qb = mx.array(Qs.astype(np.float32))[None, :]
+        del Qs
         sig_inv_q = mx.array([0.0 if q_const else 1.0], dtype=mx.float32)
         isconst_q = mx.array([q_const])
         isfinite_q = mx.array([True])
@@ -204,22 +228,27 @@ def mass(
             del W, d2  # release this block before the next one is built
         del Qb, sig_inv_q, isconst_q, isfinite_q
     else:
+        if user_stats:
+            # normalize=False does not consult compatibility statistics.
+            del M_T, Σ_T
         finite = np.concatenate([Q, T[np.isfinite(T)]])
-        center = float(finite.mean())
-        scale = float(finite.std())
-        if not np.isfinite(scale) or scale == 0.0:
-            scale = 1.0
+        center, scale = stable_center_scale(finite)
+        del finite
         prep = preprocess_series(T, m, normalize=False, center=center, scale=scale)
         override = _check_isfinite_override(T_subseq_isfinite, l)
         if override is not None:
+            forced_zero_fill = override & ~prep.isfinite
             prep.isfinite = override
             prep.isfinite_mx = mx.array(override)
-        Qs = (Q - center) / scale
+        del override
+        Qs = apply_affine_frame(Q, center, scale)
         mu_q = float(Qs.mean())
         Qsc = Qs - mu_q
+        del Qs
         engine = MassEngine(prep, normalize=False)
         Qb = mx.array(Qsc.astype(np.float32))[None, :]
         ssq_q = mx.array([float(np.sum(Qsc * Qsc))], dtype=mx.float32)
+        del Qsc
         mu_q_mx = mx.array(split_float32(np.array([mu_q])))
         isfinite_q = mx.array([True])
         for j0, j1, W in engine.target_blocks():
@@ -236,9 +265,29 @@ def mass(
     del engine
     prep.release_device()
     mx.clear_cache()
-    profile = np.sqrt(D2)
+    # Reuse the profile buffer: allocating a second l-wide float64 array here
+    # needlessly overlaps the final GPU/cache teardown phase.
+    np.sqrt(D2, out=D2)
+    profile = D2
     if not normalize:
-        profile *= prep.scale
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            profile *= prep.scale
+        if forced_zero_fill is not None and np.any(forced_zero_fill):
+            # Preprocessing uses the affine center (standardized zero) as a
+            # harmless sentinel so one NaN cannot poison later rolling stats.
+            # Preserve the historical explicit-override contract separately:
+            # a window the user forces finite is measured against raw zero at
+            # its non-finite points. Recompute only those exceptional rows in
+            # bounded CPU chunks, before match applies any threshold.
+            Tf = np.where(np.isfinite(T), T, 0.0)
+            Wfull = np.lib.stride_tricks.sliding_window_view(Tf, m)
+            js = np.nonzero(forced_zero_fill)[0]
+            chunk = refine_chunk_rows(m)
+            for start in range(0, js.size, chunk):
+                idx = js[start : start + chunk]
+                with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+                    diff = Wfull[idx].astype(np.float64) - Q[None, :]
+                profile[idx] = rowwise_l2_inplace(diff)
     if query_idx is not None and (normalize or prep.isfinite[query_idx]):
         # STUMPY zeroes the self-match unconditionally when z-normalized, but
         # mass_absolute re-applies its finite mask afterwards, so a window an

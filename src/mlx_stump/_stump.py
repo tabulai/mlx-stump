@@ -19,14 +19,20 @@ from ._mparray import mparray
 from ._preprocess import (
     EXCL_ZONE_DENOM,
     PreprocessedSeries,
+    center_rows_stable,
     check_series,
     check_window_size,
     preprocess_series,
+    process_isconstant,
+    rowwise_l2_inplace,
+    stable_center_scale,
 )
 
 _INF = float("inf")
-# matches stumpy.config.STUMPY_P_NORM_THRESHOLD: squared distances below this
-# snap to exactly 0.0, so exact-duplicate subsequences report P == 0.0
+# Matches stumpy.config.STUMPY_P_NORM_THRESHOLD for the normalized profile:
+# tiny z-distance residuals come only from normalization roundoff.  It must
+# not be applied to raw-unit AAMP distances, where any fixed absolute cutoff
+# would make the result depend on the user's choice of units.
 P_NORM_THRESHOLD = 1e-14
 
 
@@ -43,21 +49,21 @@ def _refine_znorm(
     float64 removes the sqrt-cancellation noise from the reported profile
     values at O(l * m) cost. The squared distance is computed as the sum of
     squared differences of the two z-normalized windows (each centered and
-    scaled by *exact two-pass* float64 stats): unlike `dot - m*mu_q*mu_t` —
+    scaled by freshly recomputed two-pass float64 stats): unlike `dot - m*mu_q*mu_t` —
     which cancels catastrophically for near-constant windows at an offset
     even in float64 — and unlike `2m(1-rho)` — whose ~2m*eps noise floor
-    keeps exact duplicates from snapping to 0 — a sum of squares has no
-    cancellation at all and is relatively accurate down to 0. Stats are
+    keeps exact duplicates from snapping to 0 — a sum of squares avoids
+    those cancellation-dominated formulas and remains accurate near 0. Stats are
     recomputed here rather than reusing the O(n) cumsum rolling stats: those
     are only ~1e-6-relative after the suspect repair, fine for the float32
-    search but visible in a float64-exact reported value. The windows come
+    search but visible in a directly recomputed float64 value. The windows come
     from the RAW series (z-normalized distance is affine-invariant): the
     standardized copy quietly re-rounds every value by eps64 * scale, which
     a window whose own sigma is far below the global scale cannot afford.
-    Each window is first shifted by its own first element — `x - x0` errs at
-    most eps64 * |x - x0|, proportional to the window's SPREAD — so a large
-    common offset (timestamps at 1e12, say) cannot poison the window mean,
-    whose rounding would otherwise scale with eps64 * |offset|.
+    Each window is first mapped into its own midpoint/max-deviation frame and
+    only then mean-centered. This keeps every value bounded before squaring,
+    so neither a large common offset nor uniformly tiny/huge units can poison
+    its statistics through cancellation, underflow, or overflow.
     """
     m = query.m
     out = np.full(I.shape, np.inf)
@@ -77,13 +83,11 @@ def _refine_znorm(
         # below, so let the intermediate arithmetic run silently
         with np.errstate(invalid="ignore", over="ignore", divide="ignore"):
             qw = WQ[qi]  # fancy indexing copies, so everything can be in place
-            qw -= qw[:, 0].copy()[:, None]
-            qw -= qw.mean(axis=1)[:, None]
-            sq = np.sqrt(np.einsum("ij,ij->i", qw, qw) / m)
+            center_rows_stable(qw)
+            sq = np.sqrt(np.sum(qw * qw, axis=1) / m)
             tw = WT[tj]
-            tw -= tw[:, 0].copy()[:, None]
-            tw -= tw.mean(axis=1)[:, None]
-            st = np.sqrt(np.einsum("ij,ij->i", tw, tw) / m)
+            center_rows_stable(tw)
+            st = np.sqrt(np.sum(tw * tw, axis=1) / m)
             sq_inv = np.where((sq > 0.0) & ~qc, 1.0 / np.where(sq > 0.0, sq, 1.0), 0.0)
             st_inv = np.where((st > 0.0) & ~tc, 1.0 / np.where(st > 0.0, st, 1.0), 0.0)
             qw *= sq_inv[:, None]
@@ -118,10 +122,9 @@ def _refine_absolute(
     for s in range(0, valid.size, chunk):
         qi = valid[s : s + chunk]
         tj = I[qi]
-        diff = WQ[qi] - WT[tj]
-        d2 = np.einsum("ij,ij->i", diff, diff)
-        d2[d2 < P_NORM_THRESHOLD] = 0.0
-        d = np.sqrt(d2)
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            diff = WQ[qi] - WT[tj]
+        d = rowwise_l2_inplace(diff)
         d[~(query.isfinite[qi] & target.isfinite[tj])] = np.inf
         out[qi] = d
     return out
@@ -337,26 +340,36 @@ def stump(
 ):
     """Compute the (top-k) matrix profile of ``T_A`` (optionally joined to ``T_B``).
 
-    Drop-in for ``stumpy.stump``: identical signature and output layout —
-    an object array whose columns are the profile values, profile indices,
-    left indices, and right indices (``mparray`` with ``P_``, ``I_``,
-    ``left_I_``, ``right_I_`` accessors). AB-joins return -1 left/right
-    indices, exactly like STUMPY.
+    Drop-in for ``stumpy.stump``: the same upstream parameters and output
+    layout, plus the keyword-only ``chunk_size`` memory/performance control.
+    The result is an object array whose columns are the profile values,
+    profile indices, left indices, and right indices (``mparray`` with
+    ``P_``, ``I_``, ``left_I_``, ``right_I_`` accessors). AB-joins return
+    -1 left/right indices, exactly like STUMPY.
 
     ``normalize=False`` computes the non-normalized (aamp-style) profile and
-    supports ``p=2.0`` only. ``chunk_size`` is the number of distance
-    profiles evaluated per GPU batch; when omitted it is chosen so the live
-    per-batch intermediates stay under a ~384 MiB budget. Results do not
-    depend on it, except that ``chunk_size=1`` dispatches a matrix-vector
-    kernel whose float32 accumulation order differs from the batched one and
-    can resolve near-ties to a different, equally close neighbor.
+    supports ``p=2.0`` only. Its refined profile remains in raw input units,
+    including below ``1e-7``; STUMPY's fixed raw-unit P-norm threshold snaps
+    those small-but-nonzero distances to zero. ``chunk_size`` is the number
+    of distance profiles evaluated per GPU batch; when omitted it is chosen
+    so the live per-batch intermediates stay under a ~384 MiB budget. Results
+    do not depend on it, except that ``chunk_size=1`` dispatches a
+    matrix-vector kernel whose float32 accumulation order differs from the
+    batched one and can resolve near-ties to a different, equally close
+    neighbor.
     """
     T_A = check_series(T_A, "T_A")
-    if not (isinstance(k, (int, np.integer)) and k >= 1):
+    if not (
+        isinstance(k, (int, np.integer))
+        and not isinstance(k, (bool, np.bool_))
+        and k >= 1
+    ):
         raise ValueError(f"`k` must be a positive integer but found {k}.")
     k = int(k)
     if chunk_size is not None and not (
-        isinstance(chunk_size, (int, np.integer)) and chunk_size >= 1
+        isinstance(chunk_size, (int, np.integer))
+        and not isinstance(chunk_size, (bool, np.bool_))
+        and chunk_size >= 1
     ):
         raise ValueError(f"`chunk_size` must be a positive integer but found {chunk_size}.")
 
@@ -421,12 +434,23 @@ def stump(
                 isconstant_name="T_B_subseq_isconstant",
             )
     else:
+        # Constant-window flags do not affect raw Euclidean distances, but
+        # validate them consistently with mass/match instead of silently
+        # accepting malformed controls in this one API.
+        if T_A_subseq_isconstant is not None:
+            A_nan = np.where(np.isinf(T_A), np.nan, T_A)
+            process_isconstant(
+                A_nan, m, T_A_subseq_isconstant, "T_A_subseq_isconstant"
+            )
+        if not share_b_prep and T_B_subseq_isconstant is not None:
+            B_nan = np.where(np.isinf(T_B), np.nan, T_B)
+            process_isconstant(
+                B_nan, m, T_B_subseq_isconstant, "T_B_subseq_isconstant"
+            )
         # shared affine frame keeps cross distances exactly invariant
         finite = np.concatenate([T_A[np.isfinite(T_A)], T_B[np.isfinite(T_B)]])
-        center = float(finite.mean()) if finite.size else 0.0
-        scale = float(finite.std()) if finite.size else 1.0
-        if not np.isfinite(scale) or scale == 0.0:
-            scale = 1.0
+        center, scale = stable_center_scale(finite)
+        del finite
         A = preprocess_series(T_A, m, normalize=False, center=center, scale=scale)
         Bs = (
             A
@@ -446,17 +470,43 @@ def stump(
     A.release_device()
     Bs.release_device()  # the same object for self-joins; idempotent
     mx.clear_cache()
+    A.release_search_arrays()
+    Bs.release_search_arrays()  # likewise idempotent for self-joins
 
     # float64 re-evaluation of the profile values at the chosen indices
     refine = _refine_znorm if normalize else _refine_absolute
     P = P32  # refined in place: the float32-derived values are not needed again
+    # Do not keep a second name alive through the top-k reorder and object
+    # assembly.  At large k this alias alone can pin tens of MiB until return
+    # (P32 is otherwise never read again).
+    del P32
     for j in range(k):
         P[:, j] = refine(A, Bs, I[:, j])
     if k > 1:
-        # near-ties can reorder under the exact values; keep columns ascending
+        # near-ties can reorder under the refined values; keep columns ascending
         order = np.argsort(P, axis=1, kind="stable")
         P = np.take_along_axis(P, order, axis=1)
         I = np.take_along_axis(I, order, axis=1)
+        # Object boxing is the next (and often largest) host-memory phase.
+        # Release the l-by-k permutation as soon as both numeric arrays have
+        # been reordered instead of retaining it while `out` is populated.
+        del order
+
+    # Mirror STUMPY's post-profile diagnostic. A profile dominated by tiny
+    # distances often means a self-join was requested without its exclusion
+    # zone; downstream users rely on this warning when checking join setup.
+    warning_threshold = 1e-6
+    first_profile = P[:, 0]
+    with np.errstate(over="ignore", invalid="ignore"):
+        profile_too_small = first_profile.mean() < warning_threshold or np.all(
+            first_profile < warning_threshold
+        )
+    if profile_too_small:
+        warnings.warn(
+            f"A large number of values in `P` are smaller than {warning_threshold}.\n"
+            "For a self-join, try setting `ignore_trivial=True`.",
+            stacklevel=2,
+        )
 
     out = np.empty((A.l, 2 * k + 2), dtype=object)
     for j in range(k):

@@ -345,9 +345,10 @@ def test_match_default_threshold_parity(seed):
 
 def test_match_callable_threshold_reaches_fixed_point():
     """A data-dependent threshold is re-evaluated on each refined profile
-    until it stops moving; the threshold that selects the matches is the
-    one computed on the final profile, and every reported distance is the
-    float64 value that profile holds."""
+    until a cutoff exposes no new candidates; the threshold that selects the
+    matches is the one computed on the final changed profile, and every
+    reported distance is the float64 value that profile holds. The callable
+    is not invoked redundantly on an unchanged profile."""
     rng = np.random.default_rng(6)
     T = rng.standard_normal(1500)
     m = 20
@@ -367,8 +368,8 @@ def test_match_callable_threshold_reaches_fixed_point():
     for d, i in M:
         assert float(d) == final[int(i)]
         assert float(d) <= md + 1e-8
-    # the last two evaluations saw the same profile: a fixed point
-    np.testing.assert_array_equal(seen[-1], seen[-2])
+    # The following refinement attempt found no new rows, so `final` remained
+    # unchanged without invoking a side-effecting callback a redundant time.
     assert {int(i) for _, i in M} >= {700, 100, 400, 1200}
     Mr = stumpy.match(Q, T, max_distance=thr)
     np.testing.assert_array_equal(M[:, 1].astype(int), Mr[:, 1].astype(int))

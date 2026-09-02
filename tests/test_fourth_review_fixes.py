@@ -5,9 +5,10 @@
    matches (8e-4 at offset 1e12, 0.06 at 1e14 with STUMPY's
    ``compute_mean_std``), a raw-equality snap then missed shifted (affine)
    duplicates, and non-finite entries mixed STUMPY's and mathematical
-   semantics. The explicit choice now: cached ``M_T``/``Σ_T`` are a cache —
-   validated, an infinite ``M_T`` marks its window non-finite, and nothing
-   else enters the arithmetic — so results equal the no-stats call exactly.
+   semantics. The explicit choice now: ``M_T``/``Σ_T`` are compatibility
+   metadata — validated, with an infinite ``M_T`` marking its window
+   non-finite, but otherwise absent from the arithmetic — so results equal
+   the no-stats call exactly.
 2. ``mx.clear_cache()`` ran while the per-series device arrays were still
    alive, so they entered MLX's cache when the call returned (17 MiB after
    ``mass(n=1e6)``, 86 MiB at 5e6) despite the README's "nothing stays
@@ -41,7 +42,7 @@ from mlx_stump._engine import _CHUNK_MEM_BUDGET, estimated_peak_bytes, resident_
 
 MIB = 1 << 20
 _REPO = pathlib.Path(__file__).resolve().parents[1]
-_RELEASE_YML = _REPO / ".github/workflows/release.yml"
+_RELEASE_YML = _REPO / ".github/workflows/publish-pypi.yml"
 
 
 @pytest.mark.parametrize("offset,jitter", [(1e9, 1e-3), (1e12, 1e-3), (1e14, 0.1)])
@@ -122,7 +123,7 @@ def test_peak_estimate_terms():
     l, m = 63_337, 2_200
     base = estimated_peak_bytes(l, m)
     assert base >= resident_block_bytes(l, m) + _CHUNK_MEM_BUDGET + l * 32
-    # the object-dtype output dominates for large k: ~68 bytes/neighbor/row
+    # the object-dtype output dominates for large k: ~80 bytes/neighbor/row
     l, m, k = 49_951, 50, 100
     est = estimated_peak_bytes(l, m, k=k)
     assert est >= l * k * 68
@@ -137,8 +138,7 @@ def test_peak_estimate_terms():
 
 @pytest.mark.slow
 def test_large_topk_within_estimate():
-    """n=50,000, m=50, k=100: RSS grew by 643 MiB against a 471 MiB estimate
-    before the assembly phase was modeled."""
+    """The canonical top-k process peak stays below the published estimate."""
     n, m, k = 50_000, 50, 100
     l = n - m + 1
     src = textwrap.dedent(
@@ -158,18 +158,20 @@ def test_large_topk_within_estimate():
     out = subprocess.run([sys.executable, "-c", src], capture_output=True, text=True, check=True)
     growth = float([ln for ln in out.stdout.splitlines() if ln.startswith("RESULT")][-1].split()[1])
     est = estimated_peak_bytes(l, m, k=k) / MIB
-    assert growth <= est + 128, f"RSS grew {growth:.0f} MiB vs estimate {est:.0f} MiB"
+    assert growth <= est, f"RSS grew {growth:.0f} MiB vs estimate {est:.0f} MiB"
 
 
 @pytest.mark.skipif(not _RELEASE_YML.exists(), reason="workflow files are not shipped in the sdist")
-def test_release_workflow_is_manual_and_main_only():
+def test_release_workflow_is_manual_main_only_and_tags_before_publish():
     text = _RELEASE_YML.read_text()
     assert "workflow_dispatch" in text
     assert "tags:" not in text.split("jobs:")[0]  # no tag trigger
-    assert "github.ref != 'refs/heads/main'" in text
+    assert '"${GITHUB_REF}" != "refs/heads/main"' in text
     guard = text.index("Refuse to release from anything but main")
     assert guard < text.index("check_tag_version.py")
-    assert text.index("pypa/gh-action-pypi-publish") < text.index("git push origin")
+    assert text.index('"repos/${GITHUB_REPOSITORY}/git/refs"') < text.index(
+        "pypa/gh-action-pypi-publish"
+    )
     # the version input reaches shell steps only through an environment variable
     assert "VERSION: ${{ inputs.version }}" in text
     assert "${{ inputs.version }}" not in text.replace("VERSION: ${{ inputs.version }}", "")

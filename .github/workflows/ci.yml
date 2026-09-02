@@ -5,8 +5,16 @@ on:
     branches: [main]
   pull_request:
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
   test:
+    name: Test (${{ matrix.os }}, Python ${{ matrix.python-version }})
     # macos-14/15 GitHub-hosted runners are Apple Silicon; MLX runs there
     # (Metal in the runner VM when available, CPU fallback otherwise — the
     # suite passes either way, gpu-marked tests are advisory)
@@ -17,8 +25,10 @@ jobs:
         python-version: ["3.10", "3.12", "3.14"]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: ${{ matrix.python-version }}
       - run: python -m pip install -e ".[dev]"
@@ -26,10 +36,13 @@ jobs:
       - run: python -m pytest tests/ -q
 
   build:
+    name: Build distributions
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
       - run: python -m pip install build twine
@@ -45,13 +58,34 @@ jobs:
           assert "site-packages" in pathlib.Path(mlx_stump.__file__).as_posix(), mlx_stump.__file__
           PY
           "${RUNNER_TEMP}/wheel-venv/bin/python" -m pytest tests/ -q
-      - name: Check that the sdist's bundled tests are self-contained
+      - name: Build and test from the sdist in a clean environment
+        shell: bash
         run: |
+          set -euo pipefail
+          sdist_file="$(find "${GITHUB_WORKSPACE}/dist" -maxdepth 1 -name '*.tar.gz' -print -quit)"
+          test -n "${sdist_file}"
           mkdir -p "${RUNNER_TEMP}/sdist"
-          tar xzf dist/*.tar.gz -C "${RUNNER_TEMP}/sdist"
+          tar xzf "${sdist_file}" -C "${RUNNER_TEMP}/sdist"
+          python -m venv "${RUNNER_TEMP}/sdist-venv"
+          "${RUNNER_TEMP}/sdist-venv/bin/python" -m pip install --upgrade pip
+          "${RUNNER_TEMP}/sdist-venv/bin/python" -m pip install --no-cache-dir \
+            "${sdist_file}" "pytest>=8" "stumpy>=1.13"
           cd "${RUNNER_TEMP}"/sdist/mlx_stump-*
-          "${RUNNER_TEMP}/wheel-venv/bin/python" -m pytest tests -q -p no:cacheprovider
-      - uses: actions/upload-artifact@v4
+          "${RUNNER_TEMP}/sdist-venv/bin/python" - <<'PY'
+          import pathlib
+          import sys
+
+          import mlx_stump
+
+          module = pathlib.Path(mlx_stump.__file__).resolve()
+          prefix = pathlib.Path(sys.prefix).resolve()
+          assert module.is_relative_to(prefix), (module, prefix)
+          assert "site-packages" in module.as_posix(), module
+          print("testing sdist installation", module, mlx_stump.__version__)
+          PY
+          "${RUNNER_TEMP}/sdist-venv/bin/python" -m pytest tests -q -p no:cacheprovider
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: dist
           path: dist/
+          if-no-files-found: error

@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import time
 
 import numpy as np
@@ -45,7 +46,7 @@ def _discord_topk(P: np.ndarray, excl: int, k: int = 10) -> set[int]:
     return set(out)
 
 
-def provenance() -> str:
+def provenance(stumpy_threads: int | None = None) -> str:
     """One line naming the machine, software and commit the numbers came from."""
     import datetime
     import platform
@@ -61,15 +62,19 @@ def provenance() -> str:
 
     chip = _run("sysctl", "-n", "machdep.cpu.brand_string")
     commit = _run("git", "rev-parse", "--short", "HEAD")
+    tree_state = _run("git", "status", "--porcelain", "--untracked-files=normal")
+    if tree_state not in ("", "unknown"):
+        commit += "+dirty"
     try:
         import stumpy
 
         stumpy_v = stumpy.__version__
     except ImportError:
         stumpy_v = "not installed"
+    thread_info = "" if stumpy_threads is None else f", numba threads {stumpy_threads}"
     return (
         f"{chip}, macOS {platform.mac_ver()[0]}, Python {platform.python_version()}, "
-        f"mlx {mx.__version__}, numpy {np.__version__}, stumpy {stumpy_v}, "
+        f"mlx {mx.__version__}, numpy {np.__version__}, stumpy {stumpy_v}{thread_info}, "
         f"mlx-stump {mlx_stump.__version__} @ {commit}, {datetime.date.today().isoformat()}"
     )
 
@@ -85,12 +90,24 @@ def main() -> None:
 
     use_stumpy = not args.no_stumpy
     stumpy = None
+    stumpy_threads = None
     if use_stumpy:
         try:
             import stumpy  # noqa: F811
         except ImportError:
             print("stumpy not installed - GPU-only run (pip install 'mlx-stump[bench]')")
             use_stumpy = False
+        else:
+            import numba
+
+            stumpy_threads = numba.get_num_threads()
+            available_threads = os.cpu_count()
+            if available_threads is not None and stumpy_threads != available_threads:
+                raise RuntimeError(
+                    "The STUMPY baseline must use every logical CPU: "
+                    f"Numba has {stumpy_threads}, this host reports {available_threads}. "
+                    "Unset NUMBA_NUM_THREADS or pass --no-stumpy."
+                )
 
     rng = np.random.default_rng(args.seed)
     m = args.m
@@ -102,12 +119,15 @@ def main() -> None:
     if use_stumpy:
         stumpy.stump(T_warm, m)
 
+    stumpy_label = (
+        "stumpy skipped" if stumpy_threads is None else f"stumpy {stumpy_threads}-thread"
+    )
     header = (
-        "| n | mlx-stump (s) | stumpy all-cores (s) | speedup "
+        f"| n | mlx-stump (s) | {stumpy_label} (s) | speedup "
         "| max dP | idx agree | top-10 discords |"
     )
     rule = "|---|---|---|---|---|---|---|"
-    print(f"\n{provenance()}")
+    print(f"\n{provenance(stumpy_threads)}")
     print(f"random walk, m={m}, best of {args.repeat}\n")
     print(header)
     print(rule)
