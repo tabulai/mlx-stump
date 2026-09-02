@@ -11,7 +11,10 @@ name: Publish to PyPI
 # Revoke the historical release.yml / pypi identity as well. Otherwise a tag
 # aimed at an old commit could still run that commit's workflow and obtain an
 # OIDC publishing token. Protect pypi-release-v2 with required reviewers and
-# restrict v* tag creation with a repository ruleset.
+# restrict v* tag creation with a repository ruleset whose sole bypass actor
+# is a dedicated write-enabled deploy key. Store that key's private half as
+# the RELEASE_TAG_DEPLOY_KEY secret on pypi-release-v2; this workflow can read
+# it only after environment approval and only when dispatched from main.
 #
 # Run this workflow manually from main after updating __version__, committing,
 # and letting CI pass:
@@ -193,10 +196,12 @@ jobs:
     needs: prepare_publish
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # This is the only job allowed to mutate repository contents. Checkout does
-    # not persist credentials; the tag step uses its short-lived token directly.
+    environment: pypi-release-v2
+    # GITHUB_TOKEN remains read-only. The environment-gated release deploy key
+    # is the tag ruleset's sole bypass actor and can reach this job only after
+    # reviewer approval.
     permissions:
-      contents: write  # create the verified annotated release tag
+      contents: read
     env:
       VERSION: ${{ inputs.version }}
     steps:
@@ -208,10 +213,20 @@ jobs:
       - name: Create or verify the release tag
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG_DEPLOY_KEY: ${{ secrets.RELEASE_TAG_DEPLOY_KEY }}
         run: |
           set -euo pipefail
           tag="v${VERSION}"
+          key_file="${RUNNER_TEMP}/release-tag-deploy-key"
+          if [[ -z "${RELEASE_TAG_DEPLOY_KEY}" ]]; then
+            echo "release refused: RELEASE_TAG_DEPLOY_KEY is not configured" >&2
+            exit 1
+          fi
+          umask 077
+          printf '%s\n' "${RELEASE_TAG_DEPLOY_KEY}" > "${key_file}"
+          trap 'rm -f "${key_file}"' EXIT
+          ssh_command="ssh -i ${key_file} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+
           git fetch --force --tags --quiet origin \
             "+refs/heads/main:refs/remotes/origin/main"
           if ! git merge-base --is-ancestor "${GITHUB_SHA}" "refs/remotes/origin/main"; then
@@ -238,22 +253,17 @@ jobs:
             exit 0
           fi
 
-          tag_object="$(
-            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/tags" \
-              --raw-field tag="${tag}" \
-              --raw-field message="mlx-stump ${VERSION}" \
-              --raw-field object="${GITHUB_SHA}" \
-              --raw-field type="commit" \
-              --jq '.sha'
-          )"
-          if gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
-            --raw-field ref="refs/tags/${tag}" \
-            --raw-field sha="${tag_object}" >/dev/null; then
+          git config user.name "mlx-stump release workflow"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag --annotate "${tag}" "${GITHUB_SHA}" --message "mlx-stump ${VERSION}"
+          if GIT_SSH_COMMAND="${ssh_command}" git push \
+            "git@github.com:${GITHUB_REPOSITORY}.git" "refs/tags/${tag}"; then
             exit 0
           fi
 
           # A concurrent/manual creator may have won the race. Accept only the
           # same annotated tag at the exact commit whose artifacts we tested.
+          git tag --delete "${tag}"
           git fetch --force --tags --quiet origin
           verify_existing_tag
 

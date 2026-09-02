@@ -75,7 +75,10 @@ The publisher deliberately uses the never-before-used identity
 must **not** retain the historical `release.yml` / `pypi` identity: old
 commits contain tag-triggered copies of `release.yml`, and GitHub evaluates a
 workflow at the pushed tag's commit. The GitHub environment requires review,
-and a repository ruleset reserves `v*` tag creation for GitHub Actions.
+allows deployments only from `main`, and holds `RELEASE_TAG_DEPLOY_KEY`. Its
+public half is a write-enabled repository deploy key and the sole bypass actor
+for the ruleset that protects creation, update, and deletion of `v*` tags;
+the ordinary workflow token remains read-only.
 
 ## Quickstart
 

@@ -27,8 +27,11 @@ def test_release_uses_a_fresh_identity_and_separates_permissions():
     publish_job = text[text.index("  publish:") :]
     assert "permissions: {}" in prepare_job
     assert "id-token: write" not in prepare_job
-    assert "contents: write" in tag_job
+    assert "environment: pypi-release-v2" in tag_job
+    assert "contents: read" in tag_job
+    assert "contents: write" not in tag_job
     assert "id-token: write" not in tag_job
+    assert "RELEASE_TAG_DEPLOY_KEY" in tag_job
     assert "id-token: write" in publish_job
     assert "contents: write" not in publish_job
     assert "actions/checkout" not in publish_job
@@ -43,9 +46,9 @@ def test_release_tag_is_idempotent_only_for_the_verified_commit():
     assert 'git cat-file -t "refs/tags/${tag}"' in text
     assert 'git rev-parse "refs/tags/${tag}^{commit}"' in text
     assert '"${target}" != "${GITHUB_SHA}"' in text
-    assert '"repos/${GITHUB_REPOSITORY}/git/tags"' in text
-    assert '--raw-field object="${GITHUB_SHA}"' in text
-    assert '--raw-field type="commit"' in text
+    assert 'git tag --annotate "${tag}" "${GITHUB_SHA}"' in text
+    assert '"git@github.com:${GITHUB_REPOSITORY}.git" "refs/tags/${tag}"' in text
+    assert "GIT_SSH_COMMAND" in text
     assert 'git merge-base --is-ancestor "${GITHUB_SHA}"' in text
 
 
