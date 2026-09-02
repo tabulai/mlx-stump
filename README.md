@@ -29,7 +29,7 @@ against STUMPY** (270 golden and regression tests). Distance profiles are
 computed in bulk on the GPU as dense matmuls against the doubly-centered
 subsequence matrix — materialized in one piece for moderate `n*m`, streamed
 as column blocks beyond that — with a fused `mx.compile` distance+argmin
-step per chunk. It is already 1.3–2.0x faster
+step per chunk. It is already 1.1–2.1x faster
 than STUMPY using all CPU cores on the same machine, with a max profile error
 around 1e-5 (see [Benchmarks](#benchmarks)). The SCAMP-style diagonal Metal
 kernel — the headline speed path, O(1) work per cell instead of O(m) — is the
@@ -76,9 +76,11 @@ must **not** retain the historical `release.yml` / `pypi` identity: old
 commits contain tag-triggered copies of `release.yml`, and GitHub evaluates a
 workflow at the pushed tag's commit. The GitHub environment requires review,
 allows deployments only from `main`, and holds `RELEASE_TAG_DEPLOY_KEY`. Its
-public half is a write-enabled repository deploy key and the sole bypass actor
-for the ruleset that protects creation, update, and deletion of `v*` tags;
-the ordinary workflow token remains read-only.
+public half is the repository's only deploy key. GitHub models ruleset bypass
+for deploy keys as a repository-wide actor class, so adding any other deploy
+key would also grant that key the `v*`-tag bypass and must be treated as a
+release-security change. The ruleset protects creation, update, and deletion
+of `v*` tags; the ordinary workflow token remains read-only.
 
 ## Quickstart
 
@@ -177,21 +179,21 @@ Honesty rules (see `bench/`):
 Self-join on a random walk, `m=200`, best of 2. Provenance (the script
 prints this line above its table): Apple M4 Max, macOS 26.2, Python 3.12.12,
 mlx 0.32.2, numpy 2.5.2, STUMPY 1.14.1 with numba parallel on all 16 cores,
-mlx-stump 0.1.0.dev0 at commit `4755d34`, 2026-09-01. Timings on a laptop
+mlx-stump 0.1.0.dev0 at commit `9c4dcae`, 2026-09-01. Timings on a laptop
 vary by tens of percent with thermal state and background load; compare
 runs from the same session.
 
 | n | mlx-stump (s) | stumpy all-cores (s) | speedup | max \|ΔP\| | idx agree | top-10 discords |
 |---|---|---|---|---|---|---|
-| 16,384 | 0.051 | 0.104 | 2.0x | 1.5e-05 | 99.99% | 10/10 |
-| 65,536 | 0.573 | 0.718 | 1.3x | 2.5e-05 | 99.99% | 10/10 |
-| 131,072 | 2.145 | 2.695 | 1.3x | 3.6e-05 | 99.99% | 10/10 |
-| 262,144 | 9.328 | 12.393 | 1.3x | 2.9e-05 | 99.99% | 10/10 |
+| 16,384 | 0.061 | 0.107 | 1.8x | 1.5e-05 | 99.99% | 10/10 |
+| 65,536 | 0.680 | 0.756 | 1.1x | 2.5e-05 | 99.99% | 10/10 |
+| 131,072 | 2.499 | 2.788 | 1.1x | 3.6e-05 | 99.99% | 10/10 |
+| 262,144 | 10.622 | 12.882 | 1.2x | 2.9e-05 | 99.99% | 10/10 |
 
 The MASS engine does O(m) work per distance-matrix cell where STUMPY's
 recurrence does O(1), so the current speedup is structural, not a tuning
 gap — the planned diagonal Metal kernel removes that factor. At `m=50` the
-same benchmark (same provenance) shows 1.5–2.5x with 100% index agreement
+same benchmark (same provenance) shows 1.4–2.1x with 100% index agreement
 and max |ΔP| ≤ 6e-6.
 Above a 256 MiB subsequence matrix (n ≈ 335k at `m=200`) the target is
 streamed in 128 MiB column blocks through the same compiled kernel: at
