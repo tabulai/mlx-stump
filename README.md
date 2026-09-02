@@ -11,8 +11,8 @@ STUMPY's GPU path (`gpu_stump`) requires an NVIDIA GPU, so on a Mac it simply
 does not exist: Mac users are limited to the multi-core CPU path. `mlx-stump`
 is the missing Mac GPU backend. It is a drop-in for `stumpy.stump`: same
 parameters, same output layout (profile value/index, then left/right profile
-indices), and
-the same `P_`/`I_` accessors used by STUMPY's downstream functions. Pass the
+indices), and the same `P_`/`I_` accessors used by STUMPY's downstream
+functions. Pass the
 appropriate accessor—for example, `mp.I_` to `fluss` or `mp.P_` to `motifs`—
 without conversion. Because the computation happens in Apple Silicon's
 unified memory, there is no discrete-GPU transfer anywhere in the pipeline;
@@ -31,9 +31,9 @@ computed in bulk on the GPU as dense matmuls against a locally z-normalized
 subsequence matrix (or a doubly-centered shared-frame matrix for raw
 distances) — materialized in one piece for moderate `n*m`, streamed as column
 blocks beyond that — with a fused `mx.compile` distance+argmin step per chunk.
-It is already 1.1–2.1x faster
-than STUMPY using all CPU cores on the same machine, with a max profile error
-around 1e-5 (see [Benchmarks](#benchmarks)). The SCAMP-style diagonal Metal
+It is already 1.1–2.1× as fast as STUMPY using all CPU cores on the same
+machine, with max profile error ≤ 4.4e-5 in the current benchmarks (see
+[Benchmarks](#benchmarks)). The SCAMP-style diagonal Metal
 kernel — the headline speed path, O(1) work per cell instead of O(m) — is the
 next milestone. See [Roadmap](#roadmap).
 
@@ -63,8 +63,8 @@ gh workflow run publish-pypi.yml --ref main -f version=0.1.0
 The workflow refuses to run from any other branch, requires a successful CI
 run for that exact `main` commit, and refuses a version that does not equal
 `__version__` (in canonical PEP 440 form, never a `.dev`/local version). It
-serializes releases, installs fully transitive
-hash-locked build/test environments, builds the wheel and sdist twice from
+serializes releases, installs fully transitive hash-locked build/test
+environments, builds the wheel and sdist twice from
 independent archives of the commit, and requires byte-identical artifacts.
 It installs and tests both the wheel and the sdist in separate clean
 environments, creates (or verifies) an annotated `v<version>` tag at the exact
@@ -182,22 +182,22 @@ Honesty rules (see `bench/`):
 Self-join on a random walk, `m=200`, best of 2. Provenance (the script
 prints this line above its table): Apple M4 Max, macOS 26.2, Python 3.12.12,
 mlx 0.32.2, numpy 2.5.2, STUMPY 1.14.1 with numba parallel on all 16 cores,
-mlx-stump 0.1.0.dev0 at commit `9c4dcae`, 2026-09-01. Timings on a laptop
+mlx-stump 0.1.0.dev0 at commit `b459c28`, 2026-09-01. Timings on a laptop
 vary by tens of percent with thermal state and background load; compare
 runs from the same session.
 
 | n | mlx-stump (s) | stumpy all-cores (s) | speedup | max \|ΔP\| | idx agree | top-10 discords |
 |---|---|---|---|---|---|---|
-| 16,384 | 0.061 | 0.107 | 1.8x | 1.5e-05 | 99.99% | 10/10 |
-| 65,536 | 0.680 | 0.756 | 1.1x | 2.5e-05 | 99.99% | 10/10 |
-| 131,072 | 2.499 | 2.788 | 1.1x | 3.6e-05 | 99.99% | 10/10 |
-| 262,144 | 10.622 | 12.882 | 1.2x | 2.9e-05 | 99.99% | 10/10 |
+| 16,384 | 0.070 | 0.108 | 1.6x | 7.75e-06 | 99.99% | 10/10 |
+| 65,536 | 0.722 | 0.844 | 1.2x | 2.45e-05 | 99.98% | 10/10 |
+| 131,072 | 2.587 | 3.405 | 1.3x | 4.39e-05 | 99.99% | 10/10 |
+| 262,144 | 11.795 | 12.877 | 1.1x | 3.14e-05 | 99.99% | 10/10 |
 
 The MASS engine does O(m) work per distance-matrix cell where STUMPY's
 recurrence does O(1), so the current speedup is structural, not a tuning
 gap — the planned diagonal Metal kernel removes that factor. At `m=50` the
 same benchmark (same provenance) shows 1.4–2.1x with 100% index agreement
-and max |ΔP| ≤ 6e-6.
+and max |ΔP| ≤ 4.9e-6.
 Above a 256 MiB subsequence matrix (n ≈ 335k at `m=200`) the target is
 streamed in 128 MiB column blocks through the same compiled kernel: at
 n=524,288 that path measured as fast as or faster than the dense sweep
@@ -239,8 +239,8 @@ python bench/bench_stump.py --sizes 16384 65536 131072 262144 --m 200 --repeat 2
   zero-distance matches; mlx-stump instead centers and RMS-normalizes each raw
   window in its own bounded float64 frame before the GPU cast, resolving their
   true distances.
-- The unrefined `mass` output is the float32 GPU result: near-perfect matches read
-  ~1e-3 rather than ~1e-8. `stump` and `match` re-evaluate their reported
+- The unrefined `mass` output is the float32 GPU result: near-perfect matches
+  read ~1e-3 rather than ~1e-8. `stump` and `match` re-evaluate their reported
   distances in float64, so their outputs don't carry this floor.
 - Memory is bounded by three fixed budgets rather than by `n·m`: the
   resident window block (the whole float32 subsequence matrix when it is
