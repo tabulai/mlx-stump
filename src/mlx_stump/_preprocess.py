@@ -203,10 +203,17 @@ def check_series(T, name: str, copy: bool = True) -> np.ndarray:
 
 
 def check_window_size(
-    m, n: int | None = None, warn_n: int | None = None, excl_zone_denom=EXCL_ZONE_DENOM
+    m,
+    n: int | None = None,
+    warn_n: int | None = None,
+    excl_zone_denom=EXCL_ZONE_DENOM,
+    stacklevel: int = 3,
 ) -> int:
     """Validate ``m``; with ``warn_n`` (self-joins), also emit STUMPY's
-    advisory when the exclusion zone starves the central subsequence."""
+    advisory when the exclusion zone starves the central subsequence.
+
+    ``stacklevel`` is the advisory's ``warnings.warn`` level; the default
+    points at the caller of a public function that calls this directly."""
     if not np.issubdtype(type(m), np.integer):
         raise TypeError(f"`m` must be an integer but found {type(m)}.")
     m = int(m)
@@ -220,7 +227,7 @@ def check_window_size(
             warnings.warn(
                 f"The window size, 'm = {m}', may be too large and could lead to "
                 "meaningless results. Consider reducing 'm' where necessary",
-                stacklevel=3,
+                stacklevel=stacklevel,
             )
     return m
 
@@ -413,6 +420,7 @@ def preprocess_series(
     scale: float | None = None,
     isconstant=None,
     isconstant_name: str = "T_subseq_isconstant",
+    stacklevel: int = 3,
 ) -> PreprocessedSeries:
     """Prepare one already-validated float64 series for the GPU engine.
 
@@ -422,6 +430,7 @@ def preprocess_series(
     Normalized search needs only the raw series and finite/constant masks:
     every window is centered and scaled locally by the engine, so no global
     series copy or rolling statistics are built or retained in that mode.
+    ``stacklevel`` locates its warnings as in :func:`check_window_size`.
     """
     n = T.shape[0]
     l = n - m + 1
@@ -445,7 +454,7 @@ def preprocess_series(
             "contain one or more np.nan/np.inf and so their corresponding values "
             f"in `{isconstant_name}` have been automatically switched from True "
             "to False.",
-            stacklevel=3,
+            stacklevel=stacklevel,
         )
     isconstant = fixed
 
@@ -506,7 +515,7 @@ def preprocess_series(
             "The amplitude dynamic range of this series approaches the float64 "
             "standardization limit for raw-distance search; distances involving "
             "its smallest-variance windows may be unreliable.",
-            stacklevel=3,
+            stacklevel=stacklevel,
         )
 
     ssq = None
