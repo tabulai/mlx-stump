@@ -77,6 +77,31 @@ def _check_stats(M_T, Σ_T, l: int) -> tuple[np.ndarray, np.ndarray]:
     return M, S
 
 
+def _raw_window_distances(Q: np.ndarray, T: np.ndarray, js: np.ndarray) -> np.ndarray:
+    """Float64 Euclidean distances from ``Q`` to the windows ``js`` of ``T``.
+
+    Non-finite points of ``T`` count as raw zero, like the engine's
+    zero-filled series. They are zeroed in each gathered chunk, not in a
+    zero-filled copy of the whole series, so a handful of rows costs O(m)
+    rather than O(n). Rows are processed in bounded chunks.
+    """
+    js = np.asarray(js, dtype=np.int64)
+    m = Q.shape[0]
+    out = np.empty(js.size, dtype=np.float64)
+    Wfull = np.lib.stride_tricks.sliding_window_view(T, m)
+    chunk = refine_chunk_rows(m)
+    for start in range(0, js.size, chunk):
+        W = Wfull[js[start : start + chunk]]  # fancy indexing: a float64 copy
+        finite = np.isfinite(W)
+        if not finite.all():
+            W[~finite] = 0.0
+        del finite
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            W -= Q[None, :]
+        out[start : start + chunk] = rowwise_l2_inplace(W)
+    return out
+
+
 @dataclass
 class _MassInfo:
     """What ``match`` reuses from the ``mass`` call it wraps."""
@@ -195,6 +220,7 @@ def _mass(
     *,
     zero_query: bool = True,
     keep_sigma: bool = False,
+    copy_series: bool = True,
     stacklevel: int = 2,
 ) -> tuple[np.ndarray, _MassInfo]:
     """``mass``, plus the resolved flags and statistics ``match`` reuses.
@@ -204,7 +230,10 @@ def _mass(
     ``zero_query=False``, ``query_idx`` is range-checked but its entry is
     neither compared with ``Q`` nor zeroed (``stumpy.aamp_match`` keeps the
     true distance there). ``keep_sigma`` (raw mode) also returns the
-    target's rolling sigma in the shared frame.
+    target's rolling sigma in the shared frame. ``copy_series=False`` is for
+    a caller whose ``T`` is already a private validated copy (``match``
+    after flattening an ``(n, 1)`` series or converting a byte-swapped one):
+    it is used without a second copy. Nothing here writes to ``T``.
     """
     Q = np.asarray(Q)
     if Q.ndim == 2 and Q.shape[1] == 1:
@@ -216,7 +245,7 @@ def _mass(
     if T.ndim == 2 and T.shape[1] == 1:
         T = T.flatten()
     Q = check_series(Q, "Q")
-    T = check_series(T, "T")
+    T = check_series(T, "T", copy=copy_series)
     m = check_window_size(int(Q.shape[0]), T.shape[0])
     l = T.shape[0] - m + 1
     info = _MassInfo()
@@ -390,15 +419,8 @@ def _mass(
             # a window the user forces finite is measured against raw zero at
             # its non-finite points. Recompute only those exceptional rows in
             # bounded CPU chunks, before match applies any threshold.
-            Tf = np.where(np.isfinite(T), T, 0.0)
-            Wfull = np.lib.stride_tricks.sliding_window_view(Tf, m)
             js = np.nonzero(forced_zero_fill)[0]
-            chunk = refine_chunk_rows(m)
-            for start in range(0, js.size, chunk):
-                idx = js[start : start + chunk]
-                with np.errstate(over="ignore", under="ignore", invalid="ignore"):
-                    diff = Wfull[idx].astype(np.float64) - Q[None, :]
-                profile[idx] = rowwise_l2_inplace(diff)
+            profile[js] = _raw_window_distances(Q, T, js)
     if query_idx is not None and (normalize or prep.isfinite[query_idx]):
         # STUMPY zeroes the self-match unconditionally when z-normalized, but
         # mass_absolute re-applies its finite mask afterwards, so a window an

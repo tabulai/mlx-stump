@@ -43,6 +43,22 @@
     signatures (``aamp_match`` keeps ``D[query_idx]`` at its true distance,
     as STUMPY's does), warnings point at the caller's line, and the public
     signatures are annotated.
+
+Review of the fixes above:
+
+11. ``math.ceil`` in the new top-k band (5) and trimmed walk (3) rejected a
+    size-1 array ``max_matches`` such as ``np.array([3])``, which STUMPY and
+    the previous code accept (they only compare it). It is unwrapped like a
+    size-1 threshold (2). The loop kept for small counts and the trimmed
+    walk are also pinned by their allocation sizes now.
+12. Every raw ``_refine_candidates`` call built a zero-filled copy of the
+    whole series, O(n) even for ``aamp_match``'s single forced row. Only
+    the gathered windows are zero-filled now, bitwise identically.
+13. A flattened ``(n, 1)`` or byte-swapped ``T`` was copied by ``match`` and
+    again by ``mass``; ``mass`` now uses ``match``'s private copy.
+14. ``stumpy.aamp_match`` (and so ``stumpy.match(normalize=False)``) checks
+    the query's values before any dtype, so a float32 query holding NaN is
+    a ValueError there; raw ``match`` and ``aamp_match`` follow suit.
 """
 
 from __future__ import annotations
@@ -953,3 +969,136 @@ def test_public_signatures_are_annotated():
         hints = typing.get_type_hints(f)
         assert hints["return"] is np.ndarray
         assert "Q" in hints and "T" in hints
+
+
+# ----------------------------------------- 11. size-1 array match counts
+@pytest.mark.parametrize("count", [np.array([3]), np.array([12]), np.array([[3]]), np.array([2.5])])
+def test_size1_array_match_counts_are_accepted(count):
+    T = _walk(3_000, seed=61)
+    Q = T[100:150].copy()
+    for normalize in (True, False):
+        for md in (np.inf, None):
+            got = mlx_stump.match(Q, T, max_distance=md, max_matches=count, normalize=normalize)
+            ref = stumpy.match(Q, T, max_distance=md, max_matches=count, normalize=normalize)
+            np.testing.assert_array_equal(got[:, 1].astype(np.int64), ref[:, 1].astype(np.int64))
+    D = np.random.default_rng(61).integers(0, 4, 500).astype(np.float64)
+    for md in (np.inf, 2.0):
+        _assert_same_matches(
+            _find_matches(D, 3, max_distance=md, max_matches=count),
+            _legacy_find_matches(D, 3, max_distance=md, max_matches=count),
+        )
+
+
+def test_small_match_counts_keep_the_loop_and_the_walk_is_trimmed():
+    """Allocation sizes only (no timing): STUMPY's loop needs just the
+    working copy of D, the trimmed walk about 2.4 copies, while sorting every
+    candidate (the untrimmed walk) peaks at about 4.6."""
+    D = np.random.default_rng(62).random(1_000_000)
+
+    def peak(**kwargs):
+        tracemalloc.start()
+        try:
+            tracemalloc.reset_peak()
+            base = tracemalloc.get_traced_memory()[0]
+            _find_matches(D, 25, max_distance=np.inf, **kwargs)
+            return (tracemalloc.get_traced_memory()[1] - base) / D.nbytes
+        finally:
+            tracemalloc.stop()
+
+    for k in (1, 8):
+        assert peak(max_matches=k) < 1.5, k
+    for k in (9, 100):
+        assert peak(max_matches=k) < 3.0, k
+
+
+# ------------------------------------- 12. raw refinement gathers windows only
+def _old_raw_refine(Q, T, js):
+    """Pre-review raw branch of ``_refine_candidates``: a zero-filled copy of
+    the whole series per call."""
+    Tf = np.where(np.isfinite(T), T, 0.0)
+    W = np.lib.stride_tricks.sliding_window_view(Tf, Q.shape[0])
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        diff = W[js].astype(np.float64) - Q[None, :]
+    return prep_mod.rowwise_l2_inplace(diff)
+
+
+def test_raw_refinement_zero_fills_only_the_gathered_windows():
+    rng = np.random.default_rng(63)
+    T = _walk(20_000, seed=63)
+    T[rng.random(T.size) < 0.01] = np.nan
+    T[rng.random(T.size) < 0.005] = np.inf
+    T[rng.random(T.size) < 0.005] = -np.inf
+    T[5_000:5_100] = 1.5e308 * np.sign(rng.standard_normal(100))  # norms overflow
+    m = 37
+    Q = rng.standard_normal(m)
+    js = np.concatenate([rng.permutation(T.size - m + 1)[:3_000], np.arange(4_950, 5_120)])
+    z = np.zeros(T.size - m + 1, dtype=bool)
+    got = match_mod._refine_candidates(Q, T, js, False, False, z)
+    ref = _old_raw_refine(Q, T, js)
+    assert got.tobytes() == ref.tobytes()
+    assert np.isinf(got).any() and np.isfinite(got).any()
+
+    # one forced aamp_match row no longer costs a copy of the series
+    big = _walk(1_000_000, seed=64)
+    tracemalloc.start()
+    try:
+        tracemalloc.reset_peak()
+        base = tracemalloc.get_traced_memory()[0]
+        match_mod._refine_candidates(big[:50].copy(), big, [123], False, False, z)
+        extra = tracemalloc.get_traced_memory()[1] - base
+    finally:
+        tracemalloc.stop()
+    assert extra < big.nbytes // 100, extra
+
+
+# --------------------------------------- 13. one private copy of the series
+def test_match_holds_one_private_copy_of_a_converted_series():
+    n = 1_000_000
+    T = _walk(n, seed=65)
+    Q = T[1_000:1_100].copy()
+    mlx_stump.match(Q, T[:10_000], max_matches=2)  # warm-up
+
+    def peak(X, normalize):
+        tracemalloc.start()
+        try:
+            tracemalloc.reset_peak()
+            base = tracemalloc.get_traced_memory()[0]
+            mlx_stump.match(Q, X, max_matches=3, normalize=normalize)
+            return tracemalloc.get_traced_memory()[1] - base
+        finally:
+            tracemalloc.stop()
+
+    swapped, column = T.astype(">f8"), T[:, None].copy()
+    for normalize in (True, False):
+        native = peak(T, normalize)
+        # match's converted (or flattened) array is handed to mass as its
+        # private copy: it used to be copied again, +1x the series
+        for X in (swapped, column):
+            assert peak(X, normalize) - native < T.nbytes // 2, normalize
+
+
+# ------------------------------------ 14. raw match checks Q's values first
+def test_raw_match_checks_query_values_before_dtype_like_stumpy():
+    T = _walk(200, seed=66)
+    Q32 = T[:10].astype(np.float32)
+    Q32[0] = np.nan
+    Qn = T[:10].copy()
+    Qn[0] = np.inf
+    for Q, TT in ((Q32, T), (Qn, np.arange(200))):
+        for f in (
+            lambda Q, T: mlx_stump.match(Q, T, normalize=False),
+            mlx_stump.aamp_match,
+            lambda Q, T: stumpy.match(Q, T, normalize=False),
+            stumpy.aamp_match,
+        ):
+            with pytest.raises(ValueError, match="illegal"):
+                f(Q, TT)
+        # the normalized path keeps STUMPY's dtype-first order
+        for f in (mlx_stump.match, stumpy.match):
+            with pytest.raises(TypeError, match="float"):
+                f(Q, TT)
+    for f in (lambda Q, T: mlx_stump.match(Q, T, normalize=False), mlx_stump.aamp_match):
+        with pytest.raises(TypeError, match="float32"):
+            f(T[:10].astype(np.float32), T)
+        with pytest.raises(TypeError, match="float64"):
+            f(np.array(list(T[:10]), dtype=object), T)

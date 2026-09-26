@@ -10,13 +10,12 @@ import numpy as np
 from numpy.typing import ArrayLike
 
 from ._engine import refine_chunk_rows
-from ._mass import IsConstantSpec, _mass
+from ._mass import IsConstantSpec, _mass, _raw_window_distances
 from ._preprocess import (
     apply_affine_frame,
     center_rows_stable,
     check_series,
     exclusion_zone,
-    rowwise_l2_inplace,
 )
 
 # refinement/threshold rounds for a data-dependent max_distance (the loop
@@ -498,15 +497,10 @@ def _refine_candidates(Q, T, js, normalize, q_const, t_const):
                 d[collapsed_non_affine] = np.minimum(tiny_distances, 2.0 * np.sqrt(m))
             out[s : s + chunk] = np.where(q_const & tc, 0.0, np.where(q_const ^ tc, np.sqrt(m), d))
     else:
-        # the engine computes on the zero-filled series; mirror it so a user
+        # the engine computes on the zero-filled series; mirror it (per
+        # gathered window, with no zero-filled copy of the series) so a user
         # T_subseq_isfinite override cannot inject NaN into the profile
-        Tf = np.where(np.isfinite(T), T, 0.0)
-        Wfull = np.lib.stride_tricks.sliding_window_view(Tf, m)
-        for s in range(0, js.size, chunk):
-            idx = js[s : s + chunk]
-            with np.errstate(over="ignore", under="ignore", invalid="ignore"):
-                diff = Wfull[idx].astype(np.float64) - Q[None, :]
-            out[s : s + chunk] = rowwise_l2_inplace(diff)
+        out = _raw_window_distances(Q, T, js)
     return out
 
 
@@ -594,6 +588,8 @@ def _find_matches(
 
     if max_matches is None:
         max_matches = np.inf
+    elif isinstance(max_matches, np.ndarray) and max_matches.size == 1:
+        max_matches = max_matches.reshape(())  # see _match: math.ceil needs a scalar
 
     matches = []
     if max_matches <= _SMALL_MAX_MATCHES or excl_zone < 0 or not np.all(D > -np.inf):
@@ -661,7 +657,7 @@ def match(
     T: ArrayLike,
     M_T: ArrayLike | None = None,
     Σ_T: ArrayLike | None = None,
-    max_distance: float | Callable[[np.ndarray], float] | None = None,
+    max_distance: float | Callable[[np.ndarray], ArrayLike] | None = None,
     max_matches: int | None = None,
     atol: float = 1e-8,
     query_idx: int | None = None,
@@ -719,7 +715,7 @@ def aamp_match(
     Q: ArrayLike,
     T: ArrayLike,
     T_subseq_isfinite: ArrayLike | None = None,
-    max_distance: float | Callable[[np.ndarray], float] | None = None,
+    max_distance: float | Callable[[np.ndarray], ArrayLike] | None = None,
     max_matches: int | None = None,
     atol: float = 1e-8,
     query_idx: int | None = None,
@@ -777,13 +773,25 @@ def _match(
     if Q.ndim == 2 and Q.shape[1] == 1:
         Q = Q.flatten()
     T = np.asarray(T)
+    owned = False
     if T.ndim == 2 and T.shape[1] == 1:
         T = T.flatten()
-    # Validate before reading any value, as STUMPY does (a dtype error
-    # outranks the NaN check). Q is m samples; T is only checked, not
-    # copied: mass makes its own copy of the series.
+        owned = True
+    if not normalize and Q.dtype.kind in "fc" and not np.all(np.isfinite(Q)):
+        # stumpy.aamp_match (where stumpy.match sends normalize=False) checks
+        # Q's values before any dtype: a float32 query holding NaN is a
+        # ValueError there
+        raise ValueError("Q contains illegal values (NaN or inf)")
+    # Validate before reading any value, as STUMPY's normalized match does
+    # (a dtype error outranks the NaN check). Q is m samples; T is only
+    # checked, not copied: mass makes its own copy of the series, unless
+    # this function already holds a private one (a flattened or byte-swapped
+    # input), which mass then uses as is.
     Q = check_series(Q, "Q")
+    T_in = T
     T = check_series(T, "T", copy=False)
+    owned = owned or T is not T_in
+    del T_in
     if np.any(np.isnan(Q)) or np.any(np.isinf(Q)):
         raise ValueError("Q contains illegal values (NaN or inf)")
 
@@ -806,6 +814,7 @@ def _match(
         query_idx,
         zero_query=zero_query,
         keep_sigma=not normalize,
+        copy_series=not owned,
         stacklevel=stacklevel + 1,
     )
     l = D.shape[0]
@@ -878,6 +887,10 @@ def _match(
                 )[0]
             refined[query_idx] = True
 
+    if isinstance(max_matches, np.ndarray) and max_matches.size == 1:
+        # STUMPY only compares the count (`len(matches) >= max_matches`), so
+        # any size-1 array works there; math.ceil below needs a scalar
+        max_matches = max_matches.reshape(())
     cap = np.inf
     if fixed and max_matches is not None and 0 < max_matches < l:
         # Top-k with a fixed threshold. k greedy picks (query_idx included)
