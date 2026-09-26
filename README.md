@@ -125,8 +125,8 @@ STUMPY's own `mparray` loses them on a round trip.
 |---|---|---|
 | `stump(T_A, m, T_B=None, ignore_trivial=True, normalize=True, p=2.0, k=1, T_A_subseq_isconstant=None, T_B_subseq_isconstant=None, *, chunk_size=None)` | `stumpy.stump` | self-joins and AB-joins; `normalize=False` computes the non-normalized profile (`p=2.0` only); constant flags may be boolean arrays or STUMPY-style callables; `chunk_size` is an mlx-stump extension |
 | `aamp(T_A, m, T_B=None, ignore_trivial=True, p=2.0, k=1, *, chunk_size=None)` | `stumpy.aamp` | `stump(..., normalize=False)` under aamp's positional signature, where the fifth argument is `p`; `p=2.0` only |
-| `gpu_stump(T_A, m, T_B=None, ignore_trivial=True, device_id=0, normalize=True, p=2.0, k=1, T_A_subseq_isconstant=None, T_B_subseq_isconstant=None, *, chunk_size=None)` | `stumpy.gpu_stump` | same computation as `stump`; `device_id` (an int or a list of ints) is accepted and ignored, because the Mac's one GPU is always used |
-| `gpu_aamp(T_A, m, T_B=None, ignore_trivial=True, device_id=0, p=2.0, k=1, *, chunk_size=None)` | `stumpy.gpu_aamp` | same computation as `aamp`; `device_id` is accepted and ignored |
+| `gpu_stump(T_A, m, T_B=None, ignore_trivial=True, device_id=0, normalize=True, p=2.0, k=1, T_A_subseq_isconstant=None, T_B_subseq_isconstant=None, *, chunk_size=None)` | `stumpy.gpu_stump` | same computation as `stump`; `device_id` (an int or a list of ints) is validated and ignored, because the Mac's one GPU is always used |
+| `gpu_aamp(T_A, m, T_B=None, ignore_trivial=True, device_id=0, p=2.0, k=1, *, chunk_size=None)` | `stumpy.gpu_aamp` | same computation as `aamp`; `device_id` is validated like `gpu_stump`'s and ignored |
 | `mass(Q, T, ...)` | `stumpy.mass` | normalized or raw (`p=2`) distance profile of one query; constant flags may be boolean arrays or STUMPY-style callables |
 | `mass_absolute(Q, T, T_subseq_isfinite=None, p=2.0, query_idx=None)` | `stumpy.core.mass_absolute` | STUMPY's exact signature, so positional calls port unchanged; `p=2.0` only |
 | `match(Q, T, max_distance=..., max_matches=...)` | `stumpy.match` | normalized or raw (`p=2`) matches of a query, nearest first; `max_distance` may be a number or a callable returning a number or a size-1 array |
@@ -159,7 +159,12 @@ breadth-first order), with no `scrump` approximation. `PAN_`, `M_`, `P_`
 and `pan(threshold=0.2, normalize=True, contrast=True, binary=True,
 clip=True)` follow STUMPY. `normalize=False` follows STUMPY's `aamp_stimp`
 (`percentage=1.0, pre_scraamp=False`), `p=2.0` only. `gpu_stimp` takes
-`stumpy.gpu_stimp`'s signature and runs the same computation.
+`stumpy.gpu_stimp`'s signature and runs the same computation, so its
+positional calls port unchanged. `stimp` has no `percentage` or
+`pre_scrump` parameter (it always computes the exact profile), so its fifth
+positional parameter is `normalize` where `stumpy.stimp`'s is `percentage`:
+when porting a `stumpy.stimp` call, pass everything after `step` by keyword
+(a positional `0.01` would otherwise bind to `normalize`).
 
 ```python
 pan = mlx_stump.stimp(T, min_m=8, max_m=264, step=8)
@@ -168,9 +173,12 @@ for _ in range(pan.M_.shape[0]):   # one exact profile per window size
 PAN = pan.PAN_
 ```
 
-At n=8192 with window sizes 8 to 264 in steps of 8, it was about 9x faster
-than `stumpy.stimp(percentage=1.0, pre_scrump=False)` in a prototype
-measurement, with an identical binary `PAN_`.
+On a random walk with window sizes 8 to 264 in steps of 8 (33 profiles),
+the updates took 0.485 s against 1.634 s for
+`stumpy.stimp(percentage=1.0, pre_scrump=False)` on all 16 cores at
+n=8192 (3.4x; 3.3x in a repeat run) and 2.130 s against 9.325 s at
+n=32,768 (4.4x), in 3 interleaved runs each on a shared M4 Max. The binary
+`PAN_` was identical and the raw profiles agreed to max |ΔP| ≤ 3.4e-5.
 
 ## Precision
 
@@ -278,14 +286,14 @@ n=16,384, 5.9x at 65,536, 5.6x at 131,072 and 262,144) with 100.00% index
 agreement and max |ΔP| ≤ 4.9e-6.
 
 The MASS engine still does O(m) work per distance-matrix cell where STUMPY's
-recurrence does O(1). With the reduction fused, the sweep is now largely
-matmul-bound: at n=131,072, `m=50`, one 766-row batch's matmul takes 1.80 ms
-of the 3.31 ms matmul-plus-fused-reduction, against 20.99 ms with the
-compiled reduction, and the matmul's share grows with `m`. A SCAMP-style
-diagonal kernel removes the O(m) factor, but a prototype measured only
-1.2–2.2x faster than the fused engine at n=65,536–262,144 (1.16x at
-n=65,536, `m=100`; 1.69x at n=262,144, `m=100`; 2.21x at n=262,144,
-`m=200`). It covers only normalized `k=1` self-joins and needs a
+recurrence does O(1). With the reduction fused, the matmul is now more than
+half of each batch's time, and its share grows with `m`: at n=131,072,
+`m=50`, one 766-row batch's matmul takes 1.80 ms of the 3.31 ms
+matmul-plus-fused-reduction, against 20.99 ms with the compiled reduction.
+A SCAMP-style diagonal kernel removes the O(m) factor, but a prototype
+measured only 1.2–2.2x faster than the fused engine at n=65,536–262,144
+(1.16x at n=65,536, `m=100`; 1.69x at n=262,144, `m=100`; 2.21x at
+n=262,144, `m=200`). It covers only normalized `k=1` self-joins and needs a
 conditioning gate, so it stays on the [Roadmap](#roadmap) as future work; a
 symmetric SCAMP variant, which computes each cell once, could roughly double
 that.
@@ -324,9 +332,11 @@ python bench/bench_stump.py --sizes 524288 1048576 --m 200 --repeat 1 --seed 0 -
   large-level-shift series on MASS, where its global-frame recurrence loses
   accuracy and MASS does not (a symmetric variant could roughly double the
   gain); chip-specific tuning (M1–M4).
-- **dropped**: `stump_batch` for many short series. Per-call overhead fell
-  to ~1.25 ms at n=1000, `m=50` (below the batched prototype's
-  ~2.1 ms/series there) and ~0.67 ms at n=256, `m=16`.
+- **dropped**: `stump_batch` for many short series. A `stump` call now
+  takes a median ~1.4 ms at n=1000, `m=50` (best ~1.25 ms), below the
+  batched prototype's ~2.1 ms/series there, and ~0.55 ms at n=256, `m=16`,
+  level with its 0.55 ms/series, so batching no longer pays for a separate
+  API.
 - **backlog**: `mstump`, GPU `stumpi` updates, snippets, MPdist.
 
 ## Known limitations
@@ -410,8 +420,8 @@ python bench/bench_stump.py --sizes 524288 1048576 --m 200 --repeat 1 --seed 0 -
   search: the standardized series, its rolling means and centered sums of
   squares, and the window masks (tracemalloc, n=1e7, m=100). End to end at
   n=3e7 (a 229 MiB series, random walk with NaN, m=100), `mass`/`match` grow
-  RSS above the series by about 1,060 MiB normalized and by 2,110/2,438 MiB
-  raw.
+  RSS above the series by about 1,060 MiB normalized and by about
+  2,110/2,340 MiB raw.
   For large `k` the output itself dominates:
   STUMPY's
   object-dtype `mparray` layout costs a pointer plus a CPython allocator
@@ -419,10 +429,10 @@ python bench/bench_stump.py --sizes 524288 1048576 --m 200 --repeat 1 --seed 0 -
   k=100: ~385 MiB for the returned array alone), which the estimate includes
   together with the top-k reordering temporaries. The canonical case's
   process RSS growth after a warm-up (measured as in
-  `test_large_topk_within_estimate`) is ~585 MiB (579.5–595.2 MiB over 18
+  `test_large_topk_within_estimate`) is ~597 MiB (592.1–604.0 MiB over 18
   fresh-interpreter runs on an M4 Max, macOS 26.6.2) against a ~638 MiB
-  estimate, about 8% headroom. It is an estimate with
-  headroom, not a literal cap: MLX's allocator rounds buffers up (about
+  estimate: about 6% headroom, 5% for the largest run. It is an estimate
+  with headroom, not a literal cap: MLX's allocator rounds buffers up (about
   +0.5% observed), a
   gigantic `l` can make even a one-row batch exceed the intermediates
   budget, and the figures are MLX's own active-memory peak plus host
