@@ -23,6 +23,11 @@ callables work. This round adds it:
    ``device_id`` is validated and ignored.
 5. Warnings from the per-window ``stump`` calls point at the user's
    ``update()`` line.
+6. Review follow-ups: ``P_`` returns read-only views instead of copies (no
+   second copy of the pan array); with ``normalize=False`` a constant-flag
+   function is validated once rather than evaluated at every update; on
+   exact-tie data (exactly periodic series) the profiles still agree with
+   STUMPY although the rank-based contrast may order the ties differently.
 """
 
 from __future__ import annotations
@@ -259,12 +264,23 @@ def test_raw_profiles_and_padding_layout():
             np.testing.assert_array_equal(row, mlx_stump.stump(T, int(m)).P_)
         else:
             assert np.isinf(row).all()
-    # P_ and M_ are copies: editing them does not touch the object
-    P[0][:] = 0.0
+    # P_ holds read-only views (no copy of the pan array, as in STUMPY, but
+    # they cannot corrupt it); M_ is a copy
+    for row in P:
+        assert not row.flags.writeable and not row.flags.owndata
+        assert np.shares_memory(row, ours._PAN)
+    with pytest.raises(ValueError, match="read-only"):
+        P[0][:] = 0.0
     M = ours.M_
     M[:] = 3
     assert np.isfinite(ours.P_[0]).all() and ours.P_[0].min() > 0.0
     assert ours.M_[0] == 20
+    assert ours._PAN.flags.writeable  # the pan array itself stays writable
+    # a view taken before an update is filled in place by it, as in STUMPY
+    assert np.isinf(P[2]).all()
+    _update(ours, 1)
+    assert np.isfinite(P[2]).all()
+    np.testing.assert_array_equal(P[2], mlx_stump.stump(T, int(ours.M_[2])).P_)
 
 
 def test_custom_isconstant_func_matches_stumpy():
@@ -287,6 +303,59 @@ def test_custom_isconstant_func_matches_stumpy():
     default = mlx_stump.stimp(T, **kw)
     _update(default, len(default.M_))
     assert not np.array_equal(default._PAN, ours._PAN)
+
+
+def test_raw_mode_validates_the_isconstant_func_once():
+    """Raw distances ignore constant flags, so with ``normalize=False`` a
+    user function is called once, by the first successful update, to
+    validate it; a failing first update leaves the state unchanged."""
+    T = random_walk(400, seed=21)
+    kw = dict(min_m=5, max_m=40, step=5)
+    calls = []
+
+    def counting(a, w):
+        calls.append(w)
+        return np.zeros(len(a) - w + 1, dtype=bool)
+
+    ours = mlx_stump.stimp(T, normalize=False, T_subseq_isconstant_func=counting, **kw)
+    _update(ours, len(ours.M_))
+    assert calls == [int(ours.M_[0])]
+    plain = mlx_stump.stimp(T, normalize=False, **kw)
+    _update(plain, len(plain.M_))
+    np.testing.assert_array_equal(ours._PAN, plain._PAN)
+
+    broken = mlx_stump.stimp(
+        T, normalize=False, T_subseq_isconstant_func=lambda a, w: np.zeros(3, dtype=bool), **kw
+    )
+    for _ in range(2):  # still validated (and rejected) until an update succeeds
+        with pytest.raises(ValueError, match="boolean array of shape"):
+            broken.update()
+    assert broken._n_processed == 0 and np.isinf(broken._PAN).all()
+
+    # normalized mode keeps calling it: the flags matter for every window
+    calls.clear()
+    norm = mlx_stump.stimp(T, T_subseq_isconstant_func=counting, **kw)
+    _update(norm, 3)
+    assert calls == [int(m) for m in norm.M_[:3]]
+
+
+def test_exact_tie_groups_keep_profiles_close():
+    """Exactly periodic data has large groups of exactly tied distances.
+    The rank-based contrast step may order those ties differently from
+    STUMPY (documented), but the profiles and the normalized, uncontrasted
+    pan still agree within float tolerance."""
+    T = np.tile(np.random.default_rng(22).standard_normal(25), 16)
+    kw = dict(min_m=4, max_m=60, step=4)
+    ours = mlx_stump.stimp(T, **kw)
+    ref = _ref_stimp(T, **kw)
+    _update(ours, len(ours.M_))
+    _update(ref, len(ref.M_))
+    np.testing.assert_array_equal(ours.M_, ref.M_)
+    for m, row, row_ref in zip(ours.M_, ours.P_, _ref_profiles(ref), strict=True):
+        assert_profile_close(row, row_ref, m=int(m), tie_atol=1e-6)
+    np.testing.assert_allclose(
+        ours.pan(binary=False, contrast=False), ref.pan(binary=False, contrast=False), atol=1e-6
+    )
 
 
 # --------------------------------------------- 2. window range semantics

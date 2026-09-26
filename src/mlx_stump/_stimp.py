@@ -92,13 +92,21 @@ class stimp:
     window size (default: a window is constant when its min equals its max).
     It receives the series with inf replaced by NaN and must return a
     boolean array of length ``len(a) - w + 1``. With ``normalize=False`` the
-    flags do not affect raw distances; the function is still validated at
-    every update.
+    flags do not affect raw distances, so the function is called only once,
+    at the first update, to validate it (STUMPY's ``aamp_stimp`` does not
+    accept it at all).
 
     Attributes ``PAN_`` (the transformed pan matrix profile, see
     :meth:`pan`), ``M_`` (window sizes in breadth-first order) and ``P_``
     (the raw profiles in that order) follow STUMPY. The class keeps a
     ``(len(M_), len(T))`` float64 array, like STUMPY.
+
+    ``P_`` agrees with STUMPY within float tolerance. The binary ``PAN_`` is
+    identical to STUMPY's on noisy data (random walks, sine plus noise), but
+    its contrast step ranks every value, so on series with large groups of
+    exactly tied distances (exactly periodic or discrete-valued data, or
+    constant runs with ``normalize=False``) tied cells can be ranked in a
+    different order and some binary cells differ; see :meth:`pan`.
     """
 
     def __init__(
@@ -133,6 +141,9 @@ class stimp:
         # None is STUMPY's default rule (a window is constant iff min == max),
         # which stump applies itself without calling back into Python
         self._T_subseq_isconstant_func = T_subseq_isconstant_func
+        # raw distances ignore the flags: a user function is only validated,
+        # once, by the first successful update
+        self._isconstant_func_checked = False
 
         max_window = _max_window_size(n, excl_zone_denom())
         if max_m is None:
@@ -171,6 +182,9 @@ class stimp:
         if self._n_processed >= self._M.shape[0]:
             return
         m = int(self._M[self._n_processed])
+        func = self._T_subseq_isconstant_func
+        if not self._normalize and self._isconstant_func_checked:
+            func = None  # already validated; raw distances do not use the flags
         # _stump directly (not stump): stacklevel=3 attributes its warnings,
         # and one frame deeper those of its helpers, to the caller of update()
         mp = _stump(
@@ -181,7 +195,7 @@ class stimp:
             normalize=self._normalize,
             p=2.0,
             k=1,
-            T_A_subseq_isconstant=self._T_subseq_isconstant_func,
+            T_A_subseq_isconstant=func,
             T_B_subseq_isconstant=None,
             chunk_size=None,
             stacklevel=3,
@@ -189,6 +203,7 @@ class stimp:
         P = mp.P_
         self._PAN[self._bfs_indices[self._n_processed], : P.shape[0]] = P
         self._n_processed += 1
+        self._isconstant_func_checked = True
 
     def _pan_scale(self, done: np.ndarray) -> np.ndarray:
         """Per-row factor that maps a profile to roughly ``[0, 1]``.
@@ -225,7 +240,15 @@ class stimp:
           ``aamp_stimp`` does), and cap it at 1.
         - ``contrast``: replace each value by the logistic function
           ``1 / (1 + exp(-10 (q - threshold)))`` of its quantile ``q`` among
-          all computed values (stable ranking, missing values last).
+          all computed values (stable ranking, missing values last). Because
+          this ranks every value, series with exact-tie groups (exactly
+          periodic or discrete-valued data, or constant runs with
+          ``normalize=False``) can have tied cells ordered differently from
+          STUMPY, whose tied distances differ from ours in the last bits
+          (e.g. STUMPY's ``aamp`` gives about 2e-7 for identical windows,
+          where we give exactly 0). The contrasted and binary values of those
+          cells can then differ, while the profiles (``P_``) still agree
+          within float tolerance.
         - ``binary``: 0 where the value is ``<= threshold``, else 1
           (missing values become 1).
         - ``clip``: clip to ``[0, 1]``.
@@ -284,14 +307,19 @@ class stimp:
     def P_(self) -> list[np.ndarray]:
         """Raw profiles in breadth-first order, one per ``M_`` entry.
 
-        Each is a float64 copy of length ``len(T) - m + 1``; profiles not
-        computed yet are all ``inf``.
+        Each is a float64 array of length ``len(T) - m + 1``; profiles not
+        computed yet are all ``inf``. Like STUMPY's, they are views into the
+        internal pan array (no extra memory, and a later :meth:`update` fills
+        them in place), but read-only, so they cannot corrupt it; use
+        ``.copy()`` to edit one.
         """
         n = self._T.shape[0]
-        return [
-            self._PAN[row, : max(n - int(m) + 1, 0)].copy()
-            for row, m in zip(self._bfs_indices, self._M, strict=True)
-        ]
+        profiles = []
+        for row, m in zip(self._bfs_indices, self._M, strict=True):
+            view = self._PAN[row, : max(n - int(m) + 1, 0)]
+            view.flags.writeable = False
+            profiles.append(view)
+        return profiles
 
 
 class gpu_stimp(stimp):
