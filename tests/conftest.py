@@ -110,16 +110,18 @@ def _znorm_dist(T_A, T_B, m, i, j):
     Two-pass: the difference of the two z-normalized windows, as the library's
     own refinement computes it. The one-pass ``mean(a*b) - mean(a)*mean(b)``
     covariance cancels at a large offset: on ``large_offset`` at m=8 it was
-    off by up to ~1.5e-2 in d, about half the tie tolerance it adjudicates.
+    off by up to ~1.3e-2 in d, about 40% of the tie tolerance it adjudicates.
+    Constant windows follow STUMPY's rule (ptp == 0, not std == 0: the mean
+    of a constant 0.1 window is inexact, leaving a std of ~1e-17).
     """
     a = T_A[i : i + m].astype(np.float64)
     b = T_B[j : j + m].astype(np.float64)
-    sa, sb = a.std(), b.std()
-    if sa == 0.0 and sb == 0.0:
+    ca, cb = np.ptp(a) == 0.0, np.ptp(b) == 0.0
+    if ca and cb:
         return 0.0
-    if sa == 0.0 or sb == 0.0:
-        return np.sqrt(m)
-    d = (a - a.mean()) / sa - (b - b.mean()) / sb
+    if ca or cb:
+        return float(np.sqrt(m))
+    d = (a - a.mean()) / a.std() - (b - b.mean()) / b.std()
     return float(np.sqrt(d @ d))
 
 

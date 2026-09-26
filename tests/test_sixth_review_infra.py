@@ -7,10 +7,12 @@
    skips itself after its imports.
 2. The golden tie oracle ``_znorm_dist`` used the one-pass
    ``mean(a*b) - mean(a)*mean(b)`` covariance, which cancels on
-   ``large_offset`` (random walk + 1e6) to errors of up to ~1.5e-2 in
-   distance at m=8, about half the tie tolerance it adjudicates. It is now
+   ``large_offset`` (random walk + 1e6) to errors of up to ~1.3e-2 in
+   distance at m=8, about 40% of the tie tolerance it adjudicates. It is now
    the two-pass z-difference form, pinned here against exact rational
    arithmetic (the old form misses that bound by six orders of magnitude).
+   It also detects constant windows by STUMPY's ptp == 0 rule: ``std == 0``
+   missed a constant 0.1 window (std ~1e-17) and z-normalized it.
 3. The fresh-interpreter RSS harness existed in five copies. It is now one
    ``conftest.run_isolated`` whose prologue and body are dedented
    separately (a column-0 body broke the old single-dedent template).
@@ -72,19 +74,27 @@ def test_suite_runs_without_stumpy(tmp_path):
     )
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(tmp_path), env.get("PYTHONPATH")]))
+
+    def pytest_run(*args):
+        return subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", "-rs", "-p", "no:cacheprovider", *args],
+            cwd=_REPO,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
     # one oracle module (skipped) and one oracle-free test (runs)
     args = ["tests/test_output_format.py", "tests/test_sixth_review_infra.py"]
-    args += ["-k", "not without_stumpy and (layout or estimator)"]
-    out = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "-rs", "-p", "no:cacheprovider", *args],
-        cwd=_REPO,
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    out = pytest_run(*args, "-k", "not without_stumpy and (layout or estimator)")
     assert out.returncode == 0, out.stdout + out.stderr
     assert "could not import 'stumpy'" in out.stdout
     assert re.search(r"\b1 passed, 1 skipped\b", out.stdout), out.stdout
+    # every module and the conftest still collect: a bare `import stumpy`
+    # anywhere is a collection error (exit 2)
+    out = pytest_run("--collect-only", "tests")
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert "ERROR collecting" not in out.stdout and "could not import 'stumpy'" in out.stdout
 
 
 # ---------------------------------------------------- 2: exact tie oracle
@@ -111,7 +121,7 @@ def _exact_znorm_dist(a, b):
 def test_tie_oracle_is_exact_at_a_large_offset(m):
     """Pairs outside the exclusion zone, including each row's nearest
     neighbour (the pairs the tie-tolerant helper adjudicates): the old
-    one-pass form was off by up to ~1e-2 here."""
+    one-pass form was off by up to ~1.3e-2 on this series at m=8."""
     T = DATASETS["large_offset"](2000, seed=1)
     rng = np.random.default_rng(m)
     excl = math.ceil(m / 4)
@@ -126,6 +136,17 @@ def test_tie_oracle_is_exact_at_a_large_offset(m):
         for a, b in pairs
     ]
     assert max(err) <= 1e-9, max(err)
+
+
+def test_tie_oracle_uses_stumpys_constant_rule():
+    """Constants whose float64 mean is inexact: STUMPY calls two constant
+    windows 0 apart and a constant vs a varying window sqrt(m) apart."""
+    m = 3
+    T = np.r_[np.full(10, 0.1), np.random.default_rng(0).standard_normal(20), np.full(10, 0.7)]
+    assert T[:m].std() > 0.0 and T[-m:].std() > 0.0  # the trap std == 0 fell into
+    assert _znorm_dist(T, T, m, 0, 31) == 0.0
+    assert _znorm_dist(T, T, m, 0, 15) == pytest.approx(np.sqrt(m), rel=1e-15)
+    assert _znorm_dist(T, T, m, 15, 31) == pytest.approx(np.sqrt(m), rel=1e-15)
 
 
 # ------------------------------------------- 3: one isolated-memory harness
