@@ -134,9 +134,11 @@ _TILE_WINDOW_BYTES = 1 << 27  # ~128 MiB
 # their observed allocator peak (72-80 B/row) and ufunc transients.
 _CENTER_BYTES = 1 << 26  # ~64 MiB
 _CENTER_ROW_BYTES = 128
-# byte budget for the float64 window copies held live by one refinement
-# chunk (two fancy-indexed window blocks plus their centered copies); the
-# refinement runs after the device memory has been released
+# byte budget for the float64 window copies live at once across all the
+# refinement threads, which split one chunk of refine_chunk_rows(m) rows;
+# each thread holds at most three window blocks of its rows (query, target
+# and one temporary) against the four budgeted. The refinement runs after
+# the device memory has been released
 _REFINE_MEM_BUDGET = 1 << 28  # ~256 MiB
 
 

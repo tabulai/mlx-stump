@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import os
+import threading
 import warnings
+from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 
 import mlx.core as mx
 import numpy as np
+import numpy.typing as npt
 
 from . import _engine
 from ._engine import (
@@ -38,14 +43,95 @@ _INF = float("inf")
 P_NORM_THRESHOLD = 1e-14
 
 
+# Upper bound on the threads of one refinement call. Every refinement step
+# is row-wise and NumPy releases the GIL in the gather, ufunc and reduction
+# loops that dominate, so row chunks run in parallel with bit-identical
+# results. The threads split one serial chunk between them, so the float64
+# windows live at once stay within the same _REFINE_MEM_BUDGET.
+_REFINE_MAX_WORKERS = 8
+
+
+def _cpu_count() -> int:
+    """CPUs this process may use: ``os.process_cpu_count`` (Python 3.13+,
+    which honours CPU affinity and ``PYTHON_CPU_COUNT``) where available."""
+    return getattr(os, "process_cpu_count", os.cpu_count)() or 1
+
+
+def _map_refine_chunks(job, l: int, m: int) -> None:
+    """Run ``job(s, e)`` over row chunks ``[s, e)`` that cover ``[0, l)``.
+
+    One serial refinement chunk, ``refine_chunk_rows(m)`` rows, is divided
+    among up to ``_REFINE_MAX_WORKERS`` threads of a per-call pool, so at
+    most that many rows are in flight at once. Chunks write disjoint rows,
+    so the result does not depend on the split or the scheduling. Each job
+    must enter its own ``np.errstate`` (it is per thread); a single chunk
+    runs in the calling thread.
+    """
+    rows = refine_chunk_rows(m)
+    workers = max(1, min(_REFINE_MAX_WORKERS, _cpu_count(), rows))
+    step = rows // workers
+    starts = range(0, l, step)
+    lanes = min(workers, len(starts))
+    if lanes <= 1:
+        for s in starts:
+            job(s, min(s + step, l))
+        return
+    # Each lane pulls the next chunk from one shared cursor, so the pool
+    # holds one task per thread rather than one per chunk (at large m there
+    # are ~l*m/2**20 chunks) while a slow thread still takes fewer chunks.
+    cursor = iter(starts)
+    lock = threading.Lock()
+    failed = threading.Event()
+
+    def lane():
+        while not failed.is_set():
+            with lock:
+                s = next(cursor, None)
+            if s is None:
+                return
+            try:
+                job(s, min(s + step, l))
+            except BaseException:
+                failed.set()  # the other lanes stop at their next chunk
+                raise
+
+    with ThreadPoolExecutor(max_workers=lanes) as pool:
+        tasks = [pool.submit(lane) for _ in range(lanes)]
+    for task in tasks:
+        task.result()  # re-raises a worker exception here
+
+
+def _znorm_rows(w: np.ndarray, isconstant: np.ndarray, m: int) -> np.ndarray:
+    """Z-normalize gathered float64 windows in place; return their 1/RMS.
+
+    The inverse is 0 for flagged-constant rows and for rows that are flat
+    after centering.
+    """
+    center_rows_stable(w)
+    rms = np.sqrt(np.sum(w * w, axis=1) / m)
+    inv = np.where((rms > 0.0) & ~isconstant, 1.0 / np.where(rms > 0.0, rms, 1.0), 0.0)
+    w *= inv[:, None]
+    return inv
+
+
 def _refine_znorm(
-    query: PreprocessedSeries, target: PreprocessedSeries, I: np.ndarray
+    query: PreprocessedSeries,
+    target: PreprocessedSeries,
+    I: np.ndarray,
+    out: np.ndarray | None = None,
 ) -> np.ndarray:
     """Recompute z-normalized distances at chosen indices in float64.
 
-    The GPU search runs in float32; re-evaluating d(i, I[i]) on the CPU in
+    ``I`` holds the neighbor indices, shape ``(l,)`` or ``(l, k)``, with -1
+    for "no neighbor" (reported as ``inf``). The distances are written into
+    ``out`` (same shape, float64; allocated when omitted), which is returned.
+
+    The GPU search runs in float32; re-evaluating d(i, I[i, j]) on the CPU in
     float64 removes the sqrt-cancellation noise from the reported profile
-    values at O(l * m) cost. The squared distance is computed as the sum of
+    values at O(l * k * m) cost, a sizeable share of the runtime for large
+    ``k``. Each row chunk normalizes its query windows once and reuses them
+    for all ``k`` neighbor columns, and the chunks run on a few threads
+    (:func:`_map_refine_chunks`). The squared distance is computed as the sum of
     squared differences of the two z-normalized windows (each centered and
     scaled by freshly recomputed two-pass float64 stats): unlike `dot - m*mu_q*mu_t` —
     which cancels catastrophically for near-constant windows at an offset
@@ -64,67 +150,98 @@ def _refine_znorm(
     its statistics through cancellation, underflow, or overflow.
     """
     m = query.m
-    out = np.full(I.shape, np.inf)
-    valid = np.nonzero(I >= 0)[0]
-    if valid.size == 0:
-        return out
+    if out is None:
+        out = np.empty(I.shape)
+    I2 = I[:, None] if I.ndim == 1 else I
+    out2 = out[:, None] if out.ndim == 1 else out  # a view: writes land in out
     WQ = np.lib.stride_tricks.sliding_window_view(query.T, m)
     WT = np.lib.stride_tricks.sliding_window_view(target.T, m)
     dmax = 2.0 * np.sqrt(m)  # rho >= -1; sqrt rounding can overshoot 1 ulp
-    chunk = refine_chunk_rows(m)
-    for s in range(0, valid.size, chunk):
-        qi = valid[s : s + chunk]
-        tj = I[qi]
-        qc = query.isconstant[qi]
-        tc = target.isconstant[tj]
+
+    def job(s, e):
+        Ic = I2[s:e]
+        out2[s:e] = np.inf
+        rows = np.nonzero((Ic >= 0).any(axis=1))[0]
+        if rows.size == 0:
+            return
+        qi_all = rows + s
+        qc_all = query.isconstant[qi_all]
         # raw windows may hold NaN/inf; those rows are overwritten with inf
         # below, so let the intermediate arithmetic run silently
-        with np.errstate(invalid="ignore", over="ignore", divide="ignore"):
-            qw = WQ[qi]  # fancy indexing copies, so everything can be in place
-            center_rows_stable(qw)
-            sq = np.sqrt(np.sum(qw * qw, axis=1) / m)
-            tw = WT[tj]
-            center_rows_stable(tw)
-            st = np.sqrt(np.sum(tw * tw, axis=1) / m)
-            sq_inv = np.where((sq > 0.0) & ~qc, 1.0 / np.where(sq > 0.0, sq, 1.0), 0.0)
-            st_inv = np.where((st > 0.0) & ~tc, 1.0 / np.where(st > 0.0, st, 1.0), 0.0)
-            qw *= sq_inv[:, None]
-            tw *= st_inv[:, None]
-            qw -= tw
-            d2 = np.einsum("ij,ij->i", qw, qw)
-            # a zero sig_inv on either side (constant flag, or a truly flat
-            # window flagged non-constant) means rho == 0 on the GPU; mirror
-            # that, and let the constant-flag rules below overwrite as needed
-            d2 = np.where((sq_inv == 0.0) | (st_inv == 0.0), 2.0 * m, d2)
-            d2[~np.isfinite(d2)] = 2.0 * m  # NaN/inf windows: masked below
-            d2[d2 < P_NORM_THRESHOLD] = 0.0
-            d = np.minimum(np.sqrt(d2), dmax)
-        d = np.where(qc & tc, 0.0, np.where(qc ^ tc, np.sqrt(m), d))
-        d[~(query.isfinite[qi] & target.isfinite[tj])] = np.inf
-        out[qi] = d
+        with np.errstate(invalid="ignore", over="ignore", under="ignore", divide="ignore"):
+            qw_all = WQ[qi_all]  # fancy indexing copies, so everything can be in place
+            sq_inv_all = _znorm_rows(qw_all, qc_all, m)
+            for j in range(Ic.shape[1]):
+                tj = Ic[rows, j]
+                has = tj >= 0
+                if not has.any():
+                    continue
+                # usually every row has this neighbor; a full slice then
+                # selects by view, so the query block is not copied per column
+                sel = slice(None) if has.all() else has
+                tj = tj[sel]
+                qi = qi_all[sel]
+                qc = qc_all[sel]
+                tc = target.isconstant[tj]
+                tw = WT[tj]
+                st_inv = _znorm_rows(tw, tc, m)
+                sq_inv = sq_inv_all[sel]
+                # the target copy doubles as the difference buffer
+                np.subtract(qw_all[sel], tw, out=tw)
+                d2 = np.einsum("ij,ij->i", tw, tw)
+                del tw
+                # a zero sig_inv on either side (constant flag, or a truly flat
+                # window flagged non-constant) means rho == 0 on the GPU; mirror
+                # that, and let the constant-flag rules below overwrite as needed
+                d2 = np.where((sq_inv == 0.0) | (st_inv == 0.0), 2.0 * m, d2)
+                d2[~np.isfinite(d2)] = 2.0 * m  # NaN/inf windows: masked below
+                d2[d2 < P_NORM_THRESHOLD] = 0.0
+                d = np.minimum(np.sqrt(d2), dmax)
+                d = np.where(qc & tc, 0.0, np.where(qc ^ tc, np.sqrt(m), d))
+                d[~(query.isfinite[qi] & target.isfinite[tj])] = np.inf
+                out2[qi, j] = d
+
+    _map_refine_chunks(job, I2.shape[0], m)
     return out
 
 
 def _refine_absolute(
-    query: PreprocessedSeries, target: PreprocessedSeries, I: np.ndarray
+    query: PreprocessedSeries,
+    target: PreprocessedSeries,
+    I: np.ndarray,
+    out: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Recompute non-normalized (p=2) distances at chosen indices in float64."""
+    """Recompute non-normalized (p=2) distances at chosen indices in float64.
+
+    ``I``, ``out`` and the chunking are as in :func:`_refine_znorm`. There is
+    no query normalization to share between columns here. Keeping the query
+    block across columns would hold a third window copy next to the
+    difference and the norm's scratch, so each column gathers its own.
+    """
     m = query.m
-    out = np.full(I.shape, np.inf)
-    valid = np.nonzero(I >= 0)[0]
-    if valid.size == 0:
-        return out
+    if out is None:
+        out = np.empty(I.shape)
+    I2 = I[:, None] if I.ndim == 1 else I
+    out2 = out[:, None] if out.ndim == 1 else out
     WQ = np.lib.stride_tricks.sliding_window_view(query.T, m)
     WT = np.lib.stride_tricks.sliding_window_view(target.T, m)
-    chunk = refine_chunk_rows(m)
-    for s in range(0, valid.size, chunk):
-        qi = valid[s : s + chunk]
-        tj = I[qi]
-        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
-            diff = WQ[qi] - WT[tj]
-        d = rowwise_l2_inplace(diff)
-        d[~(query.isfinite[qi] & target.isfinite[tj])] = np.inf
-        out[qi] = d
+
+    def job(s, e):
+        out2[s:e] = np.inf
+        for j in range(I2.shape[1]):
+            qi = np.nonzero(I2[s:e, j] >= 0)[0] + s
+            if qi.size == 0:
+                continue
+            tj = I2[qi, j]
+            diff = WQ[qi]  # fancy indexing copies, so the difference can be in place
+            with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+                np.subtract(diff, WT[tj], out=diff)
+            d = rowwise_l2_inplace(diff)
+            del diff  # not alive while the next column gathers
+            d[~(query.isfinite[qi] & target.isfinite[tj])] = np.inf
+            out2[qi, j] = d
+
+    _map_refine_chunks(job, I2.shape[0], m)
     return out
 
 
@@ -370,18 +487,18 @@ def _compute_profile(
 
 
 def stump(
-    T_A,
-    m,
-    T_B=None,
-    ignore_trivial=True,
-    normalize=True,
-    p=2.0,
-    k=1,
-    T_A_subseq_isconstant=None,
-    T_B_subseq_isconstant=None,
+    T_A: npt.ArrayLike,
+    m: int,
+    T_B: npt.ArrayLike | None = None,
+    ignore_trivial: bool = True,
+    normalize: bool = True,
+    p: float = 2.0,
+    k: int = 1,
+    T_A_subseq_isconstant: npt.ArrayLike | None = None,
+    T_B_subseq_isconstant: npt.ArrayLike | None = None,
     *,
-    chunk_size=None,
-):
+    chunk_size: int | None = None,
+) -> mparray:
     """Compute the (top-k) matrix profile of ``T_A`` (optionally joined to ``T_B``).
 
     Drop-in for ``stumpy.stump``: the same upstream parameters and output
@@ -390,6 +507,16 @@ def stump(
     profile indices, left indices, and right indices (``mparray`` with
     ``P_``, ``I_``, ``left_I_``, ``right_I_`` accessors). AB-joins return
     -1 left/right indices, exactly like STUMPY.
+
+    A self-join ignores neighbors within the exclusion zone
+    ``ceil(m / stumpy.config.STUMPY_EXCL_ZONE_DENOM)`` (default denominator
+    4) of each subsequence. Like STUMPY, the denominator is read at call
+    time (whenever STUMPY has been imported). With an explicit ``T_B`` and
+    ``ignore_trivial=True``, the join is a self-join only if ``T_B`` equals
+    ``T_A``. As in STUMPY, which non-finite marker (NaN, inf or -inf) marks
+    a missing sample does not matter. STUMPY's zero fill also equates a
+    missing sample with a real 0.0 (or -0.0) at the same position; here
+    such a pair makes the series different.
 
     ``normalize=False`` computes the non-normalized (aamp-style) profile and
     supports ``p=2.0`` only. Its refined profile remains in raw input units,
@@ -401,6 +528,41 @@ def stump(
     matrix-vector kernel whose float32 accumulation order differs from the
     batched one and can resolve near-ties to a different, equally close
     neighbor.
+    """
+    return _stump(
+        T_A,
+        m,
+        T_B=T_B,
+        ignore_trivial=ignore_trivial,
+        normalize=normalize,
+        p=p,
+        k=k,
+        T_A_subseq_isconstant=T_A_subseq_isconstant,
+        T_B_subseq_isconstant=T_B_subseq_isconstant,
+        chunk_size=chunk_size,
+        stacklevel=3,
+    )
+
+
+def _stump(
+    T_A,
+    m,
+    *,
+    T_B,
+    ignore_trivial,
+    normalize,
+    p,
+    k,
+    T_A_subseq_isconstant,
+    T_B_subseq_isconstant,
+    chunk_size,
+    stacklevel: int,
+) -> mparray:
+    """The implementation behind :func:`stump` and its STUMPY-named wrappers.
+
+    ``stacklevel`` locates this frame's warnings at the user's call. It is 3
+    when a public function calls this directly. The helpers one frame deeper
+    get one more.
     """
     T_A = check_series(T_A, "T_A")
     if not (
@@ -416,6 +578,10 @@ def stump(
         and chunk_size >= 1
     ):
         raise ValueError(f"`chunk_size` must be a positive integer but found {chunk_size}.")
+    if chunk_size is not None:
+        # like k: a numpy integer would reach mx.arange (which rejects it),
+        # and a small unsigned one would wrap in the batch arithmetic
+        chunk_size = int(chunk_size)
 
     # join disambiguation, replicating STUMPY's warnings exactly: a T_B equal
     # to T_A with ignore_trivial=False stays an AB-join (warn only)
@@ -425,7 +591,7 @@ def stump(
             warnings.warn(
                 "`ignore_trivial` cannot be `False` for a self-join and "
                 "has been automatically overridden and set to `True`.",
-                stacklevel=2,
+                stacklevel=stacklevel,
             )
         T_B = T_A
         ignore_trivial = True
@@ -433,18 +599,25 @@ def stump(
         share_b_prep = True
     else:
         T_B = check_series(T_B, "T_B")
-        equal = np.array_equal(T_A, T_B, equal_nan=True)
+        # STUMPY compares the series after its preprocessing has replaced
+        # every non-finite value, so the marker of a missing sample (NaN,
+        # inf, -inf) does not matter. Its zero fill would also equate a
+        # missing sample with a real 0.0; that is not copied: those series
+        # differ, and the mirrored rows STUMPY reports for them are wrong.
+        equal = T_A.shape == T_B.shape and bool(
+            np.all((T_A == T_B) | (~np.isfinite(T_A) & ~np.isfinite(T_B)))
+        )
         if not ignore_trivial and equal:
             warnings.warn(
                 "Arrays T_A, T_B are equal, which implies a self-join. "
                 "Try setting `ignore_trivial = True`.",
-                stacklevel=2,
+                stacklevel=stacklevel,
             )
         if ignore_trivial and not equal:
             warnings.warn(
                 "Arrays T_A, T_B are not equal, which implies an AB-join. "
                 "`ignore_trivial` has been automatically set to `False`.",
-                stacklevel=2,
+                stacklevel=stacklevel,
             )
             ignore_trivial = False
     self_join = ignore_trivial
@@ -457,6 +630,7 @@ def stump(
         min(T_A.shape[0], T_B.shape[0]),
         warn_n=T_A.shape[0] if self_join else None,
         excl_zone_denom=denom,
+        stacklevel=stacklevel + 1,
     )
 
     if not normalize and p != 2.0:
@@ -471,6 +645,7 @@ def stump(
             m,
             isconstant=T_A_subseq_isconstant,
             isconstant_name="T_A_subseq_isconstant",
+            stacklevel=stacklevel + 1,
         )
         if share_b_prep:
             Bs = A
@@ -480,6 +655,7 @@ def stump(
                 m,
                 isconstant=T_B_subseq_isconstant,
                 isconstant_name="T_B_subseq_isconstant",
+                stacklevel=stacklevel + 1,
             )
     else:
         # Constant-window flags do not affect raw Euclidean distances, but
@@ -499,11 +675,15 @@ def stump(
         finite = np.concatenate([T_A[np.isfinite(T_A)], T_B[np.isfinite(T_B)]])
         center, scale = stable_center_scale(finite)
         del finite
-        A = preprocess_series(T_A, m, normalize=False, center=center, scale=scale)
+        A = preprocess_series(
+            T_A, m, normalize=False, center=center, scale=scale, stacklevel=stacklevel + 1
+        )
         Bs = (
             A
             if share_b_prep
-            else preprocess_series(T_B, m, normalize=False, center=center, scale=scale)
+            else preprocess_series(
+                T_B, m, normalize=False, center=center, scale=scale, stacklevel=stacklevel + 1
+            )
         )
 
     engine = MassEngine(Bs, normalize=normalize)
@@ -534,8 +714,7 @@ def stump(
     # assembly.  At large k this alias alone can pin tens of MiB until return
     # (P32 is otherwise never read again).
     del P32
-    for j in range(k):
-        P[:, j] = refine(A, Bs, I[:, j])
+    refine(A, Bs, I, out=P)  # all k columns in one pass, written into P
     if k > 1:
         # near-ties can reorder under the refined values; keep columns ascending
         order = np.argsort(P, axis=1, kind="stable")
@@ -551,7 +730,9 @@ def stump(
     # zone; downstream users rely on this warning when checking join setup.
     warning_threshold = 1e-6
     first_profile = P[:, 0]
-    with np.errstate(over="ignore", invalid="ignore"):
+    # a subnormal-scale raw profile underflows in the mean; that must not
+    # trip a caller's np.seterr(under="raise") after all the work is done
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
         profile_too_small = first_profile.mean() < warning_threshold or np.all(
             first_profile < warning_threshold
         )
@@ -559,13 +740,137 @@ def stump(
         warnings.warn(
             f"A large number of values in `P` are smaller than {warning_threshold}.\n"
             "For a self-join, try setting `ignore_trivial=True`.",
-            stacklevel=2,
+            stacklevel=stacklevel,
         )
 
+    # whole-block assignment boxes the same Python floats/ints as a column
+    # loop but walks both arrays in memory order (measured 2.9-4x faster
+    # from k=16, the same at small k); IL/IR stay separate columns so no
+    # (l, k+2) index temporary is built
     out = np.empty((A.l, 2 * k + 2), dtype=object)
-    for j in range(k):
-        out[:, j] = P[:, j]
-        out[:, k + j] = I[:, j]
+    out[:, :k] = P
+    out[:, k : 2 * k] = I
     out[:, 2 * k] = IL
     out[:, 2 * k + 1] = IR
     return mparray(out, m, k, denom)
+
+
+def _check_device_id(device_id) -> None:
+    """Validate STUMPY's CUDA ``device_id`` loosely: an int or a list of them.
+
+    It selects nothing here. An Apple silicon Mac has one GPU, which MLX
+    already uses, so the ids are only checked for shape and then ignored.
+    """
+    ids = [device_id] if isinstance(device_id, (int, np.integer)) else device_id
+    try:
+        ids = list(ids)
+    except TypeError:
+        ids = []
+    if not ids or not all(
+        isinstance(i, (int, np.integer)) and not isinstance(i, (bool, np.bool_)) and i >= 0
+        for i in ids
+    ):
+        raise ValueError(
+            "`device_id` must be a non-negative integer or a non-empty list of them "
+            f"but found {device_id!r}."
+        )
+
+
+def aamp(
+    T_A: npt.ArrayLike,
+    m: int,
+    T_B: npt.ArrayLike | None = None,
+    ignore_trivial: bool = True,
+    p: float = 2.0,
+    k: int = 1,
+    *,
+    chunk_size: int | None = None,
+) -> mparray:
+    """Non-normalized (top-k) matrix profile; drop-in for ``stumpy.aamp``.
+
+    This is ``stump(..., normalize=False)`` under ``stumpy.aamp``'s own
+    positional signature, whose fifth argument is ``p`` rather than
+    ``normalize``. Only ``p=2.0`` is supported. ``chunk_size`` is as in
+    :func:`stump`.
+    """
+    return _stump(
+        T_A,
+        m,
+        T_B=T_B,
+        ignore_trivial=ignore_trivial,
+        normalize=False,
+        p=p,
+        k=k,
+        T_A_subseq_isconstant=None,
+        T_B_subseq_isconstant=None,
+        chunk_size=chunk_size,
+        stacklevel=3,
+    )
+
+
+def gpu_stump(
+    T_A: npt.ArrayLike,
+    m: int,
+    T_B: npt.ArrayLike | None = None,
+    ignore_trivial: bool = True,
+    device_id: int | Sequence[int] = 0,
+    normalize: bool = True,
+    p: float = 2.0,
+    k: int = 1,
+    T_A_subseq_isconstant: npt.ArrayLike | None = None,
+    T_B_subseq_isconstant: npt.ArrayLike | None = None,
+    *,
+    chunk_size: int | None = None,
+) -> mparray:
+    """:func:`stump` under ``stumpy.gpu_stump``'s positional signature.
+
+    ``device_id`` (an int or a list of ints, as in STUMPY) is validated and
+    then ignored, because the one Apple GPU is always used. This wrapper
+    exists because a bare ``gpu_stump = stump`` alias would silently bind a
+    positional ``device_id`` to ``normalize``.
+    """
+    _check_device_id(device_id)
+    return _stump(
+        T_A,
+        m,
+        T_B=T_B,
+        ignore_trivial=ignore_trivial,
+        normalize=normalize,
+        p=p,
+        k=k,
+        T_A_subseq_isconstant=T_A_subseq_isconstant,
+        T_B_subseq_isconstant=T_B_subseq_isconstant,
+        chunk_size=chunk_size,
+        stacklevel=3,
+    )
+
+
+def gpu_aamp(
+    T_A: npt.ArrayLike,
+    m: int,
+    T_B: npt.ArrayLike | None = None,
+    ignore_trivial: bool = True,
+    device_id: int | Sequence[int] = 0,
+    p: float = 2.0,
+    k: int = 1,
+    *,
+    chunk_size: int | None = None,
+) -> mparray:
+    """:func:`aamp` under ``stumpy.gpu_aamp``'s positional signature.
+
+    ``device_id`` is validated and ignored as in :func:`gpu_stump`.
+    """
+    _check_device_id(device_id)
+    return _stump(
+        T_A,
+        m,
+        T_B=T_B,
+        ignore_trivial=ignore_trivial,
+        normalize=False,
+        p=p,
+        k=k,
+        T_A_subseq_isconstant=None,
+        T_B_subseq_isconstant=None,
+        chunk_size=chunk_size,
+        stacklevel=3,
+    )

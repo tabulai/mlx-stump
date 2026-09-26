@@ -27,6 +27,22 @@ class mparray(np.ndarray):
         self._k = getattr(obj, "_k", None)
         self._excl_zone_denom = getattr(obj, "_excl_zone_denom", None)
 
+    def __reduce__(self):
+        # ndarray's own reduce rebuilds through __array_finalize__(None), which
+        # drops _m/_k/_excl_zone_denom, so a result sent through pickle,
+        # np.save or a process pool lost its P_/I_ accessors. Rebuild through
+        # __new__ instead: no __setstate__ is involved, so these pickles also
+        # load in versions without this method (as a plain __new__ call).
+        return (
+            type(self),
+            (
+                self.view(np.ndarray),
+                getattr(self, "_m", None),
+                getattr(self, "_k", None),
+                getattr(self, "_excl_zone_denom", None),
+            ),
+        )
+
     @property
     def P_(self) -> np.ndarray:
         if self._k == 1:
