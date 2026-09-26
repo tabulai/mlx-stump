@@ -18,9 +18,10 @@
    takes the whole ``(l, k)`` index matrix and writes into ``P`` in place.
    Each row chunk normalizes its query windows once, and the target gather
    doubles as the difference buffer. Chunks run on a small per-call thread
-   pool that splits the same memory budget. The output is bit-identical to
-   the per-column code; a verbatim copy of that code is kept below as the
-   reference.
+   pool that splits the same memory budget; its threads pull chunks from
+   one shared cursor, so the scheduling state is one task per thread, not
+   one future per chunk. The output is bit-identical to the per-column
+   code; a verbatim copy of that code is kept below as the reference.
 5. The object output was filled one strided column at a time; it is now
    filled by whole blocks, which boxes the same Python floats and ints.
 6. A pickled ``mparray`` lost ``_m``/``_k``/``_excl_zone_denom`` (numpy
@@ -42,9 +43,9 @@ import ast
 import importlib.util
 import inspect
 import io
-import os
 import pathlib
 import pickle
+import threading
 import typing
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -350,10 +351,10 @@ def test_refinement_bit_identical_to_per_column_code(monkeypatch, case, normaliz
             assert got.view(np.uint64).tolist() == ref.view(np.uint64).tolist(), (rows, workers)
             assert one.view(np.uint64).tolist() == ref[:, 0].view(np.uint64).tolist()
             # the threaded path really ran whenever there was more than one chunk
-            w = min(workers, os.cpu_count() or 1, budget_rows)
+            w = min(workers, st._cpu_count(), budget_rows)
             pooled = w > 1 and I.shape[0] > budget_rows // w
             assert _CountingPool.made == (2 if pooled else 0)  # one pool per refine call
-            if rows == 64 and workers == 8 and (os.cpu_count() or 1) > 1:
+            if rows == 64 and workers == 8 and st._cpu_count() > 1:
                 assert pooled
 
 
@@ -374,6 +375,68 @@ def test_refinement_worker_error_propagates(monkeypatch):
     monkeypatch.setattr(st, "_znorm_rows", flaky)
     with pytest.raises(MemoryError, match="synthetic"):
         refine(A, B, I, out=np.empty(I.shape))
+
+
+class _SubmitCountingPool(ThreadPoolExecutor):
+    tasks = 0
+
+    def submit(self, *args, **kwargs):
+        type(self).tasks += 1
+        return super().submit(*args, **kwargs)
+
+
+def _two_row_chunks(monkeypatch, m):
+    """16-row refinement budget on 8 threads: 2-row chunks, pooled even on
+    a one-CPU runner."""
+    monkeypatch.setattr(eng, "_REFINE_MEM_BUDGET", 16 * m * 8 * 4)
+    monkeypatch.setattr(st, "_REFINE_MAX_WORKERS", 8)
+    monkeypatch.setattr(st, "_cpu_count", lambda: 8)
+    monkeypatch.setattr(st, "ThreadPoolExecutor", _SubmitCountingPool)
+    _SubmitCountingPool.tasks = 0
+
+
+def test_refine_scheduling_holds_one_task_per_thread(monkeypatch):
+    """The pool gets one task per thread rather than one future per chunk
+    (~l*m/2**20 chunks at large m: 167 MiB of scheduling state at l=1.95e6,
+    m=5e4), and at most one chunk of rows is in flight at once."""
+    m, l = 10, 20001  # 10001 two-row chunks
+    _two_row_chunks(monkeypatch, m)
+    lock = threading.Lock()
+    live = [0, 0]  # rows in flight, most seen
+    spans = []
+
+    def job(s, e):
+        with lock:
+            spans.append((s, e))
+            live[0] += e - s
+            live[1] = max(live[1], live[0])
+        np.sqrt(np.arange(2000.0))  # release the GIL briefly, like a real chunk
+        with lock:
+            live[0] -= e - s
+
+    st._map_refine_chunks(job, l, m)
+    assert _SubmitCountingPool.tasks == 8
+    assert sorted(spans) == [(s, min(s + 2, l)) for s in range(0, l, 2)]
+    assert live[1] <= 16
+
+
+def test_refine_failure_stops_the_other_threads(monkeypatch):
+    m, l = 10, 20001
+    _two_row_chunks(monkeypatch, m)
+    lock = threading.Lock()
+    calls = []
+
+    def job(s, e):
+        with lock:
+            calls.append(s)
+            n = len(calls)
+        if n == 3:
+            raise MemoryError("synthetic")
+
+    with pytest.raises(MemoryError, match="synthetic"):
+        st._map_refine_chunks(job, l, m)
+    # each other thread finishes at most the chunk it holds and one more
+    assert len(calls) <= 3 + 2 * 8
 
 
 # ------------------------------------------------------ 5. block assembly

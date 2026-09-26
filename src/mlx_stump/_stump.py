@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import warnings
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -49,6 +50,12 @@ P_NORM_THRESHOLD = 1e-14
 _REFINE_MAX_WORKERS = 8
 
 
+def _cpu_count() -> int:
+    """CPUs this process may use: ``os.process_cpu_count`` (Python 3.13+,
+    which honours CPU affinity and ``PYTHON_CPU_COUNT``) where available."""
+    return getattr(os, "process_cpu_count", os.cpu_count)() or 1
+
+
 def _map_refine_chunks(job, l: int, m: int) -> None:
     """Run ``job(s, e)`` over row chunks ``[s, e)`` that cover ``[0, l)``.
 
@@ -60,17 +67,37 @@ def _map_refine_chunks(job, l: int, m: int) -> None:
     runs in the calling thread.
     """
     rows = refine_chunk_rows(m)
-    workers = max(1, min(_REFINE_MAX_WORKERS, os.cpu_count() or 1, rows))
+    workers = max(1, min(_REFINE_MAX_WORKERS, _cpu_count(), rows))
     step = rows // workers
-    spans = [(s, min(s + step, l)) for s in range(0, l, step)]
-    if workers == 1 or len(spans) == 1:
-        for s, e in spans:
-            job(s, e)
+    starts = range(0, l, step)
+    lanes = min(workers, len(starts))
+    if lanes <= 1:
+        for s in starts:
+            job(s, min(s + step, l))
         return
-    with ThreadPoolExecutor(max_workers=min(workers, len(spans))) as pool:
-        # consuming the results re-raises the first worker exception here
-        for _ in pool.map(lambda span: job(*span), spans):
-            pass
+    # Each lane pulls the next chunk from one shared cursor, so the pool
+    # holds one task per thread rather than one per chunk (at large m there
+    # are ~l*m/2**20 chunks) while a slow thread still takes fewer chunks.
+    cursor = iter(starts)
+    lock = threading.Lock()
+    failed = threading.Event()
+
+    def lane():
+        while not failed.is_set():
+            with lock:
+                s = next(cursor, None)
+            if s is None:
+                return
+            try:
+                job(s, min(s + step, l))
+            except BaseException:
+                failed.set()  # the other lanes stop at their next chunk
+                raise
+
+    with ThreadPoolExecutor(max_workers=lanes) as pool:
+        tasks = [pool.submit(lane) for _ in range(lanes)]
+    for task in tasks:
+        task.result()  # re-raises a worker exception here
 
 
 def _znorm_rows(w: np.ndarray, isconstant: np.ndarray, m: int) -> np.ndarray:
@@ -442,9 +469,9 @@ def stump(
     time (whenever STUMPY has been imported). With an explicit ``T_B`` and
     ``ignore_trivial=True``, the join is a self-join only if ``T_B`` equals
     ``T_A``. As in STUMPY, which non-finite marker (NaN, inf or -inf) marks
-    a missing sample does not matter. Unlike STUMPY, whose zero fill equates
-    them, a missing sample against a finite value (even 0.0) makes the
-    series different.
+    a missing sample does not matter. STUMPY's zero fill also equates a
+    missing sample with a real 0.0 (or -0.0) at the same position; here
+    such a pair makes the series different.
 
     ``normalize=False`` computes the non-normalized (aamp-style) profile and
     supports ``p=2.0`` only. Its refined profile remains in raw input units,
