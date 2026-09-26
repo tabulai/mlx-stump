@@ -23,16 +23,17 @@ from ._engine import (
 )
 from ._mparray import mparray
 from ._preprocess import (
+    IsConstantSpec,
     PreprocessedSeries,
     center_rows_stable,
     check_series,
     check_window_size,
     excl_zone_denom,
     exclusion_zone,
+    finite_center_scale,
     preprocess_series,
     process_isconstant,
     rowwise_l2_inplace,
-    stable_center_scale,
 )
 
 _INF = float("inf")
@@ -494,8 +495,8 @@ def stump(
     normalize: bool = True,
     p: float = 2.0,
     k: int = 1,
-    T_A_subseq_isconstant: npt.ArrayLike | None = None,
-    T_B_subseq_isconstant: npt.ArrayLike | None = None,
+    T_A_subseq_isconstant: IsConstantSpec = None,
+    T_B_subseq_isconstant: IsConstantSpec = None,
     *,
     chunk_size: int | None = None,
 ) -> mparray:
@@ -629,7 +630,7 @@ def _stump(
         m,
         min(T_A.shape[0], T_B.shape[0]),
         warn_n=T_A.shape[0] if self_join else None,
-        excl_zone_denom=denom,
+        denom=denom,
         stacklevel=stacklevel + 1,
     )
 
@@ -667,10 +668,10 @@ def _stump(
             process_isconstant(T_A, m, T_A_subseq_isconstant, "T_A_subseq_isconstant")
         if not share_b_prep and T_B_subseq_isconstant is not None:
             process_isconstant(T_B, m, T_B_subseq_isconstant, "T_B_subseq_isconstant")
-        # shared affine frame keeps cross distances exactly invariant
-        finite = np.concatenate([T_A[np.isfinite(T_A)], T_B[np.isfinite(T_B)]])
-        center, scale = stable_center_scale(finite)
-        del finite
+        # shared affine frame keeps cross distances exactly invariant (both
+        # series even for a self-join, so the numerics never change), built
+        # without compacted-length copies
+        center, scale = finite_center_scale(T_A, T_B)
         A = preprocess_series(
             T_A, m, normalize=False, center=center, scale=scale, stacklevel=stacklevel + 1
         )
@@ -813,8 +814,8 @@ def gpu_stump(
     normalize: bool = True,
     p: float = 2.0,
     k: int = 1,
-    T_A_subseq_isconstant: npt.ArrayLike | None = None,
-    T_B_subseq_isconstant: npt.ArrayLike | None = None,
+    T_A_subseq_isconstant: IsConstantSpec = None,
+    T_B_subseq_isconstant: IsConstantSpec = None,
     *,
     chunk_size: int | None = None,
 ) -> mparray:

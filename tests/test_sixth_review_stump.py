@@ -40,6 +40,7 @@
 from __future__ import annotations
 
 import ast
+import collections.abc
 import importlib.util
 import inspect
 import io
@@ -683,4 +684,12 @@ def test_public_annotations_resolve():
         hints = typing.get_type_hints(fn)
         assert hints["return"] is mparray
         assert "T_A" in hints and "chunk_size" in hints
+    # the constant flags admit STUMPY-style callables, as documented (py.typed)
+    for fn in (mlx_stump.stump, mlx_stump.gpu_stump):
+        hints = typing.get_type_hints(fn)
+        for name in ("T_A_subseq_isconstant", "T_B_subseq_isconstant"):
+            assert any(
+                typing.get_origin(a) is collections.abc.Callable
+                for a in typing.get_args(hints[name])
+            ), (fn.__name__, name)
     assert "STUMPY_EXCL_ZONE_DENOM" in mlx_stump.stump.__doc__

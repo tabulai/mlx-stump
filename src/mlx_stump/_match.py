@@ -10,8 +10,9 @@ import numpy as np
 from numpy.typing import ArrayLike
 
 from ._engine import refine_chunk_rows
-from ._mass import IsConstantSpec, _mass, _raw_window_distances
+from ._mass import _mass, _raw_window_distances
 from ._preprocess import (
+    IsConstantSpec,
     apply_affine_frame,
     center_rows_stable,
     check_series,
@@ -763,11 +764,12 @@ def _match(
     Q_subseq_isconstant=None,
     *,
     zero_query: bool = True,
-    stacklevel: int = 2,
+    stacklevel: int,
 ) -> np.ndarray:
     """``match``; ``zero_query=False`` gives ``aamp_match``'s ``query_idx``.
 
-    ``stacklevel`` is that of a warning issued directly in this function.
+    ``stacklevel`` (required) is that of a warning issued directly in this
+    function.
     """
     Q = np.asarray(Q)
     if Q.ndim == 2 and Q.shape[1] == 1:
@@ -817,6 +819,10 @@ def _match(
         copy_series=not owned,
         stacklevel=stacklevel + 1,
     )
+    if query_idx is not None:
+        # mass() range-checked it; a NumPy unsigned index would wrap (or
+        # become a float on NumPy 1.x) in the exclusion-zone arithmetic
+        query_idx = int(query_idx)
     l = D.shape[0]
 
     Qf, Tf = Q, T
