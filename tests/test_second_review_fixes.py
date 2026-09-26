@@ -302,22 +302,21 @@ def test_aamp_mixed_scale_centered():
     assert sorted(int(i) for _, i in M) == sorted(int(i) for _, i in Mr)
 
 
-def test_match_refinement_is_chunked():
+def test_match_refinement_is_chunked(monkeypatch):
     """max_distance=inf selects every finite entry for refinement; that must
     stream in byte-budgeted chunks (it used to materialize all l*m float64
     windows at once — ~GiBs for long series), with identical results."""
-    import mlx_stump._stump as st
+    import mlx_stump._engine as eng
 
     rng = np.random.default_rng(11)
     T = rng.standard_normal(3000)
     Q = rng.standard_normal(21)
     expected = mlx_stump.match(Q, T, max_distance=float("inf"))
-    orig = st._REFINE_MEM_BUDGET
-    st._REFINE_MEM_BUDGET = 21 * 8 * 4 * 7  # ~7 rows per chunk
-    try:
-        got = mlx_stump.match(Q, T, max_distance=float("inf"))
-    finally:
-        st._REFINE_MEM_BUDGET = orig
+    # one budget, read at call time, drives stump/match/mass refinement and
+    # the memory estimate alike
+    monkeypatch.setattr(eng, "_REFINE_MEM_BUDGET", 21 * 8 * 4 * 7)
+    assert eng.refine_chunk_rows(21) == 7
+    got = mlx_stump.match(Q, T, max_distance=float("inf"))
     np.testing.assert_array_equal(expected.astype(float), got.astype(float))
 
 

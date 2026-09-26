@@ -356,25 +356,6 @@ class MassEngine:
             del block
             j0 = j1
 
-    def sliding_dot_products(self, Q_batch: mx.array) -> mx.array:
-        """Centered QT for a (B, m) float32 centered query batch -> (B, l).
-
-        Materializes the full (B, l) row. In tiled mode each block's product
-        is evaluated before the next block is built, so only one block is
-        resident at a time; callers that also need the distances bounded per
-        block (``mass``, the tiled ``stump`` sweep) loop ``target_blocks``
-        themselves instead.
-        """
-        if not self.tiled:
-            return mx.matmul(Q_batch, self.W_T)
-        parts = []
-        for _, _, block in self.target_blocks():
-            part = mx.matmul(Q_batch, block)
-            mx.eval(part)  # a lazy product would pin every block until concatenation
-            parts.append(part)
-            del block
-        return mx.concatenate(parts, axis=1)
-
     def znorm_sq_distances(
         self,
         QT: mx.array,

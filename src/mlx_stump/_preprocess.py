@@ -14,14 +14,49 @@ and a subsequence is "constant" when its rolling min equals its rolling max
 
 from __future__ import annotations
 
+import numbers
+import sys
 import warnings
 from dataclasses import dataclass, field
 
 import mlx.core as mx
 import numpy as np
 
-# matches stumpy.config.STUMPY_EXCL_ZONE_DENOM
+# default of stumpy.config.STUMPY_EXCL_ZONE_DENOM
 EXCL_ZONE_DENOM = 4
+
+
+def excl_zone_denom():
+    """The exclusion-zone denominator in effect for this call.
+
+    STUMPY reads ``stumpy.config.STUMPY_EXCL_ZONE_DENOM`` at call time, and it
+    is the only knob STUMPY offers for the trivial-match exclusion zone
+    ``ceil(m / denom)``. Honour it whenever STUMPY has been imported so a
+    mixed pipeline uses one zone, and fall back to STUMPY's default of 4
+    otherwise. STUMPY is not a dependency: never import it here. The raw
+    value is kept (STUMPY accepts any positive real, e.g. 2.5 or 0.5).
+    """
+    cfg = sys.modules.get("stumpy.config")
+    denom = EXCL_ZONE_DENOM
+    if cfg is not None:
+        denom = getattr(cfg, "STUMPY_EXCL_ZONE_DENOM", EXCL_ZONE_DENOM)
+    if (
+        isinstance(denom, (bool, np.bool_))
+        or not isinstance(denom, numbers.Real)
+        or not denom > 0
+        or not np.isfinite(denom)
+    ):
+        raise ValueError(
+            f"`STUMPY_EXCL_ZONE_DENOM` must be a finite positive number but found {denom!r}."
+        )
+    return denom
+
+
+def exclusion_zone(m: int, denom=None) -> int:
+    """``ceil(m / denom)``, STUMPY's trivial-match exclusion-zone half width."""
+    if denom is None:
+        denom = excl_zone_denom()
+    return int(np.ceil(m / denom))
 
 
 def stable_center_scale(a: np.ndarray) -> tuple[float, float]:
@@ -150,8 +185,12 @@ def rowwise_l2_inplace(a: np.ndarray) -> np.ndarray:
     return np.where(finite, norm, np.inf)
 
 
-def check_series(T, name: str) -> np.ndarray:
-    """Validate a time series the way STUMPY does; return a float64 copy."""
+def check_series(T, name: str, copy: bool = True) -> np.ndarray:
+    """Validate a time series the way STUMPY does; return a float64 copy.
+
+    ``copy=False`` validates only and returns the input array itself (for
+    callers that hand the series on to a function making its own copy).
+    """
     T = np.asarray(T)
     if T.dtype != np.float64:
         raise TypeError(
@@ -160,10 +199,12 @@ def check_series(T, name: str) -> np.ndarray:
         )
     if T.ndim != 1:
         raise ValueError(f"{name} is {T.ndim}-dimensional and must be 1-dimensional.")
-    return T.copy()
+    return T.copy() if copy else T
 
 
-def check_window_size(m, n: int | None = None, warn_n: int | None = None) -> int:
+def check_window_size(
+    m, n: int | None = None, warn_n: int | None = None, excl_zone_denom=EXCL_ZONE_DENOM
+) -> int:
     """Validate ``m``; with ``warn_n`` (self-joins), also emit STUMPY's
     advisory when the exclusion zone starves the central subsequence."""
     if not np.issubdtype(type(m), np.integer):
@@ -174,7 +215,7 @@ def check_window_size(m, n: int | None = None, warn_n: int | None = None) -> int
     if n is not None and m > n:
         raise ValueError(f"The window size must be less than or equal to {n}.")
     if warn_n is not None:
-        excl_zone = int(np.ceil(m / EXCL_ZONE_DENOM))
+        excl_zone = exclusion_zone(m, excl_zone_denom)
         if (warn_n - m + 1) // 2 <= excl_zone:
             warnings.warn(
                 f"The window size, 'm = {m}', may be too large and could lead to "

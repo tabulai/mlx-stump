@@ -7,18 +7,18 @@ from decimal import Decimal, localcontext
 
 import numpy as np
 
+from ._engine import refine_chunk_rows
 from ._mass import _as_flag, mass
 from ._preprocess import (
-    EXCL_ZONE_DENOM,
     apply_affine_frame,
     center_rows_stable,
+    exclusion_zone,
     process_isconstant,
     rolling_isfinite,
     rolling_mean_sigma,
     rowwise_l2_inplace,
     stable_center_scale,
 )
-from ._stump import _refine_chunk_rows
 
 # refinement/threshold rounds for a data-dependent max_distance (the loop
 # converges as soon as a round refines nothing new, typically in 2-3 rounds)
@@ -430,7 +430,7 @@ def _refine_candidates(Q, T, js, normalize, q_const, t_const):
     if js.size == 0:
         return out
     m = Q.shape[0]
-    chunk = _refine_chunk_rows(m)
+    chunk = refine_chunk_rows(m)
     if normalize:
         Wfull = np.lib.stride_tricks.sliding_window_view(T, m)
         # Put every raw row into its own bounded midpoint/range frame before
@@ -644,7 +644,7 @@ def match(
         raise ValueError("Q contains illegal values (NaN or inf)")
 
     m = Q.shape[-1]
-    excl_zone = int(np.ceil(m / EXCL_ZONE_DENOM))
+    excl_zone = exclusion_zone(m)
 
     D = mass(
         Q,

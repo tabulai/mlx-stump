@@ -8,20 +8,21 @@ import mlx.core as mx
 import numpy as np
 
 from ._engine import (
-    _REFINE_MEM_BUDGET,  # noqa: F401 - re-exported for tests that monkeypatch it here
     MassEngine,
     ReduceStep,
     default_chunk_size,
     query_windows,
+    refine_chunk_rows,
     tiled_chunk_size,
 )
 from ._mparray import mparray
 from ._preprocess import (
-    EXCL_ZONE_DENOM,
     PreprocessedSeries,
     center_rows_stable,
     check_series,
     check_window_size,
+    excl_zone_denom,
+    exclusion_zone,
     preprocess_series,
     process_isconstant,
     rowwise_l2_inplace,
@@ -34,10 +35,6 @@ _INF = float("inf")
 # not be applied to raw-unit AAMP distances, where any fixed absolute cutoff
 # would make the result depend on the user's choice of units.
 P_NORM_THRESHOLD = 1e-14
-
-
-def _refine_chunk_rows(m: int) -> int:
-    return max(1, min(1 << 16, _REFINE_MEM_BUDGET // (m * 8 * 4)))
 
 
 def _refine_znorm(
@@ -73,7 +70,7 @@ def _refine_znorm(
     WQ = np.lib.stride_tricks.sliding_window_view(query.T, m)
     WT = np.lib.stride_tricks.sliding_window_view(target.T, m)
     dmax = 2.0 * np.sqrt(m)  # rho >= -1; sqrt rounding can overshoot 1 ulp
-    chunk = _refine_chunk_rows(m)
+    chunk = refine_chunk_rows(m)
     for s in range(0, valid.size, chunk):
         qi = valid[s : s + chunk]
         tj = I[qi]
@@ -118,7 +115,7 @@ def _refine_absolute(
         return out
     WQ = np.lib.stride_tricks.sliding_window_view(query.T, m)
     WT = np.lib.stride_tricks.sliding_window_view(target.T, m)
-    chunk = _refine_chunk_rows(m)
+    chunk = refine_chunk_rows(m)
     for s in range(0, valid.size, chunk):
         qi = valid[s : s + chunk]
         tj = I[qi]
@@ -162,6 +159,7 @@ def _compute_profile_tiled(
     normalize: bool,
     k: int,
     chunk_size: int | None,
+    excl: int,
 ):
     """Chunked sweep for targets too large to materialize in one piece.
 
@@ -172,9 +170,7 @@ def _compute_profile_tiled(
     lowest column index wins — the same first-minimum semantics as a full-row
     argmin.
     """
-    m = query.m
     l_q = query.l
-    excl = int(np.ceil(m / EXCL_ZONE_DENOM))
     B = chunk_size or tiled_chunk_size(engine, l_q, k, self_join)
 
     IL = np.full(l_q, -1, dtype=np.int64)
@@ -270,8 +266,12 @@ def _compute_profile(
     normalize: bool,
     k: int,
     chunk_size: int | None,
+    excl: int,
 ):
-    """Chunked GPU sweep: returns (P (l,k) f64-in-f32, I, IL, IR) numpy arrays."""
+    """Chunked GPU sweep: returns (P (l,k) f64-in-f32, I, IL, IR) numpy arrays.
+
+    ``excl`` is the self-join exclusion-zone half width, ``ceil(m / denom)``.
+    """
     if engine.tiled:
         return _compute_profile_tiled(
             query,
@@ -280,10 +280,9 @@ def _compute_profile(
             normalize=normalize,
             k=k,
             chunk_size=chunk_size,
+            excl=excl,
         )
-    m = query.m
     l_q = query.l
-    excl = int(np.ceil(m / EXCL_ZONE_DENOM))
     B = chunk_size or default_chunk_size(engine, l_q, k, self_join)
 
     P = np.empty((l_q, k), dtype=np.float64)
@@ -295,7 +294,7 @@ def _compute_profile(
     for s0, s, e in _batches(l_q, B):
         off = s - s0
         Q = query_windows(query, s0, e, normalize=normalize)
-        QT = engine.sliding_dot_products(Q)
+        QT = mx.matmul(Q, engine.W_T)
         if normalize:
             a, b = query.sig_inv_mx[s0:e], query.isconstant_mx[s0:e]
         else:
@@ -405,10 +404,14 @@ def stump(
             ignore_trivial = False
     self_join = ignore_trivial
 
+    # read once per call, like STUMPY: the zone used for the search, the
+    # advisory, and the returned mparray's metadata must all agree
+    denom = excl_zone_denom()
     m = check_window_size(
         m,
         min(T_A.shape[0], T_B.shape[0]),
         warn_n=T_A.shape[0] if self_join else None,
+        excl_zone_denom=denom,
     )
 
     if not normalize and p != 2.0:
@@ -460,7 +463,13 @@ def stump(
 
     engine = MassEngine(Bs, normalize=normalize)
     P32, I, IL, IR = _compute_profile(
-        A, engine, self_join=self_join, normalize=normalize, k=k, chunk_size=chunk_size
+        A,
+        engine,
+        self_join=self_join,
+        normalize=normalize,
+        k=k,
+        chunk_size=chunk_size,
+        excl=exclusion_zone(m, denom),
     )
     # the sweep is over: drop the window matrix and return the batch buffers
     # MLX cached for it to the system before the CPU refinement allocates its
@@ -514,4 +523,4 @@ def stump(
         out[:, k + j] = I[:, j]
     out[:, 2 * k] = IL
     out[:, 2 * k + 1] = IR
-    return mparray(out, m, k, EXCL_ZONE_DENOM)
+    return mparray(out, m, k, denom)
