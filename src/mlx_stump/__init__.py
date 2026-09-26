@@ -9,6 +9,7 @@ from ._engine import estimated_peak_bytes
 from ._mass import mass, mass_absolute
 from ._match import aamp_match, match
 from ._mparray import mparray
+from ._stimp import gpu_stimp, stimp
 from ._stump import aamp, gpu_aamp, gpu_stump, stump
 
 __version__ = "0.1.0.dev0"
@@ -22,6 +23,8 @@ __all__ = [
     "mass_absolute",
     "match",
     "aamp_match",
+    "stimp",
+    "gpu_stimp",
     "mparray",
     "estimated_peak_bytes",
     "__version__",
