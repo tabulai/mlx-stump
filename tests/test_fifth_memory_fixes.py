@@ -58,7 +58,8 @@ def test_estimate_includes_one_row_centering_floor():
     """A single enormous window can exceed the nominal 64 MiB CPU budget."""
     l, m = 5, 10_000_000
     block = resident_block_bytes(l, m)
-    actual_upload_floor = 2 * block + max(1 << 26, m * 8 + _CENTER_ROW_BYTES)
+    # the block is built in place in its device buffer (no staging copy)
+    actual_upload_floor = block + max(1 << 26, m * 8 + _CENTER_ROW_BYTES)
     assert estimated_peak_bytes(l, m, chunk_size=1) >= actual_upload_floor
 
 

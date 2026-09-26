@@ -44,6 +44,8 @@ batches it also sizes.
 
 from __future__ import annotations
 
+import os
+import sys
 import warnings
 from types import SimpleNamespace
 
@@ -326,6 +328,20 @@ _KERNELS: dict = {}
 # k -> the threadgroup width all four variants of the k kernel launch with
 # on this GPU, or None when they cannot run here (see launch_threadgroup)
 _LAUNCH: dict = {}
+_PKG_PREFIX = os.path.dirname(__file__) + os.sep
+
+
+def _warn_outside_package(message: str, category: type[Warning]) -> None:
+    """Warn at the first frame outside this package: the depth of the
+    user's call differs per entry point (``estimated_peak_bytes``, ``stump``,
+    the tiled sweep, ``stimp``), so no fixed ``stacklevel`` is right."""
+    if sys.version_info >= (3, 12):
+        warnings.warn(message, category, skip_file_prefixes=(_PKG_PREFIX,))
+        return
+    f, level = sys._getframe(1), 1
+    while f is not None and f.f_code.co_filename.startswith(_PKG_PREFIX):
+        f, level = f.f_back, level + 1
+    warnings.warn(message, category, stacklevel=level + 1)
 
 
 def _kernel(kind: str, normalize: bool, self_join: bool):
@@ -377,7 +393,10 @@ class FusedReduce:
             raise RuntimeError(f"the fused k={k} kernels cannot run on this device")
         self.k = k
         self.self_join = self_join
-        self.excl = int(excl)
+        # as in ReduceStep: a zone of l columns excludes every self-join
+        # candidate, and the clamp keeps EXCL + 1 and the int32 parameter
+        # buffer from overflowing (an extreme denominator raised bad_cast)
+        self.excl = min(int(excl), int(target.l))
         if normalize:
             self._q = (query.sig_inv_mx, query.isconstant_mx, query.isfinite_mx)
             self._t = (target.sig_inv_mx, target.isconstant_mx, target.isfinite_mx)
@@ -430,6 +449,7 @@ def _probe(k: int, tg: int) -> None:
     stats = mx.zeros((n,), dtype=mx.float32)
     flags = mx.zeros((n,), dtype=mx.bool_)
     series = SimpleNamespace(
+        l=n,
         sig_inv_mx=stats,
         isconstant_mx=flags,
         isfinite_mx=mx.ones((n,), dtype=mx.bool_),
@@ -470,11 +490,10 @@ def launch_threadgroup(k: int) -> int | None:
                 err = exc
                 tg //= 2
         else:
-            warnings.warn(
+            _warn_outside_package(
                 f"mlx_stump: the fused Metal kernels for k={k} cannot run on this GPU "
                 f"({err}); using the slower compiled reduction.",
                 RuntimeWarning,
-                stacklevel=2,
             )
             tg = None
         _LAUNCH[k] = tg

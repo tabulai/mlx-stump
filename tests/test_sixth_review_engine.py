@@ -79,13 +79,26 @@ def _force_tiles(monkeypatch, m, columns):
 
 
 def _run(monkeypatch, T, m, T_B=None, *, fused, tiled=False, columns=150, **kwargs):
-    """stump() on the fused kernels or the forced compiled fallback."""
+    """stump() on the fused kernels or the forced compiled fallback; with
+    ``fused`` it checks that stump built the fused reducer, so a bit-identity
+    test cannot silently compare the fallback with itself."""
+    built = []
     with monkeypatch.context() as mp:
-        if not fused:
+        if fused:
+            real = stump_mod.make_reducer
+
+            def spy(*a, **kw):
+                built.append(kw["fused"])
+                return real(*a, **kw)
+
+            mp.setattr(stump_mod, "make_reducer", spy)
+        else:
             _force_fallback(mp)
         if tiled:
             _force_tiles(mp, m, columns)
-        return mlx_stump.stump(T, m, T_B, **kwargs)
+        out = mlx_stump.stump(T, m, T_B, **kwargs)
+    assert not fused or (built and all(built)), "fused=True ran the compiled fallback"
+    return out
 
 
 def _assert_same(a, b, label=""):
@@ -520,7 +533,7 @@ def test_measured_sweep_peak_within_budget(monkeypatch, n, k, normalize, fused):
     plus the intermediates budget in every dispatch case. A fused-path
     (4 B/cell) batch leaking into the fallback peaked at 2.6 GiB. The k == 1
     sweeps fill the budget exactly, so the slack covers the O(l) per-series
-    device arrays that come on top (<= 1.8 MiB here) and allocator
+    device arrays that come on top (<= 0.75 MiB here) and allocator
     variance."""
     m = 50
     T = np.random.default_rng(10).standard_normal(n).cumsum()
@@ -655,8 +668,10 @@ def test_kernels_that_cannot_launch_fall_back(monkeypatch):
         raise RuntimeError("simulated pipeline failure")
 
     monkeypatch.setattr(kern, "_probe", broken)
-    with pytest.warns(RuntimeWarning, match="compiled reduction"):
+    with pytest.warns(RuntimeWarning, match="compiled reduction") as rec:
         assert not eng._fused_reducer(5)
+    # attributed to this caller, not to a line inside the package
+    assert {w.filename for w in rec if "compiled reduction" in str(w.message)} == {__file__}
     assert not eng._fused_reducer(5)  # cached: one warning per process and k
     engine = _FakeEngine(131_023, 50)
     assert eng.default_chunk_size(engine, engine.l, 5, True) == eng.default_chunk_size(
