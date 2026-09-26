@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-import stumpy
 
 import mlx_stump
 
 from .conftest import DATASETS, assert_dist_profiles_close
+
+stumpy = pytest.importorskip("stumpy")
 
 
 @pytest.mark.parametrize("name", ["random_walk", "sine_noise", "large_offset"])

@@ -1,24 +1,50 @@
-"""Shared datasets and golden-comparison helpers.
+"""Shared datasets, golden-comparison helpers and the isolated-memory harness.
 
-The golden harness compares every code path against float64 STUMPY. Index
-comparisons are tie-tolerant: the GPU searches in float32, so near-tied
+The golden harness compares every ``stump`` mode (self- and AB-joins,
+k >= 1, normalized and raw, single-block and tiled engines) and
+``mass``/``match`` against float64 STUMPY. Index comparisons are
+tie-tolerant: the GPU searches in float32, so near-tied
 neighbors may legitimately resolve to a different index — the assertion is
 then that both chosen neighbors are equally good (their exact float64
 distances agree within a small tolerance), which is what downstream motif or
 discord analysis actually depends on.
+
+STUMPY is an optional extra: each module that needs the oracle skips itself
+with a module-level ``pytest.importorskip("stumpy")``, so the rest of the
+suite still runs without it.
 """
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+import textwrap
+
 import numpy as np
 import pytest
 
-stumpy = pytest.importorskip("stumpy")
+
+def pytest_sessionstart(session):
+    """With ``MLX_STUMP_REQUIRE_METAL=1`` (set in CI) refuse to run anywhere
+    but the Metal GPU: MLX silently falls back to its CPU backend, where the
+    suite still passes, so a green run would not show the GPU path ran."""
+    if os.environ.get("MLX_STUMP_REQUIRE_METAL") != "1":
+        return
+    import mlx.core as mx
+
+    metal = mx.metal.is_available()
+    device = mx.default_device()
+    if not (metal and device == mx.gpu):
+        pytest.exit(
+            f"MLX_STUMP_REQUIRE_METAL=1 but metal={metal} default_device={device}",
+            returncode=1,
+        )
 
 
 def pytest_collection_modifyitems(config, items):
-    """gpu-marked tests measure Metal behavior (e.g. peak GPU memory) and are
-    skipped on CPU-only runners, as the marker description promises."""
+    """gpu-marked tests measure Metal behavior (e.g. peak GPU memory); they
+    are skipped when ``mx.metal.is_available()`` is False."""
     import mlx.core as mx
 
     if mx.metal.is_available():
@@ -62,7 +88,8 @@ def with_constants(n: int, seed: int = 0) -> np.ndarray:
 
 
 def large_offset(n: int, seed: int = 0) -> np.ndarray:
-    # exercises the global-standardization layer of the precision strategy
+    # offset data: exercises per-window local z-normalization (normalize=True)
+    # and the shared affine frame of raw-distance search (normalize=False)
     return random_walk(n, seed) + 1.0e6
 
 
@@ -78,7 +105,13 @@ DATASETS = {
 
 # ------------------------------------------------------- golden comparison
 def _znorm_dist(T_A, T_B, m, i, j):
-    """Exact float64 z-normalized distance between two subsequences."""
+    """Exact float64 z-normalized distance between two subsequences.
+
+    Two-pass: the difference of the two z-normalized windows, as the library's
+    own refinement computes it. The one-pass ``mean(a*b) - mean(a)*mean(b)``
+    covariance cancels at a large offset: on ``large_offset`` at m=8 it was
+    off by up to ~1.5e-2 in d, about half the tie tolerance it adjudicates.
+    """
     a = T_A[i : i + m].astype(np.float64)
     b = T_B[j : j + m].astype(np.float64)
     sa, sb = a.std(), b.std()
@@ -86,8 +119,8 @@ def _znorm_dist(T_A, T_B, m, i, j):
         return 0.0
     if sa == 0.0 or sb == 0.0:
         return np.sqrt(m)
-    rho = ((a * b).mean() - a.mean() * b.mean()) / (sa * sb)
-    return np.sqrt(max(2.0 * m * (1.0 - rho), 0.0))
+    d = (a - a.mean()) / sa - (b - b.mean()) / sb
+    return float(np.sqrt(d @ d))
 
 
 def _abs_dist(T_A, T_B, m, i, j):
@@ -164,3 +197,39 @@ def assert_dist_profiles_close(D, Dr, *, m, scale=1.0):
         atol=3e-4 * m * scale**2,
         rtol=1e-3,
     )
+
+
+# ------------------------------------------------------ isolated memory runs
+def run_isolated(body: str) -> tuple[float, float, float]:
+    """Run ``body`` in a fresh interpreter; return (rss_before_mib,
+    rss_peak_mib, mlx_peak_mib).
+
+    ``body`` runs after the imports, with ``np``, ``mx``, ``mlx_stump``,
+    ``resource`` and ``_unit`` (the ru_maxrss unit) bound. The RSS baseline
+    is taken after the imports; a body may reassign ``before`` (after a
+    warm-up or its own setup) to measure growth from that point instead.
+    The prologue and the body are dedented separately, so the body may be
+    written at any indentation.
+    """
+    prologue = textwrap.dedent(
+        """
+        import resource, sys
+        import numpy as np
+        import mlx.core as mx
+        import mlx_stump
+        _unit = 1 if sys.platform == "darwin" else 1024  # ru_maxrss: bytes vs KiB
+        before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * _unit
+        mx.reset_peak_memory()
+        """
+    )
+    epilogue = textwrap.dedent(
+        """
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * _unit
+        print("RESULT", before / 2**20, peak / 2**20, mx.get_peak_memory() / 2**20)
+        """
+    )
+    src = prologue + textwrap.dedent(body) + epilogue
+    out = subprocess.run([sys.executable, "-c", src], capture_output=True, text=True, check=True)
+    line = [ln for ln in out.stdout.splitlines() if ln.startswith("RESULT")][-1]
+    before, peak, mlx_peak = (float(x) for x in line.split()[1:])
+    return before, peak, mlx_peak

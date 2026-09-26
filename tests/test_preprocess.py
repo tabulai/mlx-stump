@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-import stumpy
 
 from mlx_stump._preprocess import (
     check_series,
@@ -16,6 +15,8 @@ from mlx_stump._preprocess import (
 )
 
 from .conftest import DATASETS
+
+stumpy = pytest.importorskip("stumpy")
 
 
 @pytest.mark.parametrize("name", sorted(DATASETS))

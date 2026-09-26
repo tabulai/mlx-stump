@@ -20,12 +20,13 @@ import warnings
 
 import numpy as np
 import pytest
-import stumpy
 
 import mlx_stump
 from mlx_stump._engine import _CHUNK_MEM_BUDGET, default_chunk_size, tiled_chunk_size
 
 from .conftest import tie_tolerance
+
+stumpy = pytest.importorskip("stumpy")
 
 
 # ------------------------------------------------- 1: refinement cancellation
