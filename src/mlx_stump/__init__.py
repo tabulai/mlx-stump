@@ -5,6 +5,7 @@ independent project and is not affiliated with or endorsed by the STUMPY
 project or TD Ameritrade.
 """
 
+from ._engine import estimated_peak_bytes
 from ._mass import mass
 from ._match import match
 from ._mparray import mparray
@@ -12,4 +13,4 @@ from ._stump import stump
 
 __version__ = "0.1.0.dev0"
 
-__all__ = ["stump", "mass", "match", "mparray", "__version__"]
+__all__ = ["stump", "mass", "match", "mparray", "estimated_peak_bytes", "__version__"]

@@ -20,14 +20,10 @@
 from __future__ import annotations
 
 import math
-import subprocess
-import sys
-import textwrap
 import warnings
 
 import numpy as np
 import pytest
-import stumpy
 
 import mlx_stump
 import mlx_stump._engine as eng
@@ -41,6 +37,10 @@ from mlx_stump._engine import (
     resident_block_bytes,
 )
 from mlx_stump._preprocess import preprocess_series, rolling_mean_sigma
+
+from .conftest import run_isolated
+
+stumpy = pytest.importorskip("stumpy")
 
 MIB = 1 << 20
 
@@ -129,34 +129,6 @@ def test_mass_stats_validation_and_nonfinite_windows():
 
 
 # ------------------------------------------------------------- 2: memory
-def _run_isolated(code: str) -> tuple[float, float, float]:
-    """Run ``code`` in a fresh interpreter; return (rss_before_mib,
-    rss_peak_mib, mlx_peak_mib). ``code`` runs after the imports, with
-    ``np`` and ``mx`` bound; the RSS baseline is taken after the imports."""
-    src = textwrap.dedent(
-        """
-        import resource, sys
-        import numpy as np
-        import mlx.core as mx
-        import mlx_stump
-        from mlx_stump._engine import MassEngine
-        from mlx_stump._preprocess import preprocess_series
-        _unit = 1 if sys.platform == "darwin" else 1024  # ru_maxrss: bytes vs KiB
-        before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * _unit
-        mx.reset_peak_memory()
-        """
-        + code
-        + """
-        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * _unit
-        print("RESULT", before / 2**20, peak / 2**20, mx.get_peak_memory() / 2**20)
-        """
-    )
-    out = subprocess.run([sys.executable, "-c", src], capture_output=True, text=True, check=True)
-    line = [ln for ln in out.stdout.splitlines() if ln.startswith("RESULT")][-1]
-    before, peak, mlx_peak = (float(x) for x in line.split()[1:])
-    return before, peak, mlx_peak
-
-
 @pytest.mark.gpu
 @pytest.mark.slow
 def test_mass_is_blockwise():
@@ -167,7 +139,7 @@ def test_mass_is_blockwise():
     l = n - m + 1
     block = resident_block_bytes(l, m)
     assert block < l * m * 4  # the case is tiled
-    _, rss, mlx_peak = _run_isolated(
+    _, rss, mlx_peak = run_isolated(
         f"""
         rng = np.random.default_rng(0)
         T = rng.standard_normal({n}).cumsum(); Q = T[100:100 + {m}].copy()
@@ -189,8 +161,10 @@ def test_engine_build_is_byte_budgeted():
     n, m = 65_536, 1_000
     l = n - m + 1
     assert resident_block_bytes(l, m) == l * m * 4  # dense
-    before, rss, _ = _run_isolated(
+    before, rss, _ = run_isolated(
         f"""
+        from mlx_stump._engine import MassEngine
+        from mlx_stump._preprocess import preprocess_series
         rng = np.random.default_rng(0)
         prep = preprocess_series(rng.standard_normal({n}).cumsum(), {m})
         before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * _unit
@@ -210,14 +184,15 @@ def test_constant_series_preprocessing_is_cheap():
     32 MiB chunks."""
     n, m = 65_536, 2_200
     l = n - m + 1
-    before, rss, _ = _run_isolated(
+    before, rss, _ = run_isolated(
         f"""
+        from mlx_stump._preprocess import preprocess_series
         before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * _unit
         preprocess_series(np.full({n}, 7.0), {m}, normalize=False)
         """
     )
     assert rss - before < 96, f"constant-series preprocessing grew RSS by {rss - before:.0f} MiB"
-    before, rss, mlx_peak = _run_isolated(
+    before, rss, mlx_peak = run_isolated(
         f"""
         before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * _unit
         mlx_stump.stump(np.full({n}, 7.0), {m})
@@ -234,7 +209,7 @@ def test_constant_series_preprocessing_is_cheap():
 def test_tiled_stump_peak_within_ceiling():
     n, m = 65_536, 2_200
     l = n - m + 1
-    before, rss, mlx_peak = _run_isolated(
+    before, rss, mlx_peak = run_isolated(
         f"""
         rng = np.random.default_rng(0)
         T = rng.standard_normal({n}).cumsum()

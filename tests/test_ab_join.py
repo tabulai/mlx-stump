@@ -6,7 +6,6 @@ import warnings
 
 import numpy as np
 import pytest
-import stumpy
 
 import mlx_stump
 
@@ -16,6 +15,8 @@ from .conftest import (
     assert_profile_close,
     tie_tolerance,
 )
+
+stumpy = pytest.importorskip("stumpy")
 
 
 def golden_ab_join(T_A, T_B, m, **kwargs):

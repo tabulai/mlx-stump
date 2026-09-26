@@ -6,7 +6,6 @@ import warnings
 
 import numpy as np
 import pytest
-import stumpy
 
 import mlx_stump
 
@@ -15,6 +14,8 @@ from .conftest import (
     assert_indices_tie_tolerant,
     tie_tolerance,
 )
+
+stumpy = pytest.importorskip("stumpy")
 
 
 def _true_row_distances(T, m, i, excl):

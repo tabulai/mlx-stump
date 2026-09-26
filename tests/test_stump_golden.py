@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-import stumpy
 
 import mlx_stump
 
@@ -14,6 +13,8 @@ from .conftest import (
     assert_profile_close,
     tie_tolerance,
 )
+
+stumpy = pytest.importorskip("stumpy")
 
 
 def golden_self_join(T, m, **kwargs):
@@ -75,7 +76,7 @@ def test_minimal_length_self_join():
 
 def test_all_constant_series():
     T = np.full(500, 7.0)
-    mp, ref = golden_self_join(T, 25)
+    mp, _ = golden_self_join(T, 25)
     assert np.all(mp.P_ == 0.0)
 
 
@@ -118,13 +119,14 @@ def test_validation_matches_stumpy():
         mlx_stump.stump(T.astype(np.float32), 8)
     with pytest.raises(TypeError):
         mlx_stump.stump(np.arange(100), 8)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="must be 1-dimensional"):
         mlx_stump.stump(T.reshape(10, 10), 8)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="greater than or equal to three"):
         mlx_stump.stump(T, 2)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="less than or equal to 100"):
         mlx_stump.stump(T, 101)
-    with pytest.raises(ValueError):
+    # STUMPY accepts k=0; rejecting it is mlx-stump's own stricter validation
+    with pytest.raises(ValueError, match="`k` must be a positive integer"):
         mlx_stump.stump(T, 8, k=0)
 
 

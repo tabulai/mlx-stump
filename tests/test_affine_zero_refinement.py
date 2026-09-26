@@ -2,7 +2,6 @@
 
 import numpy as np
 import pytest
-import stumpy
 
 import mlx_stump
 from mlx_stump._match import (
@@ -10,6 +9,8 @@ from mlx_stump._match import (
     _exact_translation_rows,
     _refine_candidates,
 )
+
+stumpy = pytest.importorskip("stumpy")
 
 
 @pytest.mark.parametrize(

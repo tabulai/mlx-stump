@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import numpy as np
-import stumpy
+import pytest
 
 import mlx_stump
 
 from .conftest import DATASETS
+
+stumpy = pytest.importorskip("stumpy")
 
 
 def test_output_layout_k1():
@@ -75,9 +77,9 @@ def test_motifs_consumes_output_profile():
     T[300 : 300 + m] = pattern + 0.01 * rng.standard_normal(m)
     T[1400 : 1400 + m] = pattern + 0.01 * rng.standard_normal(m)
     mp = mlx_stump.stump(T, m)
-    motif_distances, motif_indices = stumpy.motifs(T, mp.P_, max_motifs=1)
+    _, motif_indices = stumpy.motifs(T, mp.P_, max_motifs=1)
     ref = stumpy.stump(T, m)
-    ref_distances, ref_indices = stumpy.motifs(T, ref.P_, max_motifs=1)
+    _, ref_indices = stumpy.motifs(T, ref.P_, max_motifs=1)
     assert motif_indices.shape == ref_indices.shape
     assert motif_indices.size > 0
     np.testing.assert_array_equal(np.sort(motif_indices[0]), np.sort(ref_indices[0]))

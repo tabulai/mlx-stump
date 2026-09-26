@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import subprocess
-import sys
-
 import numpy as np
 import pytest
 
@@ -16,6 +13,8 @@ from mlx_stump._engine import (
     estimated_peak_bytes,
     resident_block_bytes,
 )
+
+from .conftest import run_isolated
 
 
 def test_topk_estimate_uses_allocator_footprint_and_ab_lengths():
@@ -197,24 +196,16 @@ def test_raw_constant_flags_are_consistently_validated_then_ignored():
 def test_exact_affine_certificate_has_bounded_auxiliary_memory():
     """A legal million-sample scaled duplicate must not build bigint lists."""
     source = r"""
-import resource
-import sys
-import numpy as np
 from mlx_stump._match import _exact_positive_affine_rows
 
-unit = 1 if sys.platform == "darwin" else 1024
 m = 1_000_000
 Q = np.arange(m, dtype=np.float64)
 W = 2.0 * Q + 1.0
-before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * unit
+before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * _unit
 assert _exact_positive_affine_rows(Q, W)[0]
-peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * unit
-print((peak - before) / 2**20)
 """
-    result = subprocess.run(
-        [sys.executable, "-c", source], capture_output=True, text=True, check=True
-    )
-    growth_mib = float(result.stdout.strip().splitlines()[-1])
+    before, peak, _ = run_isolated(source)
+    growth_mib = peak - before
     assert growth_mib < 64.0, f"affine certificate grew RSS by {growth_mib:.1f} MiB"
 
 
@@ -222,49 +213,33 @@ print((peak - before) / 2**20)
 def test_high_precision_non_affine_fallback_has_bounded_memory():
     """The rare Decimal path must stream rather than retain four huge lists."""
     source = r"""
-import resource
-import sys
-import numpy as np
 from mlx_stump._match import _refine_candidates
 
-unit = 1 if sys.platform == "darwin" else 1024
 m = 1_000_000
 Q = np.random.default_rng(1).standard_normal(m)
 W = Q.copy()
 W[2] = np.nextafter(W[2], np.inf)
-before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * unit
+before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * _unit
 distance = _refine_candidates(Q, W, [0], True, False, np.array([False]))[0]
-peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * unit
 assert distance > 0.0
-print((peak - before) / 2**20)
 """
-    result = subprocess.run(
-        [sys.executable, "-c", source], capture_output=True, text=True, check=True
-    )
-    growth_mib = float(result.stdout.strip().splitlines()[-1])
+    before, peak, _ = run_isolated(source)
+    growth_mib = peak - before
     assert growth_mib < 64.0, f"Decimal refinement grew RSS by {growth_mib:.1f} MiB"
 
 
 def test_default_threshold_has_one_linear_scratch_array():
     """Computing the default cutoff must not retain three profile copies."""
     source = r"""
-import resource
-import sys
-import numpy as np
 from mlx_stump._match import _default_max_distance
 
-unit = 1 if sys.platform == "darwin" else 1024
 D = np.linspace(0.0, 1.0, 4_000_000, dtype=np.float64)
-before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * unit
+before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * _unit
 value = _default_max_distance(D)
 assert np.isfinite(value)
-peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * unit
-print((peak - before) / 2**20)
 """
-    result = subprocess.run(
-        [sys.executable, "-c", source], capture_output=True, text=True, check=True
-    )
-    growth_mib = float(result.stdout.strip().splitlines()[-1])
+    before, peak, _ = run_isolated(source)
+    growth_mib = peak - before
     assert growth_mib < 56.0, f"default threshold grew RSS by {growth_mib:.1f} MiB"
 
 
