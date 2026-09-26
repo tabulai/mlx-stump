@@ -661,16 +661,12 @@ def _stump(
         # Constant-window flags do not affect raw Euclidean distances, but
         # validate them consistently with mass/match instead of silently
         # accepting malformed controls in this one API.
+        # process_isconstant reads only the length for an array spec and
+        # hands a callable its own inf->NaN copy, so no series copy is needed.
         if T_A_subseq_isconstant is not None:
-            A_nan = np.where(np.isinf(T_A), np.nan, T_A)
-            process_isconstant(
-                A_nan, m, T_A_subseq_isconstant, "T_A_subseq_isconstant"
-            )
+            process_isconstant(T_A, m, T_A_subseq_isconstant, "T_A_subseq_isconstant")
         if not share_b_prep and T_B_subseq_isconstant is not None:
-            B_nan = np.where(np.isinf(T_B), np.nan, T_B)
-            process_isconstant(
-                B_nan, m, T_B_subseq_isconstant, "T_B_subseq_isconstant"
-            )
+            process_isconstant(T_B, m, T_B_subseq_isconstant, "T_B_subseq_isconstant")
         # shared affine frame keeps cross distances exactly invariant
         finite = np.concatenate([T_A[np.isfinite(T_A)], T_B[np.isfinite(T_B)]])
         center, scale = stable_center_scale(finite)

@@ -6,8 +6,8 @@ project or TD Ameritrade.
 """
 
 from ._engine import estimated_peak_bytes
-from ._mass import mass
-from ._match import match
+from ._mass import mass, mass_absolute
+from ._match import aamp_match, match
 from ._mparray import mparray
 from ._stump import aamp, gpu_aamp, gpu_stump, stump
 
@@ -19,7 +19,9 @@ __all__ = [
     "gpu_stump",
     "gpu_aamp",
     "mass",
+    "mass_absolute",
     "match",
+    "aamp_match",
     "mparray",
     "estimated_peak_bytes",
     "__version__",

@@ -55,8 +55,10 @@ def test_raw_preprocess_standardization_and_masks():
     # standardized series has ~zero mean / unit variance over finite values
     assert abs(prep.Ts.mean()) < 1e-9
     assert abs(prep.Ts.std() - 1.0) < 1e-9
-    # constant windows get sigma_inv == 0
-    assert np.all(prep.sig_inv[prep.isconstant] == 0.0)
+    # constant windows get a zero centered sum of squares
+    assert np.all(prep.ssq[prep.isconstant] == 0.0)
+    # the raw engine reads ssq/mu only: no inverse sigma or constant mask
+    assert prep.sig_inv_mx is None and prep.isconstant_mx is None
     # original series is untouched
     np.testing.assert_array_equal(prep.T, T)
 
@@ -68,7 +70,7 @@ def test_normalized_preprocess_keeps_only_locally_consumed_arrays():
 
     assert prep.Ts is None
     assert prep.mu is None
-    assert prep.sig_inv is None
+    assert prep.sigma is None
     assert prep.ssq is None
     assert prep.mu_mx is None
     assert prep.sig_inv_mx is not None
