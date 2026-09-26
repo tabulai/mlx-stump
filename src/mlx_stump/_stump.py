@@ -136,7 +136,10 @@ def _batches(l_q: int, B: int):
     cannot reuse (up to another full budget retained after the call), and at
     width 1 would dispatch a GEMV-shaped kernel whose float32 accumulation
     order differs from the batched GEMM. Recomputing ``s - s0`` rows once
-    costs less than one batch."""
+    costs less than one batch. The bounds are Python ints (the device calls
+    reject NumPy integers) and the generator is lazy: a materialized list
+    costs ~170 B per batch, 160 MiB at ``l_q = 10**6`` with ``chunk_size=1``."""
+    l_q, B = int(l_q), int(B)
     for s in range(0, l_q, B):
         e = min(s + B, l_q)
         yield max(0, e - B), s, e
@@ -171,7 +174,8 @@ def _merge_topk(run_vals, run_idxs, blk_vals, blk_idxs, k, rows=None):
 
 def _query_args(batches, query, normalize):
     """Yield each batch's float32 query windows, built one batch ahead: the
-    caller asks for batch i+1 while batch i runs on the GPU."""
+    caller asks for batch i+1 while batch i runs on the GPU. ``batches`` is
+    a second ``_batches`` generator running one step ahead of the sweep's."""
     for s0, _, e in batches:
         yield query_windows(query, s0, e, normalize=normalize)
 
@@ -200,7 +204,6 @@ def _compute_profile_tiled(
     l_q = query.l
     fused = _engine._fused_reducer(k)
     B = chunk_size or tiled_chunk_size(engine, l_q, k, self_join, fused=fused)
-    batches = list(_batches(l_q, B))
 
     IL = np.full(l_q, -1, dtype=np.int64)
     IR = np.full(l_q, -1, dtype=np.int64)
@@ -220,9 +223,9 @@ def _compute_profile_tiled(
         query, engine, normalize=normalize, self_join=self_join, excl=excl, k=k, fused=fused
     )
     for j0, j1, W in engine.target_blocks():
-        Qs = _query_args(batches, query, normalize)
+        Qs = _query_args(_batches(l_q, B), query, normalize)
         Q = next(Qs)
-        for s0, s, e in batches:
+        for s0, s, e in _batches(l_q, B):
             off = s - s0
             outs = red.block(mx.matmul(Q, W), s0, j0, j1)
             mx.async_eval(*outs)
@@ -321,7 +324,6 @@ def _compute_profile(
     l_q = query.l
     fused = _engine._fused_reducer(k)
     B = chunk_size or default_chunk_size(engine, l_q, k, self_join, fused=fused)
-    batches = list(_batches(l_q, B))
 
     P = np.empty((l_q, k), dtype=np.float64)
     I = np.empty((l_q, k), dtype=np.int64)
@@ -331,9 +333,9 @@ def _compute_profile(
     red = make_reducer(
         query, engine, normalize=normalize, self_join=self_join, excl=excl, k=k, fused=fused
     )
-    Qs = _query_args(batches, query, normalize)
+    Qs = _query_args(_batches(l_q, B), query, normalize)
     Q = next(Qs)
-    for s0, s, e in batches:
+    for s0, s, e in _batches(l_q, B):
         off = s - s0
         # QT is passed inline, never bound to a name: a live reference would
         # keep the B*l*4-byte product alive through the eval below

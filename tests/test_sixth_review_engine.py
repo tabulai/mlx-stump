@@ -27,6 +27,19 @@
 5. Each batch's query windows are built on the CPU while the previous batch
    runs on the GPU, keeping exactly one live set of device intermediates,
    and the dense loop no longer binds QT to a name through the eval.
+6. (Review of 1-5.) The prefetching loops first materialized
+   ``list(_batches(...))``: ~170 B per batch of host memory that
+   ``estimated_peak_bytes`` does not model (160 MiB at ``l_q = 10**6``
+   with ``chunk_size=1``). Two lazy generators, one a step ahead, replace
+   it, and the batch bounds are Python ints: a NumPy-integer ``chunk_size``
+   made the kernel's parameter array and ``mx.arange`` raise.
+7. (Review of 3.) The ``k == 1`` kernel launches 1024 threads per row, and
+   MLX rejects a threadgroup wider than the pipeline allows (a limit that
+   depends on the GPU and the kernel's register use). The kernels are now
+   probed once per process and ``k``: the width is halved until all four
+   variants launch, and if none does (or they fail to build) the dispatch
+   predicate falls back, with a warning, to the compiled step, which the
+   batch sizing then follows.
 """
 
 from __future__ import annotations
@@ -505,7 +518,10 @@ def _peak(fn):
 def test_measured_sweep_peak_within_budget(monkeypatch, n, k, normalize, fused):
     """The automatic batch keeps MLX's peak at or below the resident block
     plus the intermediates budget in every dispatch case. A fused-path
-    (4 B/cell) batch leaking into the fallback peaked at 2.6 GiB."""
+    (4 B/cell) batch leaking into the fallback peaked at 2.6 GiB. The k == 1
+    sweeps fill the budget exactly, so the slack covers the O(l) per-series
+    device arrays that come on top (<= 1.8 MiB here) and allocator
+    variance."""
     m = 50
     T = np.random.default_rng(10).standard_normal(n).cumsum()
     l = n - m + 1
@@ -534,3 +550,124 @@ def test_prefetch_keeps_one_live_batch(monkeypatch, tiled):
     peak = _peak(lambda: mlx_stump.stump(T, m, chunk_size=B))
     one_set = B * width * 4
     assert peak <= block + one_set + 16 * MIB, f"peak {peak / MIB:.0f} MiB"
+
+
+# ------------------------------------------- 6: lazy, integer batch bounds
+def test_batches_are_lazy_python_ints():
+    gen = stump_mod._batches(np.int64(10), np.int64(4))
+    assert iter(gen) is gen  # a generator, not a list
+    batches = list(gen)
+    assert batches == [(0, 0, 4), (4, 4, 8), (6, 8, 10)]
+    assert all(type(x) is int for b in batches for x in b)
+
+
+@pytest.mark.parametrize("tiled", [False, True])
+def test_sweep_pulls_batches_lazily(monkeypatch, tiled):
+    """At every reducer call the sweep has taken at most two batches (its
+    own and the prefetched query's) per reduction so far: nothing is
+    materialized ahead."""
+    events = {"pulled": 0, "reduced": 0, "ahead": 0}
+    real_batches = stump_mod._batches
+    real_make = stump_mod.make_reducer
+
+    def counting(l_q, B):
+        for b in real_batches(l_q, B):
+            events["pulled"] += 1
+            yield b
+
+    def counted(reduce):
+        def wrapped(*a):
+            events["reduced"] += 1
+            events["ahead"] = max(events["ahead"], events["pulled"] - 2 * events["reduced"])
+            return reduce(*a)
+
+        return wrapped
+
+    def make(*args, **kwargs):
+        red = real_make(*args, **kwargs)
+        red.full, red.block = counted(red.full), counted(red.block)
+        return red
+
+    monkeypatch.setattr(stump_mod, "_batches", counting)
+    monkeypatch.setattr(stump_mod, "make_reducer", make)
+    T = np.random.default_rng(12).standard_normal(400).cumsum()
+    m = 10
+    if tiled:
+        _force_tiles(monkeypatch, m, 100)
+    for k in (1, 3):
+        mlx_stump.stump(T, m, k=k, chunk_size=7)
+    assert events["reduced"] >= 2 * 56
+    assert events["ahead"] <= 0
+
+
+def test_numpy_integer_arguments_run(monkeypatch):
+    """NumPy-integer m / k / chunk_size give the Python-int result on the
+    fused kernels (k <= 16) and on the compiled fallback."""
+    T = np.random.default_rng(13).standard_normal(500).cumsum()
+    for k in (1, 5, 20):
+        for fused in (True, False) if k <= kern.FUSED_TOPK_MAX else (False,):
+            with monkeypatch.context() as mp:
+                if not fused:
+                    _force_fallback(mp)
+                a = mlx_stump.stump(T, np.int64(20), k=np.int64(k), chunk_size=np.int64(33))
+                b = mlx_stump.stump(T, 20, k=k, chunk_size=33)
+            _assert_same(a, b, f"k={k} fused={fused}")
+
+
+# ----------------------------------------- 7: the kernels are launch-probed
+@needs_metal
+def test_every_fused_k_launches_here():
+    """On this GPU the probe accepts every fused k (otherwise the fused vs
+    fallback bit-identity tests would compare the fallback with itself)."""
+    for k in range(1, kern.FUSED_TOPK_MAX + 1):
+        assert eng._fused_reducer(k)
+        tg = kern.launch_threadgroup(k)
+        preferred = kern._ARGMIN_TG if k == 1 else kern.topk_threadgroup(k)
+        assert tg is not None and tg <= preferred and preferred % tg == 0
+
+
+@needs_metal
+def test_threadgroup_wider_than_the_pipeline_is_halved(monkeypatch):
+    """A preferred width no Apple GPU pipeline accepts (4096 threads) is
+    halved until the kernels launch; the output is unchanged."""
+    monkeypatch.setattr(kern, "_LAUNCH", {})
+    monkeypatch.setattr(kern, "_ARGMIN_TG", 4096)
+    tg = kern.launch_threadgroup(1)
+    assert tg is not None and tg < 4096 and 4096 % tg == 0
+    T = _quantized(600, 16)
+    for normalize in (True, False):
+        for tiled in (False, True):
+            kw = dict(normalize=normalize, tiled=tiled, columns=200)
+            _assert_same(
+                _run(monkeypatch, T, 12, fused=True, **kw),
+                _run(monkeypatch, T, 12, fused=False, **kw),
+                f"normalize={normalize} tiled={tiled}",
+            )
+
+
+@needs_metal
+def test_kernels_that_cannot_launch_fall_back(monkeypatch):
+    """If no width launches (or the kernels fail to build), the predicate
+    turns False with a warning; dispatch and batch sizing both follow it."""
+    monkeypatch.setattr(kern, "_LAUNCH", {})
+
+    def broken(k, tg):
+        raise RuntimeError("simulated pipeline failure")
+
+    monkeypatch.setattr(kern, "_probe", broken)
+    with pytest.warns(RuntimeWarning, match="compiled reduction"):
+        assert not eng._fused_reducer(5)
+    assert not eng._fused_reducer(5)  # cached: one warning per process and k
+    engine = _FakeEngine(131_023, 50)
+    assert eng.default_chunk_size(engine, engine.l, 5, True) == eng.default_chunk_size(
+        engine, engine.l, 5, True, fused=False
+    )
+    A = preprocess_series(np.random.default_rng(14).standard_normal(64).cumsum(), 8)
+    with pytest.raises(RuntimeError, match="cannot run"):
+        kern.FusedReduce(
+            A, A, normalize=True, self_join=True, excl=2, k=5, consts=eng.reduce_consts(8)
+        )
+    T = _nan_inf_const(500, 17)
+    got = mlx_stump.stump(T, 15, k=5)
+    ref = _run(monkeypatch, T, 15, fused=False, k=5)
+    _assert_same(got, ref, "probe failure")

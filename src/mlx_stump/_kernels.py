@@ -15,9 +15,11 @@ reference) is by construction:
 - ``#pragma METAL fp contract(off)``: without it the Metal compiler fuses
   ``x + (m*dmu)*dmu`` (raw mode) and similar products into FMAs, which MLX's
   own kernels do not do;
-- the same float32 constants: ``m``, the host-computed ``float32(1/m)``,
-  ``2m`` and ``4m`` arrive in one input buffer (the compiled step receives
-  the identical values as 0-d arrays);
+- the same float32 constants: the kernels read ``m``, the host-computed
+  ``float32(1/m)``, ``2m`` and ``4m`` from one input buffer; the compiled
+  step receives ``m`` and the same ``float32(1/m)`` as 0-d arrays and forms
+  ``2m`` and ``4m`` on the device, which is exact in float32 for integer
+  ``m``;
 - MLX's NaN-propagating ``maximum``/``minimum`` (``isnan(x) ? x : ...``);
 - the same lexicographic ``(d2, key)`` selection order (see ``_engine``):
   self-joins use ``key = 2*|j - i| + (j > i)``, AB-joins ``key = j``.
@@ -29,9 +31,21 @@ compile; only ``k`` (the register list length) and the threadgroup size are
 template parameters. ``QT`` is indexed directly: MLX binds size-1 inputs in
 the ``constant`` address space, so aliasing it as a ``device`` pointer would
 not compile for a one-window series.
+
+Before first use, ``launch_threadgroup(k)`` dispatches every variant of the
+``k`` kernel once on a tiny input: MLX rejects a threadgroup wider than the
+pipeline's ``maxTotalThreadsPerThreadgroup``, which depends on the GPU and
+the kernel's register use, so the preferred width is halved until all
+variants launch (the lexicographic reduction does not depend on it). If
+none does, or the kernel fails to build, the dispatch predicate
+(``_engine._fused_reducer``) sends ``k`` to the compiled fallback, whose
+batches it also sizes.
 """
 
 from __future__ import annotations
+
+import warnings
+from types import SimpleNamespace
 
 import mlx.core as mx
 import numpy as np
@@ -291,22 +305,27 @@ def _topk_source(normalize: bool, self_join: bool) -> str:
 
 
 def topk_threadgroup(k: int) -> int:
-    """Threads per row for the top-k kernel: the per-thread lists live in
-    threadgroup memory during the merge, so wide lists get fewer threads."""
+    """Preferred threads per row for the top-k kernel: the per-thread lists
+    live in threadgroup memory during the merge, so wide lists get fewer
+    threads."""
     tg = 256
     while tg > 32 and tg * k * 8 > 16 * 1024:
         tg //= 2
     return tg
 
 
-def topk_threadgroup_bytes(k: int) -> int:
-    """Threadgroup memory of the top-k kernel: the value/key lists plus the
-    left/right reduction scratch."""
-    tg = topk_threadgroup(k)
+def topk_threadgroup_bytes(k: int, tg: int | None = None) -> int:
+    """Threadgroup memory of the top-k kernel at ``tg`` threads (default: the
+    preferred width, the largest it launches with): the value/key lists plus
+    the left/right reduction scratch."""
+    tg = topk_threadgroup(k) if tg is None else tg
     return tg * k * 8 + 2 * 8 * max(1, tg // 32)
 
 
 _KERNELS: dict = {}
+# k -> the threadgroup width all four variants of the k kernel launch with
+# on this GPU, or None when they cannot run here (see launch_threadgroup)
+_LAUNCH: dict = {}
 
 
 def _kernel(kind: str, normalize: bool, self_join: bool):
@@ -335,7 +354,8 @@ class FusedReduce:
     Same call convention and outputs as ``_engine.ReduceStep``: ``full(QT,
     s0)`` / ``block(QT, s0, j0, j1)`` for the batch whose first query row is
     ``s0``; indices are block-local int32. A top-k list is always ``k`` wide:
-    columns beyond the block's width hold ``(inf, -1)``.
+    columns beyond the block's width hold ``(inf, -1)``. ``threadgroup``
+    overrides the probed width (``launch_threadgroup``; the probe passes it).
     """
 
     def __init__(
@@ -348,9 +368,13 @@ class FusedReduce:
         excl: int,
         k: int,
         consts: np.ndarray,
+        threadgroup: int | None = None,
     ):
         if not 1 <= k <= FUSED_TOPK_MAX:
             raise ValueError(f"fused reduction supports 1 <= k <= {FUSED_TOPK_MAX}, got {k}")
+        tg = launch_threadgroup(k) if threadgroup is None else threadgroup
+        if tg is None:
+            raise RuntimeError(f"the fused k={k} kernels cannot run on this device")
         self.k = k
         self.self_join = self_join
         self.excl = int(excl)
@@ -361,20 +385,19 @@ class FusedReduce:
             self._q = (query.ssq_mx, query.mu_mx, query.isfinite_mx)
             self._t = (target.ssq_mx, target.mu_mx, target.isfinite_mx)
         self._consts = mx.array(consts)
+        self._tg = tg
         if k == 1:
             self._kern = _kernel("argmin", normalize, self_join)
-            self._tg = _ARGMIN_TG
-            self._template = [("TG", self._tg)]
+            self._template = [("TG", tg)]
         else:
             self._kern = _kernel("topk", normalize, self_join)
-            self._tg = topk_threadgroup(k)
-            tg_bytes = topk_threadgroup_bytes(k)
+            tg_bytes = topk_threadgroup_bytes(k, tg)
             assert tg_bytes <= _TG_MEM_LIMIT, f"top-k kernel needs {tg_bytes} B threadgroup memory"
-            self._template = [("TG", self._tg), ("KK", k)]
+            self._template = [("TG", tg), ("KK", k)]
 
     def _run(self, QT, s0: int, j0: int):
         B = QT.shape[0]
-        par = mx.array([s0, j0, self.excl], dtype=mx.int32)
+        par = mx.array([int(s0), int(j0), self.excl], dtype=mx.int32)
         lr_shapes = [(B,)] * 4 if self.self_join else []
         lr_dtypes = [mx.int32, mx.float32] * 2 if self.self_join else []
         if self.k == 1:
@@ -397,3 +420,62 @@ class FusedReduce:
 
     def block(self, QT, s0: int, j0: int, j1: int):
         return self._run(QT, s0, j0)
+
+
+def _probe(k: int, tg: int) -> None:
+    """Build and dispatch all four variants (z-normalized/raw x self/AB-join)
+    of the ``k`` kernel at ``tg`` threads on a tiny input with the real
+    input dtypes; raises what MLX raises."""
+    n = 64
+    stats = mx.zeros((n,), dtype=mx.float32)
+    flags = mx.zeros((n,), dtype=mx.bool_)
+    series = SimpleNamespace(
+        sig_inv_mx=stats,
+        isconstant_mx=flags,
+        isfinite_mx=mx.ones((n,), dtype=mx.bool_),
+        ssq_mx=stats,
+        mu_mx=mx.zeros((n, 2), dtype=mx.float32),
+    )
+    consts = np.array([8.0, 1.0 / 8.0, 16.0, 32.0], dtype=np.float32)
+    QT = mx.zeros((2, n), dtype=mx.float32)
+    outs = []
+    for normalize in (True, False):
+        for self_join in (True, False):
+            red = FusedReduce(
+                series,
+                series,
+                normalize=normalize,
+                self_join=self_join,
+                excl=1,
+                k=k,
+                consts=consts,
+                threadgroup=tg,
+            )
+            outs.extend(red.full(QT, 0))
+    mx.eval(*outs)
+
+
+def launch_threadgroup(k: int) -> int | None:
+    """Threads per row the ``k`` kernels launch with on this GPU, or None
+    when they cannot run here; probed once per process and ``k`` (see the
+    module docstring). Call only with a Metal GPU as the default device."""
+    if k not in _LAUNCH:
+        tg = _ARGMIN_TG if k == 1 else topk_threadgroup(k)
+        err = None
+        while tg >= 32:
+            try:
+                _probe(k, tg)
+                break
+            except Exception as exc:  # any failure: not at this width
+                err = exc
+                tg //= 2
+        else:
+            warnings.warn(
+                f"mlx_stump: the fused Metal kernels for k={k} cannot run on this GPU "
+                f"({err}); using the slower compiled reduction.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            tg = None
+        _LAUNCH[k] = tg
+    return _LAUNCH[k]

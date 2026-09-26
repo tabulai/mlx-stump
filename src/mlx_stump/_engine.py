@@ -34,10 +34,11 @@ self-joins also keep the left and right minima) or top-k lists by one of two
 bit-identical implementations, chosen by the single predicate
 ``_fused_reducer(k)``:
 
-- ``_kernels.FusedReduce`` (a Metal GPU that is MLX's default device, and
-  ``k <= 16``): one threadgroup per query row reads each QT element once
-  and evaluates the distance in registers, so QT is the only ``(B, width)``
-  buffer of the batch;
+- ``_kernels.FusedReduce`` (a Metal GPU that is MLX's default device,
+  ``k <= 16``, and kernels that launch there, probed once per process): one
+  threadgroup per query row reads each QT element once and evaluates the
+  distance in registers, so QT is the only ``(B, width)`` buffer of the
+  batch;
 - ``ReduceStep``, one ``mx.compile`` graph (the CPU device, ``k > 16``, and
   the reference in the tests), which materializes the distances, masked
   variants and top-k sort buffers.
@@ -96,7 +97,13 @@ _TOPK_CHUNK = 1024
 # QT, the reduction outputs and, on the compiled fallback, the squared
 # distances, masked left/right variants and top-k sort/gather buffers).
 # Actual peak memory also includes the per-call constants (the window
-# matrix or one tile of it) on top of this.
+# matrix or one tile of it) and the O(l) per-series device arrays (window
+# stats and masks, 14-18 B per window and series, and the fallback's 4 B
+# column index) on top of this. The k == 1 sweeps fill the budget: their
+# cells carry no headroom (the fused kernels on MLX 0.30 and 0.32, the
+# fallback on 0.30), so measured peaks exceed block + budget by part of
+# those arrays: at n=131072, m=50 by +1.5 MiB (fused, raw self-join; the
+# arrays are 2.3 MiB) and +3.5 MiB (fallback on 0.30, raw AB-join; 5.0 MiB).
 _CHUNK_MEM_BUDGET = 3 << 27  # ~384 MiB
 # Device bytes per QT cell (batch row x target column) live during one
 # batch, measured as the slope of MLX's peak over two explicit batch sizes
@@ -300,7 +307,9 @@ def _fallback_cell(k: int, self_join: bool) -> int:
     of MLX 0.30 and 0.32 (which needs 4 fewer): measured 16/8 (self/AB) at
     k=1; with the two-stage top-k selection 52/32 at k=5-16, 56/36 at k=100
     and 62/42 at k=256 (the chunk winners add ~40*k/_TOPK_CHUNK); 68/48 for
-    the single-stage selection used above k=256."""
+    the single-stage selection used above k=256. The top-k cells keep 4 B of
+    headroom on MLX 0.30; the k == 1 cells are exact there (see
+    ``_CHUNK_MEM_BUDGET``)."""
     if k == 1:
         return 16 if self_join else 8
     if 4 * k <= _TOPK_CHUNK:
@@ -595,8 +604,10 @@ def _topk(d2, key, k: int):
 def reduce_consts(m: int) -> np.ndarray:
     """``[m, 1/m, 2m, 4m]`` in float32; ``1/m`` is rounded once, on the host.
 
-    Both sweep reductions consume exactly these values, which is part of
-    what makes them bit-identical to each other.
+    The fused kernels read all four from one buffer; ``ReduceStep`` receives
+    ``m`` and the same ``1/m`` as 0-d arrays and forms ``2m`` and ``4m`` on
+    the device, which is exact in float32 for integer ``m``. Sharing these
+    values is part of what makes the two reductions bit-identical.
     """
     m = float(m)
     return np.array([m, 1.0 / m, 2.0 * m, 4.0 * m], dtype=np.float32)
@@ -605,15 +616,22 @@ def reduce_consts(m: int) -> np.ndarray:
 def _fused_reducer(k: int) -> bool:
     """The one dispatch predicate: does this process run the fused kernels?
 
-    True only on a Metal GPU that is MLX's default device and for ``k``
-    within the top-k kernel's range. Both the reducer choice
+    True only on a Metal GPU that is MLX's default device, for ``k`` within
+    the top-k kernel's range, and when the ``k`` kernels launch on this GPU
+    (``_kernels.launch_threadgroup``: probed once per process and ``k``;
+    a failure warns and falls back). Both the reducer choice
     (``make_reducer``) and the batch sizing (``default_chunk_size``,
     ``tiled_chunk_size``, ``estimated_peak_bytes``) are derived from it, so a
     batch sized for the fused path's 4 B/cell never reaches the fallback.
     """
-    from ._kernels import FUSED_TOPK_MAX
+    from ._kernels import FUSED_TOPK_MAX, launch_threadgroup
 
-    return k <= FUSED_TOPK_MAX and mx.metal.is_available() and mx.default_device() == mx.gpu
+    return (
+        k <= FUSED_TOPK_MAX
+        and mx.metal.is_available()
+        and mx.default_device() == mx.gpu
+        and launch_threadgroup(k) is not None
+    )
 
 
 def make_reducer(
@@ -746,12 +764,14 @@ class ReduceStep:
         self._compiled = mx.compile(step)
 
     def full(self, QT, s0: int):
+        s0 = int(s0)
         e = s0 + QT.shape[0]
         qa, qb, qf = (x[s0:e] for x in self._q)
         i_col = mx.arange(s0, e)[:, None]
         return self._compiled(QT, qa, qb, qf, i_col, *self._t, self._j_full, *self._consts)
 
     def block(self, QT, s0: int, j0: int, j1: int):
+        s0, j0, j1 = int(s0), int(j0), int(j1)
         e = s0 + QT.shape[0]
         qa, qb, qf = (x[s0:e] for x in self._q)
         i_col = mx.arange(s0, e)[:, None]
