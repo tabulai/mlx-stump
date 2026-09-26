@@ -495,9 +495,13 @@ def test_q_isconstant_accepts_booleans(good):
 # --------------------------------------------------- aamp mixed-scale claim
 def test_aamp_mixed_scale_disagreements_are_float32_near_ties():
     """Index agreement with STUMPY's aamp drops on mixed-scale data (83% at
-    m=7 with a 1e5 segment). The README does not claim equality; what it
-    claims is that every disagreement is a float32 near-tie relative to the
-    distance itself, and the reported P is float64-exact at its own index."""
+    m=7 with a 1e5 segment, re-measured after the sixth review's exact-tie
+    rule: nearly every disagreement is a row on the 1e5 plateau, where all
+    candidates are exactly 0 apart but STUMPY's float64 recurrence reports
+    ~1.4e-3 that differs by diagonal, so its own rounding picks the
+    neighbour). The README does not claim equality; what it claims is that
+    every disagreement is a float32 near-tie relative to the distance
+    itself, and the reported P is float64-exact at its own index."""
     cases = []
     rng = np.random.default_rng(3)
     T = rng.standard_normal(1500)

@@ -7,10 +7,11 @@ import warnings
 import mlx.core as mx
 import numpy as np
 
+from . import _engine
 from ._engine import (
     MassEngine,
-    ReduceStep,
     default_chunk_size,
+    make_reducer,
     query_windows,
     refine_chunk_rows,
     tiled_chunk_size,
@@ -135,20 +136,48 @@ def _batches(l_q: int, B: int):
     cannot reuse (up to another full budget retained after the call), and at
     width 1 would dispatch a GEMV-shaped kernel whose float32 accumulation
     order differs from the batched GEMM. Recomputing ``s - s0`` rows once
-    costs less than one batch."""
+    costs less than one batch. The bounds are Python ints (the device calls
+    reject NumPy integers) and the generator is lazy: a materialized list
+    costs ~170 B per batch, 160 MiB at ``l_q = 10**6`` with ``chunk_size=1``."""
+    l_q, B = int(l_q), int(B)
     for s in range(0, l_q, B):
         e = min(s + B, l_q)
         yield max(0, e - B), s, e
 
 
-def _merge_topk(run_vals, run_idxs, blk_vals, blk_idxs, k):
-    """Row-wise merge of two ascending top-k sets; earlier (lower-index)
-    candidates win ties because the running set sorts first under stable
-    argsort and blocks arrive in ascending column order."""
+def _tie_keys(idxs, rows, self_join: bool):
+    """The sweep's exact-tie key for global columns ``idxs`` of query
+    ``rows``: ``2*|j - i| + (j > i)`` for self-joins (nearest in time, then
+    left, as STUMPY's diagonal traversal), the column itself for AB-joins."""
+    if not self_join:
+        return idxs
+    off = idxs - rows[:, None]
+    key = np.abs(off)
+    key *= 2
+    key += off > 0
+    return key
+
+
+def _merge_topk(run_vals, run_idxs, blk_vals, blk_idxs, k, rows=None):
+    """Row-wise merge of two top-k sets, each ascending in ``(value, key)``,
+    keeping the k smallest in that lexicographic order. ``rows`` (the global
+    query row of each line) selects the self-join key; without it the key is
+    the column (AB-joins). Entries with an infinite value carry index -1 and
+    order arbitrarily among themselves; they are reported as (inf, -1)."""
     allv = np.concatenate([run_vals, blk_vals], axis=1)
     alli = np.concatenate([run_idxs, blk_idxs], axis=1)
-    order = np.argsort(allv, axis=1, kind="stable")[:, :k]
+    keys = _tie_keys(alli, rows, rows is not None)
+    order = np.lexsort((keys, allv), axis=1)[:, :k]
+    del keys
     return np.take_along_axis(allv, order, axis=1), np.take_along_axis(alli, order, axis=1)
+
+
+def _query_args(batches, query, normalize):
+    """Yield each batch's float32 query windows, built one batch ahead: the
+    caller asks for batch i+1 while batch i runs on the GPU. ``batches`` is
+    a second ``_batches`` generator running one step ahead of the sweep's."""
+    for s0, _, e in batches:
+        yield query_windows(query, s0, e, normalize=normalize)
 
 
 def _compute_profile_tiled(
@@ -165,13 +194,16 @@ def _compute_profile_tiled(
 
     The target window matrix is streamed as column blocks (each block
     doubly-centered exactly like the single-block path), and per-row minima /
-    top-k sets are merged across blocks on the CPU. Blocks arrive in
-    ascending column order and merges use strict ``<``, so on exact ties the
-    lowest column index wins — the same first-minimum semantics as a full-row
-    argmin.
+    top-k sets are merged across blocks on the CPU in the sweep's
+    lexicographic ``(d2, key)`` order (see ``_engine.ReduceStep``). Blocks
+    arrive in ascending column order: on the right (and in AB-joins) an
+    earlier block's equal minimum is the nearer / lower column and a strict
+    ``<`` keeps it, while on the left a later block's is nearer and ``<=``
+    takes it. The result is identical to the dense sweep's.
     """
     l_q = query.l
-    B = chunk_size or tiled_chunk_size(engine, l_q, k, self_join)
+    fused = _engine._fused_reducer(k)
+    B = chunk_size or tiled_chunk_size(engine, l_q, k, self_join, fused=fused)
 
     IL = np.full(l_q, -1, dtype=np.int64)
     IR = np.full(l_q, -1, dtype=np.int64)
@@ -187,18 +219,18 @@ def _compute_profile_tiled(
         rPk2 = np.full((l_q, k), np.inf, dtype=np.float32)
         rIk = np.full((l_q, k), -1, dtype=np.int64)
 
-    step = ReduceStep(engine, normalize=normalize, self_join=self_join, excl=excl, k=k)
+    red = make_reducer(
+        query, engine, normalize=normalize, self_join=self_join, excl=excl, k=k, fused=fused
+    )
     for j0, j1, W in engine.target_blocks():
-        j_row = mx.arange(j0, j1)[None, :]
+        Qs = _query_args(_batches(l_q, B), query, normalize)
+        Q = next(Qs)
         for s0, s, e in _batches(l_q, B):
             off = s - s0
-            Q = query_windows(query, s0, e, normalize=normalize)
-            if normalize:
-                a, b = query.sig_inv_mx[s0:e], query.isconstant_mx[s0:e]
-            else:
-                a, b = query.ssq_mx[s0:e], query.mu_mx[s0:e]
-            i_col = mx.arange(s0, e)[:, None]
-            outs = step.block(mx.matmul(Q, W), a, b, query.isfinite_mx[s0:e], i_col, j0, j1, j_row)
+            outs = red.block(mx.matmul(Q, W), s0, j0, j1)
+            mx.async_eval(*outs)
+            # build the next batch's windows on the CPU while this one runs
+            Q = next(Qs, None)
             mx.eval(*outs)
             # wait for the command buffer's completion handler as well: it is
             # what returns this batch's buffers to the allocator, and without
@@ -209,7 +241,7 @@ def _compute_profile_tiled(
                 # k == 1: (I, P2, Il, Pl2, Ir, Pr2); k > 1: (vals2, idxs, Il, Pl2, Ir, Pr2)
                 pl2 = np.array(outs[3])[off:]
                 il = np.array(outs[2], dtype=np.int64)[off:] + j0
-                upd = pl2 < rPl2[s:e]
+                upd = pl2 <= rPl2[s:e]  # a later block's equal left minimum is nearer
                 rPl2[s:e][upd] = pl2[upd]
                 rIl[s:e][upd] = il[upd]
                 pr2 = np.array(outs[5])[off:]
@@ -231,7 +263,9 @@ def _compute_profile_tiled(
                     pad = k - v.shape[1]
                     v = np.pad(v, ((0, 0), (0, pad)), constant_values=np.inf)
                     ix = np.pad(ix, ((0, 0), (0, pad)), constant_values=-1)
-                rPk2[s:e], rIk[s:e] = _merge_topk(rPk2[s:e], rIk[s:e], v, ix, k)
+                rows = np.arange(s, e) if self_join else None
+                rPk2[s:e], rIk[s:e] = _merge_topk(rPk2[s:e], rIk[s:e], v, ix, k, rows)
+            del outs
         del W  # release this block before the generator builds the next one
 
     if self_join:
@@ -239,8 +273,10 @@ def _compute_profile_tiled(
         IL = np.where(np.isfinite(pl2), rIl, -1)
         pr2 = rPr2.astype(np.float64)
         IR = np.where(np.isfinite(pr2), rIr, -1)
-        # combined left/right minimum IS the global minimum; ties go left
-        left_better = pl2 <= pr2
+        # the combined left/right minimum IS the global one; exact ties go to
+        # the nearer side, and to the left on an equal offset
+        rows = np.arange(l_q)
+        left_better = (pl2 < pr2) | ((pl2 == pr2) & ((rows - rIl) <= (rIr - rows)))
         p2_min = np.where(left_better, pl2, pr2)
         I_min = np.where(left_better, rIl, rIr)
     elif k == 1:
@@ -271,6 +307,9 @@ def _compute_profile(
     """Chunked GPU sweep: returns (P (l,k) f64-in-f32, I, IL, IR) numpy arrays.
 
     ``excl`` is the self-join exclusion-zone half width, ``ceil(m / denom)``.
+    The reduction is the fused Metal kernel or the compiled fallback, per
+    ``_engine._fused_reducer(k)``, and the automatic batch is sized for the
+    one that runs. Exact ties follow STUMPY (see ``_engine.ReduceStep``).
     """
     if engine.tiled:
         return _compute_profile_tiled(
@@ -283,23 +322,28 @@ def _compute_profile(
             excl=excl,
         )
     l_q = query.l
-    B = chunk_size or default_chunk_size(engine, l_q, k, self_join)
+    fused = _engine._fused_reducer(k)
+    B = chunk_size or default_chunk_size(engine, l_q, k, self_join, fused=fused)
 
     P = np.empty((l_q, k), dtype=np.float64)
     I = np.empty((l_q, k), dtype=np.int64)
     IL = np.full(l_q, -1, dtype=np.int64)
     IR = np.full(l_q, -1, dtype=np.int64)
 
-    step = ReduceStep(engine, normalize=normalize, self_join=self_join, excl=excl, k=k)
+    red = make_reducer(
+        query, engine, normalize=normalize, self_join=self_join, excl=excl, k=k, fused=fused
+    )
+    Qs = _query_args(_batches(l_q, B), query, normalize)
+    Q = next(Qs)
     for s0, s, e in _batches(l_q, B):
         off = s - s0
-        Q = query_windows(query, s0, e, normalize=normalize)
-        QT = mx.matmul(Q, engine.W_T)
-        if normalize:
-            a, b = query.sig_inv_mx[s0:e], query.isconstant_mx[s0:e]
-        else:
-            a, b = query.ssq_mx[s0:e], query.mu_mx[s0:e]
-        outs = step.full(QT, a, b, query.isfinite_mx[s0:e], mx.arange(s0, e)[:, None])
+        # QT is passed inline, never bound to a name: a live reference would
+        # keep the B*l*4-byte product alive through the eval below
+        outs = red.full(mx.matmul(Q, engine.W_T), s0)
+        mx.async_eval(*outs)
+        # build the next batch's windows on the CPU while this one runs; still
+        # exactly one live set of device intermediates
+        Q = next(Qs, None)
         mx.eval(*outs)
         mx.synchronize()  # see _compute_profile_tiled: releases this batch's buffers
         if k == 1:
@@ -321,6 +365,7 @@ def _compute_profile(
             IL[s:e] = np.where(np.isfinite(pl2), np.array(outs[2], dtype=np.int64)[off:], -1)
             pr2 = np.array(outs[5], dtype=np.float64)[off:]
             IR[s:e] = np.where(np.isfinite(pr2), np.array(outs[4], dtype=np.int64)[off:], -1)
+        del outs
     return P, I, IL, IR
 
 
