@@ -290,7 +290,7 @@ def test_sigma_repair_known_constant_shortcut(monkeypatch):
     # (the shortcut uses detected constancy, not the user's flags)
     flags = np.zeros(a.shape[0] - w + 1, dtype=bool)
     p = preprocess_series(a, w, normalize=False, isconstant=flags)
-    assert np.all(p.sig_inv[detected] == 0.0)
+    assert np.all(p.ssq[detected] == 0.0)
 
 
 def test_tiled_blocks_are_released(monkeypatch):

@@ -5,11 +5,19 @@ independent project and is not affiliated with or endorsed by the STUMPY
 project or TD Ameritrade.
 """
 
-from ._mass import mass
-from ._match import match
+from ._mass import mass, mass_absolute
+from ._match import aamp_match, match
 from ._mparray import mparray
 from ._stump import stump
 
 __version__ = "0.1.0.dev0"
 
-__all__ = ["stump", "mass", "match", "mparray", "__version__"]
+__all__ = [
+    "stump",
+    "mass",
+    "mass_absolute",
+    "match",
+    "aamp_match",
+    "mparray",
+    "__version__",
+]
