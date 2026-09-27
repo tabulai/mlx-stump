@@ -88,6 +88,7 @@ Distance special cases follow STUMPY's semantics:
 from __future__ import annotations
 
 import os
+import weakref
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 
@@ -619,8 +620,9 @@ class MassEngine:
         step = _center_rows(self.m)
 
         if self.normalize:
+            output_ref = weakref.ref(out)
 
-            def pack_rows(s: int, e: int, output: np.ndarray) -> None:
+            def pack_rows(s: int, e: int) -> None:
                 work = w[s:e].copy()
                 center_rows_stable(work)
                 rms = np.sqrt(np.einsum("ij,ij->i", work, work) / self.m)
@@ -629,7 +631,16 @@ class MassEngine:
                 safe_rms = np.where(active & (rms > 0.0), rms, 1.0)
                 work /= safe_rms[:, None]
                 work[~active] = 0.0
-                output[s:e] = work
+                # Work-item arguments and their traceback must not retain a
+                # strong view of the MLX block after a worker error. The
+                # parent keeps `out` alive until every worker has joined.
+                output = output_ref()
+                if output is None:
+                    raise RuntimeError("target packing output was released before workers finished")
+                try:
+                    output[s:e] = work
+                finally:
+                    del output
                 # Each worker owns disjoint rows of the evaluated block.
                 # Their total live float64 work is at most one centering step.
 
@@ -656,12 +667,12 @@ class MassEngine:
                             end = min(start + step, rows)
                             count = end - start
                             if count < 256 or count * self.m < 1 << 18:
-                                pack_rows(start, end, out)
+                                pack_rows(start, end)
                                 continue
                             work_count = min(workers, max(1, count // 128))
                             width = -(-count // work_count)
                             futures = [
-                                pool.submit(pack_rows, s, min(s + width, end), out)
+                                pool.submit(pack_rows, s, min(s + width, end))
                                 for s in range(start, end, width)
                             ]
                             for future in futures:
@@ -676,7 +687,7 @@ class MassEngine:
                     raise
             else:
                 for s in range(0, rows, step):
-                    pack_rows(s, min(s + step, rows), out)
+                    pack_rows(s, min(s + step, rows))
         else:
             for s in range(0, j1 - j0, step):
                 e = min(s + step, j1 - j0)
