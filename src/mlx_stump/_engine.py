@@ -244,7 +244,7 @@ def estimated_peak_bytes(
     With no explicit chunk size, the automatic byte-budgeted batch is
     modeled; with one, the requested batch (clamped to ``l_q``) is modeled,
     including requests that deliberately exceed the automatic ~384 MiB
-    device budget. The largest of three phases:
+    device budget. The largest of four phases:
 
     - upload: the block, which is built in place in its device buffer, plus
       the centering temporary;
@@ -261,6 +261,9 @@ def estimated_peak_bytes(
       merge each device result into the running set on the host; the two
       concatenations, tie keys, full lexsort permutation, gather results,
       and sorting workspace are included here;
+    - near-zero repair: the resident block, bounded rescan/refinement batches,
+      and the candidate and side-winner arrays used when every query row
+      needs its float32 near-ties checked;
     - assembly: after the device memory is released, the float64
       refinement chunk plus the numeric outputs, the top-k reordering
       temporaries, and the object-dtype ``mparray`` STUMPY's output layout
@@ -348,6 +351,12 @@ def estimated_peak_bytes(
         # Value/index and (for self-joins) left/right conversion vectors.
         host_batch = batch * 32
     sweep = block + device_batch + numeric + accum + host_batch
+    # Worst case: every row survives the near-zero seed check. I/IL/IR stay
+    # live, while best indices/distances, side winners, row indices and masks
+    # add up to < (24*k + 64) bytes per query row. The replay's score matrix
+    # and float64 query/refinement work are separately bounded.
+    repair_batch = (24 << 20) + max(8 << 20, m * 24 + _CENTER_ROW_BYTES)
+    repair = block + l_q * (24 * k + 64) + repair_batch
     refine = refine_chunk_rows(m) * m * 8 * 4
     reorder = l_q * 16 * k if k > 1 else 0  # argsort order + one reordered copy live
     # Object-array pointers plus CPython's allocation-size footprint for the
@@ -364,7 +373,7 @@ def estimated_peak_bytes(
     # only a safety net, and the tests keep it from being taken on the
     # supported MLX versions.
     upload = block + max(_CENTER_BYTES, m * 8 + _CENTER_ROW_BYTES)
-    return max(upload, sweep, assembly)
+    return max(upload, sweep, repair, assembly)
 
 
 def _query_batch_bytes(m: int) -> int:
@@ -893,4 +902,21 @@ def query_windows(
     else:
         source = np.lib.stride_tricks.sliding_window_view(query.Ts, query.m)[start:stop]
         w = source - query.mu[start:stop, None]
+    return mx.array(w.astype(np.float32))
+
+
+def query_windows_at(query: PreprocessedSeries, rows: np.ndarray, *, normalize: bool) -> mx.array:
+    """Build a bounded batch of noncontiguous query windows for tie verification."""
+    rows = np.asarray(rows, dtype=np.int64)
+    if normalize:
+        w = np.lib.stride_tricks.sliding_window_view(query.T, query.m)[rows].copy()
+        center_rows_stable(w)
+        rms = np.sqrt(np.einsum("ij,ij->i", w, w) / query.m)
+        active = query.isfinite[rows] & ~query.isconstant[rows]
+        safe_rms = np.where(active & (rms > 0.0), rms, 1.0)
+        w /= safe_rms[:, None]
+        w[~active] = 0.0
+    else:
+        source = np.lib.stride_tricks.sliding_window_view(query.Ts, query.m)[rows]
+        w = source - query.mu[rows, None]
     return mx.array(w.astype(np.float32))

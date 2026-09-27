@@ -212,7 +212,13 @@ error negligible in practice by:
    windows, with each window's mean and sigma freshly recomputed two-pass —
    a cancellation-free form that stays relatively accurate down to distance
    0 — so reported `P` values use well-conditioned float64 arithmetic for
-   the reported neighbor. `match` refines, the same way, every candidate
+   the reported neighbor. When a float32 top-k or side minimum lies in the
+   near-zero rounding band, `stump` checks the selected neighbors. If they
+   are not already exact zeros, it rescans that query row in bounded GPU
+   blocks and float64-ranks all candidates in the band. This recovers
+   exact duplicates and positive-affine normalized matches evicted by near
+   copies with the same GPU score. Repeated near-zero data can require extra
+   work. `match` refines, the same way, every candidate
    that can pass its threshold. With a fixed threshold and a finite
    `max_matches`, that means only the windows that can be among the greedy
    picks, so `max_distance=np.inf, max_matches=k` refines a narrow band
