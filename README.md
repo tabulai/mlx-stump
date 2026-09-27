@@ -26,7 +26,7 @@ anomaly classification on the same silicon.
 ## Status
 
 **v0.1 development — the batched-MASS engine is implemented and golden-tested
-against STUMPY** (NNN golden and regression tests). Distance profiles are
+against STUMPY** (891 golden and regression tests). Distance profiles are
 computed in bulk on the GPU as dense matmuls against a locally z-normalized
 subsequence matrix (or a doubly-centered shared-frame matrix for raw
 distances) — materialized in one piece for moderate `n*m`, streamed as column
@@ -42,9 +42,9 @@ cell) measured only 1.2–2.2× faster than the fused engine in a prototype, so
 it remains future work. See [Roadmap](#roadmap).
 
 CI runs the suite on macOS 14/15 with Python 3.10/3.12/3.14 plus one job at
-the declared dependency floors (Python 3.10, numpy 1.24, mlx 0.30, STUMPY
-1.13), and fails any test run whose MLX default device is not the Metal GPU
-(`MLX_STUMP_REQUIRE_METAL=1`).
+the exact declared dependency floors (Python 3.10 with numpy 1.24.0, mlx
+0.30.0 and STUMPY 1.13.0), and fails any test run whose MLX default device
+is not the Metal GPU (`MLX_STUMP_REQUIRE_METAL=1`).
 
 ## Install
 
@@ -157,14 +157,17 @@ pre_scrump=False, ...)`: every `update()` computes one exact matrix profile
 for the next window size in `M_` (which lists them in STUMPY's
 breadth-first order), with no `scrump` approximation. `PAN_`, `M_`, `P_`
 and `pan(threshold=0.2, normalize=True, contrast=True, binary=True,
-clip=True)` follow STUMPY. `normalize=False` follows STUMPY's `aamp_stimp`
-(`percentage=1.0, pre_scraamp=False`), `p=2.0` only. `gpu_stimp` takes
-`stumpy.gpu_stimp`'s signature and runs the same computation, so its
-positional calls port unchanged. `stimp` has no `percentage` or
-`pre_scrump` parameter (it always computes the exact profile), so its fifth
-positional parameter is `normalize` where `stumpy.stimp`'s is `percentage`:
-when porting a `stumpy.stimp` call, pass everything after `step` by keyword
-(a positional `0.01` would otherwise bind to `normalize`).
+clip=True)` follow STUMPY, except for read-only `P_` views, integer-only
+window arguments and the order of exactly tied cells (see the `stimp` note
+under [Known limitations](#known-limitations)). `normalize=False` follows
+STUMPY's `aamp_stimp` (`percentage=1.0, pre_scraamp=False`), `p=2.0` only.
+`gpu_stimp` takes `stumpy.gpu_stimp`'s signature and runs the same
+computation, so its positional calls port unchanged. `stimp` has no
+`percentage` or `pre_scrump` parameter (it always computes the exact
+profile), so its fifth positional parameter is `normalize` where
+`stumpy.stimp`'s is `percentage`: when porting a `stumpy.stimp` call, pass
+everything after `step` by keyword (a positional `0.01` would otherwise
+bind to `normalize`).
 
 ```python
 pan = mlx_stump.stimp(T, min_m=8, max_m=264, step=8)
@@ -225,14 +228,25 @@ error negligible in practice by:
    against an independent float64 oracle and STUMPY. The exclusion zone is
    `ceil(m / stumpy.config.STUMPY_EXCL_ZONE_DENOM)`, read at call time
    whenever STUMPY has been imported (otherwise STUMPY's default
-   denominator of 4). Exact ties resolve by STUMPY's own rule: in self-joins
-   the nearest-in-time candidate wins, and the left one on an equal offset
-   (the order of STUMPY's diagonal traversal), for `I_`, `left_I_`,
-   `right_I_` and every top-k column; AB-joins take the lowest index (for
-   the order of raw top-k ties see [Known limitations](#known-limitations)).
-   The golden suite asserts exact index equality with
+   denominator of 4). Any positive finite denominator works, however
+   extreme: a zone wider than the series gives STUMPY's all-inf self-join
+   profile. Exact ties resolve by STUMPY's own rule: in self-joins the
+   nearest-in-time candidate wins, and the left one on an equal offset (the
+   order of STUMPY's diagonal traversal), for `I_`, `left_I_`, `right_I_`
+   and every top-k column; AB-joins take the lowest index (raw top-k ties
+   can differ from STUMPY in order and membership; see
+   [Known limitations](#known-limitations)). In raw mode
+   (`normalize=False`) this covers zero-distance ties (identical windows,
+   constant or not): every window's statistics come from one fixed
+   pairwise summation of its own values, so identical windows are exactly
+   tied in the float32 search as well. Exact ties at nonzero distance
+   between different raw windows cannot be ordered by a float32 search
+   (e.g. 619 of 2,493 `I_` rows on iid {0, 1, 2} integers, `m=8`). The
+   golden suite asserts exact index equality with
    `stumpy.stump`/`stumpy.aamp` on constant, flatline and NaN-segmented
-   series.
+   series, and with `stumpy.aamp` on the zero-distance rows of periodic
+   integer, periodic dyadic and planted-motif series (dense and tiled,
+   fused kernels and fallback).
 
 Precision metrics are asserted in the test suite and published next to every
 benchmark number. Published `idx agree` is strict index equality; the golden
@@ -346,9 +360,10 @@ python bench/bench_stump.py --sizes 524288 1048576 --m 200 --repeat 1 --seed 0 -
   `T_A_subseq_isconstant`/`T_B_subseq_isconstant`, `Q_subseq_isconstant`)
   follow STUMPY's contract: `f(a, w)` is called on a copy of the series with
   inf replaced by NaN and returns a boolean array. Each callable is
-  evaluated once per call. STUMPY's own `match` alone hands its callable the
-  series with raw inf, so a callable that treats inf and NaN differently can
-  flag different windows there. With `normalize=False` the flags are
+  evaluated once per call. Of the STUMPY functions mlx-stump mirrors, only
+  `match` hands its callable the series with raw inf (as do STUMPY's
+  `stumpi` and `motifs`), so a callable that treats inf and NaN differently
+  can flag different windows there. With `normalize=False` the flags are
   validated (so a callable is evaluated) and then ignored; STUMPY does not
   evaluate them in that mode.
 - `mass`/`match` operate on 1-D series. For compatibility, a single-column
@@ -376,11 +391,12 @@ python bench/bench_stump.py --sizes 524288 1048576 --m 200 --repeat 1 --seed 0 -
   read ~1e-3 rather than ~1e-8. `stump` and `match` re-evaluate their reported
   distances in float64, so their outputs don't carry this floor.
 - The fused kernels are test-launched once per process and `k`. If a GPU
-  cannot run them, mlx-stump emits a `RuntimeWarning` and uses the compiled
-  reduction, which is slower (about 2–9× here) and uses smaller batches. The
-  results are the same bit for bit. Only `k` and the kernel threadgroup width
-  are compile-time parameters, so a new window size `m` does not trigger a
-  new Metal compile.
+  cannot run them, mlx-stump emits a `RuntimeWarning` (attributed to the
+  user's calling line) and uses the compiled reduction, which is slower
+  (about 2–9× here) and uses smaller batches. The results are the same bit
+  for bit. Only `k` and the kernel threadgroup width are compile-time
+  parameters, so a new window size `m` does not trigger a new Metal
+  compile.
 - Memory is bounded by three fixed budgets rather than by `n·m`: the
   resident window block (the whole float32 subsequence matrix when it is
   ≤ 256 MiB, otherwise ~128 MiB column blocks, at least four windows wide,
@@ -391,24 +407,30 @@ python bench/bench_stump.py --sizes 524288 1048576 --m 200 --repeat 1 --seed 0 -
   measured device bytes per distance-matrix cell of the reduction that
   runs — 4 B for the fused Metal kernels, which materialize only the QT
   product, 8–72 B for the compiled fallback used on the CPU device and for
-  `k > 16`; the O(n) per-series device arrays (window statistics and masks,
-  14–18 B per window) come on top of it; each batch is synchronized before
-  the next one allocates, and the trailing batch is computed at full width
-  so no second set of buffers ever exists), and bounded CPU temporaries
-  (block centering and sigma repair are ≤ 64 MiB each; the refinement's
-  float64 windows are ≤ 256 MiB in total across its threads and are
-  processed after the window matrix and MLX's cached batch buffers have been
-  released). Tiled top-k joins additionally need a batch-sized host merge
-  workspace for concatenation, tie keys, lexicographic sorting, and
-  gathering (≤ 85 B per neighbor per row measured); it scales with
-  `batch_rows·k`, is charged per row when the batch is sized, and is
-  included in the peak estimate. Each block exists twice while it is
-  uploaded (numpy staging plus the device copy), so the dominant modeled
-  peak beyond the O(n) series arrays is estimated as
-  `2·block + max(64 MiB, 8·m + 128 B)` during upload (the second term
-  includes the documented one-window float64 floor) or `block + 384 MiB`
-  during the sweep, plus numeric/object outputs —
-  ~640 MiB for the largest dense block, ~512 MiB in tiled mode at `k=1`
+  `k > 16`; the O(n) per-series device arrays (window statistics and
+  masks: 6 B per window in normalized mode, 13 B in raw mode, per series,
+  plus a 4 B column index per target window on the compiled fallback) come
+  on top of it; each batch is synchronized before the next one allocates,
+  the trailing batch is computed at full width, and MLX's cache is cleared
+  once where tiled blocks narrow by a column, so no second set of buffers
+  ever exists), and bounded CPU temporaries (block centering and sigma
+  repair are ≤ 64 MiB each; the refinement's float64 windows are ≤ 256 MiB
+  in total across its threads and are processed after the window matrix
+  and MLX's cached batch buffers have been released). Tiled top-k joins
+  additionally need a batch-sized host merge workspace for concatenation,
+  tie keys, lexicographic sorting, and gathering (≤ 85 B per neighbor per
+  row measured); it scales with `batch_rows·k`, is charged per row when
+  the batch is sized, and is included in the peak estimate. Each block is
+  built in place: its centered float64 chunks are cast straight into the
+  block's own device buffer (unified memory), so no host staging copy
+  exists (checked on MLX 0.30 and 0.32; an MLX that does not export the
+  buffer writable gets a NumPy-staged build, which holds one more block).
+  The dominant modeled peak beyond the O(n) series arrays is therefore
+  estimated as `block + max(64 MiB, 8·m + 128 B)` during the build (the
+  second term includes the documented one-window float64 floor) or
+  `block + 384 MiB` during the sweep, plus numeric/object outputs —
+  ~640 MiB for the largest dense block (n=68,000, m=1000, k=1, where RSS
+  grew 434–475 MiB in fresh interpreters), ~512 MiB in tiled mode at `k=1`
   (`mlx_stump.estimated_peak_bytes(l, m, k, self_join, l_q, chunk_size,
   fused)` gives that phase estimate; `fused` defaults to the reduction this
   process runs). The O(n) arrays come on top and are deliberately excluded
@@ -419,33 +441,39 @@ python bench/bench_stump.py --sizes 524288 1048576 --m 200 --repeat 1 --seed 0 -
   mode it peaks at about 4.5x, of which about 3.25x is retained for the
   search: the standardized series, its rolling means and centered sums of
   squares, and the window masks (tracemalloc, n=1e7, m=100). End to end at
-  n=3e7 (a 229 MiB series, random walk with NaN, m=100), `mass`/`match` grow
-  RSS above the series by about 1,060 MiB normalized and by about
-  2,110/2,340 MiB raw.
-  For large `k` the output itself dominates:
-  STUMPY's
-  object-dtype `mparray` layout costs a pointer plus a CPython allocator
-  block per cell, ~80 resident bytes per neighbor per row (n=50,000, m=50,
-  k=100: ~385 MiB for the returned array alone), which the estimate includes
-  together with the top-k reordering temporaries. The canonical case's
-  process RSS growth after a warm-up (measured as in
-  `test_large_topk_within_estimate`) is ~597 MiB (592.1–604.0 MiB over 18
-  fresh-interpreter runs on an M4 Max, macOS 26.6.2) against a ~638 MiB
-  estimate: about 6% headroom, 5% for the largest run. It is an estimate
-  with headroom, not a literal cap: MLX's allocator rounds buffers up (about
-  +0.5% observed), a
-  gigantic `l` can make even a one-row batch exceed the intermediates
-  budget, and the figures are MLX's own active-memory peak plus host
-  memory (GPU-written buffers do not show up in RSS on macOS, only in the
-  process footprint). `mass`/`match`
-  evaluate one block at a time and never hold more, and every device array
-  is dropped before the cache is cleared, so no per-series allocation stays
-  cached after a call returns. MLX may retain a small runtime/allocator
-  baseline (2.6 MiB on one hosted-runner image). For `stump`, pass
-  `chunk_size` to trade memory for larger batches, and pass the same value to
-  `estimated_peak_bytes` because an explicit batch is allowed to exceed the
-  automatic 384 MiB budget. `mass` and `match` always use automatic block
-  streaming.
+  n=3e7 (a 229 MiB series, random walk, m=100), `mass`/`match` grow RSS
+  above the series by about 1,060 MiB normalized and by about 2,080 /
+  2,310–2,365 MiB raw, whatever the NaN density (measured with 0, 300,
+  3,000 and 30,000 = 0.1% NaNs; raw `match` varies by ~50 MiB from run to
+  run). For large `k` the output itself dominates: STUMPY's object-dtype
+  `mparray` layout costs a pointer plus a CPython allocator block per cell,
+  ~80 resident bytes per neighbor per row (n=50,000, m=50, k=100: ~385 MiB
+  for the returned array alone), which the estimate includes together with
+  the top-k reordering temporaries. The canonical case's process RSS
+  growth after a warm-up (measured as in `test_large_topk_within_estimate`)
+  is ~588 MiB (585.3–592.8 MiB over 10 fresh-interpreter runs on an M4
+  Max, macOS 26.6.2) against a ~638 MiB estimate: about 8% headroom, 7%
+  for the largest run. It is an estimate with headroom, not a literal cap:
+  MLX's allocator rounds buffers up (about +0.5% observed), a gigantic `l`
+  can make even a one-row batch exceed the intermediates budget, the
+  figures are MLX's own active-memory peak plus host memory (GPU-written
+  buffers do not show up in RSS on macOS, only in the process footprint),
+  and memory one phase frees is not always returned before the next
+  allocates: Metal releases cleared buffers asynchronously (tens to
+  ~200 ms after `mx.clear_cache()`) and macOS keeps freed large host
+  temporaries resident, so at large `m` the refinement's float64 chunks
+  (≤ 256 MiB) can land on part of the sweep's footprint (tiled n=60,000,
+  m=4000, k=1 and k=5: RSS grew 555–571 MiB against 508–516 MiB
+  estimates). `mass`/`match` evaluate one block at a time and never hold
+  more, and every device array is dropped before the cache is cleared, so
+  no per-series allocation stays cached after a call returns or raises: an
+  error or Ctrl-C in the GPU phase of `stump`, `mass` or `match` releases
+  the window block and batch buffers before the exception propagates. MLX
+  may retain a small runtime/allocator baseline (2.6 MiB on one
+  hosted-runner image). For `stump`, pass `chunk_size` to trade memory for
+  larger batches, and pass the same value to `estimated_peak_bytes` because
+  an explicit batch is allowed to exceed the automatic 384 MiB budget.
+  `mass` and `match` always use automatic block streaming.
 - Out-of-range `query_idx` values (including negative ones) raise
   `ValueError`. STUMPY silently wraps `query_idx <= -m` through numpy
   negative indexing and fabricates a zero-distance match at a negative
@@ -536,28 +564,41 @@ python bench/bench_stump.py --sizes 524288 1048576 --m 200 --repeat 1 --seed 0 -
   all exactly 0 apart. mlx-stump resolves them by STUMPY's nearest-in-time
   tie rule, but STUMPY's float64 `aamp` recurrence leaves ~1.4e-3 of
   rounding over that segment's 1e10-scale squared terms, different on each
-  diagonal, so its own noise picks the neighbor (where STUMPY's recurrence
-  is exact, e.g. dyadic-valued data, the choices agree exactly). Every
-  disagreement is a float32 near-tie *relative to
-  the distance itself* — the two candidates' true distances differ by
-  ~1e-7 of their magnitude (≤ 5e-7 in those two cases, which the test
-  suite asserts: 3.6e-5 raw units on a ~1.7e5 distance, 0.08 on a ~4e6
-  one; up to ~5e-6 on long series with large `m`). The reported `P` is
-  directly recomputed in float64 for the chosen neighbor, and `match` widens its
-  re-evaluation cutoff per-window so true matches are not dropped. From
-  ~1e6 of dynamic range on, STUMPY's own CPU `aamp` — a float64 diagonal
-  recurrence over terms of the segment's squared magnitude — drifts (its
-  `P` is off by ~1e-2 at 1e6, ~0.5 at 1e7, ~5 at 1e8 on unit-scale rows,
-  and it can pick neighbors far from the true nearest), so agreement with
-  it stops being a precision metric there; measured against direct float64
-  evaluation, mlx-stump's neighbor gaps stay ≤ ~1e-7 relative and its `P`
-  agrees with that evaluation up to the ~1e13 standardization limit.
-- With `normalize=False` and `k > 1`, `stumpy.aamp` lists exactly tied
-  members of a top-k row in reverse traversal order (it inserts a new tie in
-  front of equal entries, which also depends on its thread partitioning);
-  mlx-stump keeps the nearest-first order it uses everywhere else. The
-  neighbor sets agree; `stump` (normalized, any `k`) and `k = 1` follow
-  STUMPY exactly.
+  diagonal, so its own noise picks the neighbor. Where STUMPY's recurrence
+  is exact, zero-distance ties between identical windows agree exactly
+  (integer or dyadic data: all 1,091 rows of a 30-fold tile of a 37-sample
+  integer pattern at `m=20`). Every disagreement is a float32 near-tie
+  *relative to the distance itself* — the two candidates' true distances
+  differ by ~1e-7 of their magnitude (≤ 5e-7 in those two cases, which the
+  test suite asserts: 3.6e-5 raw units on a ~1.7e5 distance, 0.08 on a
+  ~4e6 one; up to ~5e-6 on long series with large `m`). The reported `P`
+  is directly recomputed in float64 for the chosen neighbor, and `match`
+  widens its re-evaluation cutoff per-window so true matches are not
+  dropped. From ~1e6 of dynamic range on, STUMPY's own CPU `aamp` — a
+  float64 diagonal recurrence over terms of the segment's squared
+  magnitude — drifts (its `P` is off by ~1e-2 at 1e6, ~0.5 at 1e7, ~5 at
+  1e8 on unit-scale rows, and it can pick neighbors far from the true
+  nearest), so agreement with it stops being a precision metric there;
+  measured against direct float64 evaluation, mlx-stump's neighbor gaps
+  stay ≤ ~1e-7 relative and its `P` agrees with that evaluation up to the
+  ~1e13 standardization limit.
+- With `normalize=False` and `k > 1`, `stumpy.aamp`'s choice among exactly
+  tied top-k candidates depends on its traversal. Within a thread it
+  inserts a new tie in front of equal entries, so a later smaller distance
+  evicts the *nearest* member of a tied group; its cross-thread merge then
+  fills the remaining slots from each later thread in that reversed order.
+  Both the order and the set of tied members therefore vary with the
+  series and with `NUMBA_NUM_THREADS`: on the integer tile above at `k=3`,
+  148 of 1,091 rows keep their 3 nearest copies at 16 threads, against all
+  1,091 single-threaded. mlx-stump orders the candidates its float32 search
+  sees as exactly tied by (distance, nearest in time, left first on an
+  equal offset), the rule it uses everywhere else; identical raw windows
+  are such ties (see [Precision](#precision)), so on that tile every row
+  keeps its 3 nearest copies. Compare raw top-k results with STUMPY by
+  distance, not by index set. Normalized `stump` (any `k`) is
+  thread-independent in STUMPY, and its exact ties resolve exactly as
+  there; with raw `k = 1`, zero-distance ties do wherever STUMPY's float64
+  recurrence is exact (e.g. integer or dyadic data).
 - On smooth, highly self-similar series (a clean periodic signal with
   small noise) most rows have many near-tied period-repeat candidates, and
   the float32 search often resolves them differently from STUMPY (≈60% of
@@ -572,6 +613,21 @@ python bench/bench_stump.py --sizes 524288 1048576 --m 200 --repeat 1 --seed 0 -
   variation warns that those smallest raw distances may be unreliable. This
   is not an absolute-units limit: uniformly rescaling an ordinary finite
   series from subnormal-scale values through ~1e300 remains scale-safe.
+  `stimp`'s raw `pan()` is scale-safe too: it runs under
+  `np.errstate(all="raise")` and emits no floating-point `RuntimeWarning`
+  on `2**-1060`-, 1e307- and 1.7e308-scale series, or on one mixing
+  1e-300- and 1e305-scale halves.
+- `stimp`/`gpu_stimp` differ from STUMPY's pan matrix profile in three
+  ways. `P_` returns read-only views of the internal pan array (use
+  `.copy()` to edit one), where STUMPY's are writeable. `min_m`, `max_m`
+  and `step` must be integers (a float raises `TypeError`); STUMPY also
+  accepts floats and truncates them to int64. On series with large groups
+  of exactly tied distances (exactly periodic or discrete-valued data, or
+  constant runs with `normalize=False`), the rank-based contrast can order
+  tied cells differently, so some binary `PAN_` cells differ while `P_`
+  still agrees within float tolerance (292 of 6,000 cells, max |ΔP|
+  3.5e-7, on a 16-fold tile of 25 Gaussian samples at `m` = 4 to 60 in
+  steps of 4).
 - Streaming updates (`stumpi`) are not GPU-accelerated: `stumpi.update` runs
   on STUMPY's CPU path. The expensive initial profile can come from the GPU:
   ```python
@@ -582,10 +638,12 @@ python bench/bench_stump.py --sizes 524288 1048576 --m 200 --repeat 1 --seed 0 -
   mismatch is accepted silently and gives wrong distances (raw mode is `p=2`
   only). With a custom `T_subseq_isconstant_func`, pass the same mask to
   `mlx_stump.stump` as
-  `T_A_subseq_isconstant=stumpy.core.process_isconstant(T, m, func)`. Row
-  indices differ from stumpi's own start-up only where `mlx_stump.stump`'s
-  indices already differ from `stumpy.stump`'s (see the tie notes under
-  [Precision](#precision)).
+  `T_A_subseq_isconstant=stumpy.core.process_isconstant(T, m, func)`
+  (pass this mask, not `func` itself: stumpi evaluates `func` on the raw
+  series, inf included, whereas `mlx_stump.stump` replaces inf by NaN
+  first, so the two masks can differ). Row indices differ from stumpi's
+  own start-up only where `mlx_stump.stump`'s indices already differ from
+  `stumpy.stump`'s (see the tie notes under [Precision](#precision)).
 
 ## License
 

@@ -243,8 +243,11 @@ def _golden_ties(monkeypatch, name, normalize, tiled, fused, k=1):
 )
 def test_self_join_exact_ties_match_stumpy(monkeypatch, name, normalize, tiled, fused):
     """Exact ties resolve like STUMPY: nearest in time, left on an equal
-    offset. (A periodic raw-mode series is left out: its float32 near-ties
-    are not exact ties for STUMPY either.)"""
+    offset. (The raw sine_flatline case is left out: STUMPY's float64 aamp
+    recurrence does not reach exact zeros on that series' flatline windows,
+    so its own rounding picks among them. Raw ties between identical
+    non-constant windows are pinned against stumpy.aamp in
+    test_sixth_review_final_prep.py.)"""
     T, m, ref, mp = _golden_ties(monkeypatch, name, normalize, tiled, fused)
     for f in ("I_", "left_I_", "right_I_"):
         np.testing.assert_array_equal(getattr(mp, f), getattr(ref, f), err_msg=f)
@@ -265,8 +268,12 @@ def test_topk_exact_ties_match_stumpy(monkeypatch, name, tiled, fused):
 @pytest.mark.parametrize("name", ["walk_nan_const", "all_constant"])
 def test_raw_topk_ties_select_stumpys_set(monkeypatch, name):
     """stumpy.aamp inserts an exactly tied candidate in front of the equal
-    entries already held (reverse traversal order); mlx-stump keeps its one
-    nearest-first order. The neighbour sets and left/right indices agree."""
+    entries already held (reverse traversal order), so its tied top-k order
+    and membership depend on its traversal and thread count; mlx-stump
+    keeps its one nearest-first order. On these series every tie is at
+    distance 0 and STUMPY's first thread already holds k of them, so its
+    set equals mlx-stump's nearest-first set at any NUMBA_NUM_THREADS, and
+    the left/right indices agree."""
     T, m, ref, mp = _golden_ties(monkeypatch, name, False, False, True, k=3)
     assert all(
         set(a) == set(b) for a, b in zip(np.asarray(mp.I_), np.asarray(ref.I_), strict=True)

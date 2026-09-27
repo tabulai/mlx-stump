@@ -24,7 +24,9 @@
    timeouts and never resolved the declared dependency floors. CI now
    reports the device, sets ``MLX_STUMP_REQUIRE_METAL=1`` (the conftest
    gate below fails a non-GPU run), lints once with the locked ruff, bounds
-   both jobs, adds a lowest-dependency job and runs ``--strict-markers``.
+   both jobs, adds a lowest-dependency job pinned to the exact floor
+   releases (``==1.24`` is 1.24.0; ``==1.24.*`` resolved to 1.24.4) and
+   runs ``--strict-markers``.
 6. The benchmark's provenance line reported the git state of the current
    directory rather than of the imported package, so a stale install was
    labelled with a clean commit; each size also ran one extra untimed call
@@ -191,7 +193,10 @@ def test_ci_lowest_dependency_job_pins_the_declared_floors():
     floors = dict(re.findall(r'"(mlx|numpy|stumpy)>=([0-9.]+)"', pyproject))
     assert set(floors) == {"mlx", "numpy", "stumpy"}
     for name, floor in floors.items():
-        assert f'"{name}=={floor}.*"' in ci, name
+        # exactly the floor release: PEP 440 zero-pads "==0.30" to 0.30.0,
+        # while "==0.30.*" would install the newest 0.30.x patch (the
+        # closing quote rejects that form)
+        assert f'"{name}=={floor}"' in ci, name
     python = re.search(r'requires-python = ">=([0-9.]+)"', pyproject).group(1)
     include = ci[ci.index("include:") : ci.index("runs-on:")]
     assert f'python-version: "{python}"' in include and "deps: lowest" in include

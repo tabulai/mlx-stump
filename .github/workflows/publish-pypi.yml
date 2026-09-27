@@ -147,6 +147,8 @@ jobs:
       - run: twine check --strict dist/*
       - name: Test the built wheel in a clean environment
         shell: bash
+        env:
+          MLX_STUMP_REQUIRE_METAL: "1"
         run: |
           python -m venv "${RUNNER_TEMP}/wheel-venv"
           "${RUNNER_TEMP}/wheel-venv/bin/python" -m pip install \
@@ -166,9 +168,11 @@ jobs:
           assert "site-packages" in module.as_posix(), module
           print("testing", module, mlx_stump.__version__)
           PY
-          "${RUNNER_TEMP}/wheel-venv/bin/python" -m pytest tests/ -q
+          "${RUNNER_TEMP}/wheel-venv/bin/python" -m pytest tests/ -q -rs
       - name: Build, install, and test from the sdist in a clean environment
         shell: bash
+        env:
+          MLX_STUMP_REQUIRE_METAL: "1"
         run: |
           set -euo pipefail
           sdist_file="$(find "${GITHUB_WORKSPACE}/dist" -maxdepth 1 -name '*.tar.gz' -print -quit)"
@@ -195,7 +199,7 @@ jobs:
           assert "site-packages" in module.as_posix(), module
           print("testing sdist installation", module, mlx_stump.__version__)
           PY
-          "${RUNNER_TEMP}/sdist-venv/bin/python" -m pytest tests -q -p no:cacheprovider
+          "${RUNNER_TEMP}/sdist-venv/bin/python" -m pytest tests -q -rs -p no:cacheprovider
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-dist

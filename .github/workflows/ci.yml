@@ -31,7 +31,11 @@ jobs:
         deps: [latest]
         include:
           # The declared floors (requires-python, numpy>=1.24, mlx>=0.30 and
-          # the dev extra's stumpy>=1.13), which no latest-deps job resolves.
+          # the dev extra's stumpy>=1.13), which no latest-deps job resolves,
+          # as the exact floor releases numpy 1.24.0, mlx 0.30.0 and stumpy
+          # 1.13.0: "==X.Y" matches only X.Y.0, where "==X.Y.*" would take
+          # the newest patch (and mlx adds public API in patch releases).
+          # Python is the newest 3.10.x.
           - os: macos-15
             python-version: "3.10"
             deps: lowest
@@ -50,7 +54,7 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "${DEPS}" == "lowest" ]]; then
-            printf '%s\n' "numpy==1.24.*" "mlx==0.30.*" "stumpy==1.13.*" \
+            printf '%s\n' "numpy==1.24" "mlx==0.30" "stumpy==1.13" \
               > "${RUNNER_TEMP}/lowest-constraints.txt"
             python -m pip install -c "${RUNNER_TEMP}/lowest-constraints.txt" -e ".[dev]"
           else

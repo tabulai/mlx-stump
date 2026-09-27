@@ -17,8 +17,11 @@ groundwork:
    method is gone and the dense sweep multiplies against ``W_T`` directly.
 
 See ``test_sixth_review_engine.py``, ``test_sixth_review_stump.py``,
-``test_sixth_review_mass_match.py`` and ``test_sixth_review_infra.py`` for
-the rest of the round.
+``test_sixth_review_mass_match.py``, ``test_sixth_review_infra.py``,
+``test_sixth_review_coverage.py`` and ``test_sixth_review_stimp.py`` for the
+rest of the round, and ``test_sixth_review_final_prep.py`` and
+``test_sixth_review_final_engine.py`` for the fixes from its final
+adversarial review.
 """
 
 from __future__ import annotations

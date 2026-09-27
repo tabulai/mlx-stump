@@ -116,6 +116,9 @@ def test_release_build_is_locked_reproducible_and_tests_both_artifacts():
     assert "--no-deps --no-build-isolation" in text
     assert text.count("-m pip check") >= 2
     assert text.count('"site-packages" in module.as_posix()') >= 2
+    # the artifacts it uploads are tested on the Metal GPU, as in ci.yml
+    assert text.count('MLX_STUMP_REQUIRE_METAL: "1"') == text.count("-m pytest") == 2
+    assert text.count(" -q -rs") == 2
     for floating in (
         "pip install build",
         "pip install --upgrade pip",
