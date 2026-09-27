@@ -26,7 +26,7 @@ anomaly classification on the same silicon.
 ## Status
 
 **v0.1 development — the batched-MASS engine is implemented and golden-tested
-against STUMPY** (891 golden and regression tests). Distance profiles are
+against STUMPY** (893 golden and regression tests). Distance profiles are
 computed in bulk on the GPU as dense matmuls against a locally z-normalized
 subsequence matrix (or a doubly-centered shared-frame matrix for raw
 distances) — materialized in one piece for moderate `n*m`, streamed as column
@@ -468,18 +468,15 @@ python bench/bench_stump.py --sizes 524288 1048576 --m 200 --repeat 1 --seed 0 -
   m=4000, k=1 and k=5: RSS grew 555–571 MiB against 508–516 MiB
   estimates). `mass`/`match` evaluate one block at a time and never hold
   more, and every device array is dropped before the cache is cleared, so
-  no per-series allocation stays cached after a call returns, and an error
-  or Ctrl-C in the GPU phase of `stump`, `mass` or `match` releases the
-  window block and batch buffers before the exception propagates. One gap
-  remains before that phase: a normalized `stump` AB-join whose
-  `T_B_subseq_isconstant` flags fail validation (or whose `T_B` callable
-  raises) leaves `T_A`'s already-uploaded window statistics in MLX's cache
-  (5.8 MiB at n=1e6, m=50). MLX may retain a small runtime/allocator
-  baseline (2.6 MiB on one hosted-runner image). For `stump`, pass
-  `chunk_size` to trade memory for larger batches, and pass the same value
-  to `estimated_peak_bytes` because an explicit batch is allowed to exceed
-  the automatic 384 MiB budget. `mass` and `match` always use automatic
-  block streaming.
+  no per-series allocation stays cached after a call returns or raises: an
+  error or Ctrl-C in `stump`, `mass` or `match` (during preprocessing or
+  the GPU sweep) releases the per-window arrays, window block and batch
+  buffers before the exception propagates. MLX may retain a small
+  runtime/allocator baseline (2.6 MiB on one hosted-runner image). For
+  `stump`, pass `chunk_size` to trade memory for larger batches, and pass
+  the same value to `estimated_peak_bytes` because an explicit batch is
+  allowed to exceed the automatic 384 MiB budget. `mass` and `match` always
+  use automatic block streaming.
 - Out-of-range `query_idx` values (including negative ones) raise
   `ValueError`. STUMPY silently wraps `query_idx <= -m` through numpy
   negative indexing and fabricates a zero-distance match at a negative

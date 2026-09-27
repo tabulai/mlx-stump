@@ -644,51 +644,54 @@ def _stump(
             f"found p={p}. Use stumpy.aamp for other p-norms."
         )
 
-    if normalize:
-        A = preprocess_series(
-            T_A,
-            m,
-            isconstant=T_A_subseq_isconstant,
-            isconstant_name="T_A_subseq_isconstant",
-            stacklevel=stacklevel + 1,
-        )
-        if share_b_prep:
-            Bs = A
-        else:
-            Bs = preprocess_series(
-                T_B,
+    # One handler covers preprocessing too: a failure while preparing T_B
+    # (e.g. a bad or raising T_B_subseq_isconstant) must not leave T_A's
+    # uploaded window statistics in MLX's cache any more than a failed sweep.
+    A = Bs = engine = None
+    try:
+        if normalize:
+            A = preprocess_series(
+                T_A,
                 m,
-                isconstant=T_B_subseq_isconstant,
-                isconstant_name="T_B_subseq_isconstant",
+                isconstant=T_A_subseq_isconstant,
+                isconstant_name="T_A_subseq_isconstant",
                 stacklevel=stacklevel + 1,
             )
-    else:
-        # Constant-window flags do not affect raw Euclidean distances, but
-        # validate them consistently with mass/match instead of silently
-        # accepting malformed controls in this one API.
-        # process_isconstant reads only the length for an array spec and
-        # hands a callable its own inf->NaN copy, so no series copy is needed.
-        if T_A_subseq_isconstant is not None:
-            process_isconstant(T_A, m, T_A_subseq_isconstant, "T_A_subseq_isconstant")
-        if not share_b_prep and T_B_subseq_isconstant is not None:
-            process_isconstant(T_B, m, T_B_subseq_isconstant, "T_B_subseq_isconstant")
-        # shared affine frame keeps cross distances exactly invariant (both
-        # series even for a self-join, so the numerics never change), built
-        # without compacted-length copies
-        center, scale = finite_center_scale(T_A, T_B)
-        A = preprocess_series(
-            T_A, m, normalize=False, center=center, scale=scale, stacklevel=stacklevel + 1
-        )
-        Bs = (
-            A
-            if share_b_prep
-            else preprocess_series(
-                T_B, m, normalize=False, center=center, scale=scale, stacklevel=stacklevel + 1
+            if share_b_prep:
+                Bs = A
+            else:
+                Bs = preprocess_series(
+                    T_B,
+                    m,
+                    isconstant=T_B_subseq_isconstant,
+                    isconstant_name="T_B_subseq_isconstant",
+                    stacklevel=stacklevel + 1,
+                )
+        else:
+            # Constant-window flags do not affect raw Euclidean distances, but
+            # validate them consistently with mass/match instead of silently
+            # accepting malformed controls in this one API.
+            # process_isconstant reads only the length for an array spec and
+            # hands a callable its own inf->NaN copy, so no series copy is needed.
+            if T_A_subseq_isconstant is not None:
+                process_isconstant(T_A, m, T_A_subseq_isconstant, "T_A_subseq_isconstant")
+            if not share_b_prep and T_B_subseq_isconstant is not None:
+                process_isconstant(T_B, m, T_B_subseq_isconstant, "T_B_subseq_isconstant")
+            # shared affine frame keeps cross distances exactly invariant (both
+            # series even for a self-join, so the numerics never change), built
+            # without compacted-length copies
+            center, scale = finite_center_scale(T_A, T_B)
+            A = preprocess_series(
+                T_A, m, normalize=False, center=center, scale=scale, stacklevel=stacklevel + 1
             )
-        )
+            Bs = (
+                A
+                if share_b_prep
+                else preprocess_series(
+                    T_B, m, normalize=False, center=center, scale=scale, stacklevel=stacklevel + 1
+                )
+            )
 
-    engine = None
-    try:
         engine = MassEngine(Bs, normalize=normalize)
         I, IL, IR = _compute_profile(
             A,
@@ -704,8 +707,9 @@ def _stump(
         # buffers back to the system as a normal return does, rather than
         # leaving them in MLX's cache (hundreds of MiB) until the next call
         engine = None
-        A.release_device()
-        Bs.release_device()
+        for prep in (A, Bs):  # either may not exist yet; idempotent
+            if prep is not None:
+                prep.release_device()
         free_gpu_after_error(exc)
         raise
     # the sweep is over: drop the window matrix and return the batch buffers

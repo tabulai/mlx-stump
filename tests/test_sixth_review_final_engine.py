@@ -29,7 +29,9 @@
    ~400 MiB, until the next call: the traceback's frames kept them alive
    past any ``clear_cache``. The handler now releases the device arrays,
    clears the finished mlx-stump frames, synchronizes and clears the cache
-   (``_engine.free_gpu_after_error``).
+   (``_engine.free_gpu_after_error``). It also covers preprocessing: a
+   normalized AB-join whose ``T_B`` constant flags fail after ``T_A``'s
+   per-window arrays were uploaded no longer leaves those cached.
 6. (Q3) The kernel-fallback RuntimeWarning had a fixed ``stacklevel`` and
    pointed into ``_engine``; it now points at the first frame outside the
    package, whichever entry point reached it.
@@ -522,6 +524,26 @@ def test_ctrl_c_between_batches_leaves_nothing_cached(monkeypatch, tiled):
     monkeypatch.setattr(st, "query_windows", _sigint_on_call(st.query_windows, 6))
     base = _clean_slate()
     _check_released(lambda: mlx_stump.stump(T, m, chunk_size=512), KeyboardInterrupt, base)
+
+
+@pytest.mark.parametrize("bad_flag", ["array", "callable"])
+def test_failing_t_b_preprocessing_releases_t_a(bad_flag):
+    """A normalized AB-join whose T_B constant flags fail after T_A's
+    per-window arrays were uploaded (~6 MiB here): the handler must cover
+    preprocessing, not only the sweep."""
+    n, m = 1_000_000, 50
+    T_A, T_B = _walk(n, seed=71), _walk(n, seed=72)
+
+    def boom(a, w):
+        raise ValueError("flag callable failed")
+
+    flag = np.zeros(3, dtype=bool) if bad_flag == "array" else boom
+    base = _clean_slate()
+    _check_released(
+        lambda: mlx_stump.stump(T_A, m, T_B, ignore_trivial=False, T_B_subseq_isconstant=flag),
+        ValueError,
+        base,
+    )
 
 
 def test_successful_call_after_a_failure_is_unchanged(monkeypatch):
