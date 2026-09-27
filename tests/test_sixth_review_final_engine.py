@@ -526,13 +526,33 @@ def test_failing_sweep_releases_the_window_block(monkeypatch):
 @real_sigint
 @pytest.mark.parametrize("tiled", [False, True])
 def test_ctrl_c_between_batches_leaves_nothing_cached(monkeypatch, tiled):
-    """A real SIGINT while the next batch's query windows are built, i.e.
-    with the current batch still in flight on the GPU."""
+    """A real SIGINT while fetching the next query batch, with the current
+    batch still in flight on the GPU."""
     m = 50
     T = _walk(20_000, seed=69)
     if tiled:
         _force_tiles(monkeypatch, m, 5_000)
-    monkeypatch.setattr(st, "query_windows", _sigint_on_call(st.query_windows, 6))
+    if tiled:
+        monkeypatch.setattr(st, "query_windows", _sigint_on_call(st.query_windows, 6))
+    else:
+        # The dense implicit self-join now takes views of the already-packed
+        # target rows. Interrupt its lazy batch generator instead of the old
+        # CPU query packer; the 11th pull is the sixth query batch, fetched
+        # while the fifth batch runs.
+        real_batches = st._batches
+        pulls = [0]
+        main = threading.main_thread().ident
+
+        def interrupted_batches(*args, **kwargs):
+            for bounds in real_batches(*args, **kwargs):
+                pulls[0] += 1
+                if pulls[0] == 11:
+                    signal.pthread_kill(main, signal.SIGINT)
+                    time.sleep(10)
+                    raise AssertionError("SIGINT was not delivered")
+                yield bounds
+
+        monkeypatch.setattr(st, "_batches", interrupted_batches)
     base = _clean_slate()
     _check_released(lambda: mlx_stump.stump(T, m, chunk_size=512), KeyboardInterrupt, base)
 

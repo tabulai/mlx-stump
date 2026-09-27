@@ -9,8 +9,8 @@ from decimal import Decimal, localcontext
 import numpy as np
 from numpy.typing import ArrayLike
 
-from ._engine import refine_chunk_rows
-from ._mass import _mass, _raw_window_distances
+from ._engine import _REPAIR_NORMALIZED_CACHE_MAX_BYTES, refine_chunk_rows
+from ._mass import PreparedTarget, _mass, _raw_window_distances
 from ._preprocess import (
     IsConstantSpec,
     apply_affine_frame,
@@ -402,7 +402,67 @@ def _high_precision_znorm_rows(
     return out
 
 
-def _refine_candidates(Q, T, js, normalize, q_const, t_const, *, max_chunk_rows=None):
+class _NormalizedWindowCache:
+    """Bounded, float64 copies of a repair target's normalized windows.
+
+    Only near-zero matrix-profile repair constructs this. A row is built by
+    exactly the same centering, sum, inverse-sigma, and multiplication steps
+    as :func:`_refine_candidates`; the raw series stays available for the
+    exact positive-affine certificate. The inverse sigma is retained because
+    a flagged constant has a different distance rule even if its normalized
+    row happens to equal another row's.
+    """
+
+    def __init__(self, T: np.ndarray, m: int, isconstant: np.ndarray):
+        l = T.size - m + 1
+        if l * (m + 1) * 8 > _REPAIR_NORMALIZED_CACHE_MAX_BYTES:
+            raise ValueError("normalized repair window cache exceeds its memory limit")
+        self.T = T
+        self.m = m
+        self.isconstant = isconstant
+        self.U = np.empty((l, m), dtype=np.float64)
+        self.sig_inv = np.empty(l, dtype=np.float64)
+        raw = np.lib.stride_tricks.sliding_window_view(T, m)
+        # Building a full cache in refine_chunk_rows(m) chunks can leave a
+        # second 64 MiB matrix live next to the cache and the GPU target
+        # block. Keep this temporary at ~1 MiB (or one very long row).
+        step = max(1, min(1 << 16, (1 << 20) // (m * 8)))
+        for s in range(0, l, step):
+            e = min(l, s + step)
+            work = raw[s:e].copy()
+            # The cache may include rows never selected by refinement. A
+            # pathological row must not change a caller's floating-point
+            # warning policy merely because caching became profitable.
+            with np.errstate(invalid="ignore", over="ignore", under="ignore", divide="ignore"):
+                center_rows_stable(work)
+                sigma = np.sqrt(np.sum(work * work, axis=1) / m)
+                positive = (sigma > 0.0) & ~isconstant[s:e]
+                inverse = np.where(positive, 1.0 / np.where(sigma > 0.0, sigma, 1.0), 0.0)
+                work *= inverse[:, None]
+            self.U[s:e] = work
+            self.sig_inv[s:e] = inverse
+
+    def query_row(self, Q: np.ndarray, q_const: bool) -> int | None:
+        """Find an identical raw target window whose flag matches ``Q``."""
+        if (
+            Q.size != self.m
+            or Q.strides != (self.T.itemsize,)
+            or not np.shares_memory(Q, self.T)
+        ):
+            return None
+        offset = Q.ctypes.data - self.T.ctypes.data
+        if offset < 0 or offset % self.T.itemsize:
+            return None
+        row = offset // self.T.itemsize
+        if row >= self.U.shape[0] or bool(self.isconstant[row]) != bool(q_const):
+            return None
+        return row
+
+
+def _refine_candidates(
+    Q, T, js, normalize, q_const, t_const, *, max_chunk_rows=None,
+    normalized_cache: _NormalizedWindowCache | None = None,
+):
     """Float64 re-evaluation of the finite profile entries ``js``.
 
     The GPU profile is float32, so a perfect occurrence reads ~1e-3 instead
@@ -431,6 +491,9 @@ def _refine_candidates(Q, T, js, normalize, q_const, t_const, *, max_chunk_rows=
     non-affine perturbation retains its non-zero distance.
     ``max_chunk_rows`` lets the matrix-profile tie repair use smaller host
     chunks while a GPU window block is resident.
+    ``normalized_cache`` is private to dense matrix-profile repair. It
+    supplies rows prepared by these exact operations and retains the raw
+    series for the positive-affine certificate.
     """
     js = np.asarray(js, dtype=np.int64)
     out = np.empty(js.size, dtype=np.float64)
@@ -442,30 +505,46 @@ def _refine_candidates(Q, T, js, normalize, q_const, t_const, *, max_chunk_rows=
         chunk = min(chunk, max_chunk_rows)
     if normalize:
         Wfull = np.lib.stride_tricks.sliding_window_view(T, m)
+        use_cache = (
+            normalized_cache is not None
+            and normalized_cache.T is T
+            and normalized_cache.m == m
+            and normalized_cache.isconstant is t_const
+        )
         # Put every raw row into its own bounded midpoint/range frame before
         # centering and squaring. This retains the large-offset protection of
         # first-element shifting while also preventing overflow/underflow for
         # uniformly huge/tiny finite units.
-        Qw = Q.copy()[None, :]
-        center_rows_stable(Qw)
-        # ``np.sum`` uses a partial pairwise reduction along this contiguous
-        # axis.  Besides being more accurate than the BLAS-like accumulation
-        # selected by ``einsum`` for long rows, it keeps the norm of an exactly
-        # scaled row proportional to within a few ulps.
-        sig_q = float(np.sqrt(np.sum(Qw * Qw, axis=1)[0] / m))
-        sig_inv_q = 0.0 if (q_const or sig_q == 0.0) else 1.0 / sig_q
-        u = Qw[0] * sig_inv_q
+        cached_query = normalized_cache.query_row(Q, q_const) if use_cache else None
+        if cached_query is None:
+            Qw = Q.copy()[None, :]
+            center_rows_stable(Qw)
+            # ``np.sum`` uses a partial pairwise reduction along this contiguous
+            # axis.  Besides being more accurate than the BLAS-like accumulation
+            # selected by ``einsum`` for long rows, it keeps the norm of an exactly
+            # scaled row proportional to within a few ulps.
+            sig_q = float(np.sqrt(np.sum(Qw * Qw, axis=1)[0] / m))
+            sig_inv_q = 0.0 if (q_const or sig_q == 0.0) else 1.0 / sig_q
+            u = Qw[0] * sig_inv_q
+        else:
+            sig_inv_q = float(normalized_cache.sig_inv[cached_query])
+            u = normalized_cache.U[cached_query]
         for s in range(0, js.size, chunk):
             idx = js[s : s + chunk]
             collapsed_non_affine = np.zeros(idx.size, dtype=bool)
             tiny_distances = np.empty(0, dtype=np.float64)
-            W = Wfull[idx].astype(np.float64)
             tc = t_const[idx]
-            center_rows_stable(W)
-            sig_t = np.sqrt(np.sum(W * W, axis=1) / m)
-            pos = (sig_t > 0.0) & ~tc
-            sig_inv_t = np.where(pos, 1.0 / np.where(sig_t > 0.0, sig_t, 1.0), 0.0)
-            W *= sig_inv_t[:, None]
+            if use_cache:
+                # Integer advanced indexing already returns a writable copy.
+                W = normalized_cache.U[idx]
+                sig_inv_t = normalized_cache.sig_inv[idx]
+            else:
+                W = Wfull[idx].astype(np.float64)
+                center_rows_stable(W)
+                sig_t = np.sqrt(np.sum(W * W, axis=1) / m)
+                pos = (sig_t > 0.0) & ~tc
+                sig_inv_t = np.where(pos, 1.0 / np.where(sig_t > 0.0, sig_t, 1.0), 0.0)
+                W *= sig_inv_t[:, None]
             W -= u[None, :]
             d2 = np.sum(W * W, axis=1)
             del W
@@ -768,6 +847,8 @@ def _match(
     Q_subseq_isconstant=None,
     *,
     zero_query: bool = True,
+    target_owned: bool = False,
+    prepared: PreparedTarget | None = None,
     stacklevel: int,
 ) -> np.ndarray:
     """``match``; ``zero_query=False`` gives ``aamp_match``'s ``query_idx``.
@@ -779,7 +860,7 @@ def _match(
     if Q.ndim == 2 and Q.shape[1] == 1:
         Q = Q.flatten()
     T = np.asarray(T)
-    owned = False
+    owned = target_owned
     if T.ndim == 2 and T.shape[1] == 1:
         T = T.flatten()
         owned = True
@@ -821,6 +902,7 @@ def _match(
         zero_query=zero_query,
         keep_sigma=not normalize,
         copy_series=not owned,
+        prepared=prepared,
         stacklevel=stacklevel + 1,
     )
     if query_idx is not None:

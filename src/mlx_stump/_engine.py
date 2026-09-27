@@ -67,7 +67,9 @@ documented one-row/one-block floors can exceed a nominal budget at extreme
   windows being built on the CPU while it runs);
 - CPU-side float64 temporaries: the block-centering step (``_CENTER_BYTES``),
   the sigma repair in preprocessing and the float64 refinement chunks (see
-  ``_preprocess`` / ``_stump``), each a fixed budget independent of ``n``.
+  ``_preprocess`` / ``_stump``), each a fixed budget independent of ``n``;
+- an optional 64 MiB normalized-window cache during dense near-zero repair
+  of a k=1 self-join, concurrent with the resident GPU block.
 
 A block is built in place: each centered float64 chunk is cast straight
 into the block's own device buffer (unified memory), so no block-sized host
@@ -85,7 +87,10 @@ Distance special cases follow STUMPY's semantics:
 
 from __future__ import annotations
 
+import os
+import weakref
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 
 import mlx.core as mx
 import numpy as np
@@ -119,10 +124,12 @@ _CHUNK_MEM_BUDGET = 3 << 27  # ~384 MiB
 # variants and, for k > 1, the uint64 (d2, key) selection keys and sort
 # buffers.
 _FUSED_CELL = 4
-# host bytes per neighbour per row of the tiled top-k merge (_stump's
+# Host bytes per neighbour per row of the tiled CPU top-k merge (_stump's
 # _merge_topk: the block result, both 2k-wide concatenations, the self-join
 # tie keys, the full lexsort permutation, the gathered outputs, and NumPy's
-# sort workspace). tracemalloc peaks: 84.6 at k=2, 71 at k=16, 70 at k=100.
+# sort workspace). Tracemalloc peaks: 84.6 at k=2, 71 at k=16, 70 at k=100.
+# The Metal merge for 2 <= k <= 16 needs less space, so charging this for
+# either path keeps the batch and peak estimates conservative.
 _TILED_MERGE_CELL = 96
 # cap for materializing the (l, m) target window matrix on the GPU in one
 # piece; above it the engine switches to tiled column blocks. The tiled
@@ -134,6 +141,18 @@ _TILED_MERGE_CELL = 96
 _MATMUL_WINDOW_BYTES = 1 << 28  # ~256 MiB
 # size of one materialized target window block in tiled mode
 _TILE_WINDOW_BYTES = 1 << 27  # ~128 MiB
+# A tiled sweep may retain its packed query batches across target blocks.
+# Bound the persistent copies and their Python/MLX array count separately:
+# a tiny explicit chunk_size can otherwise create millions of arrays even
+# when the underlying float32 windows fit in a few MiB.
+_TILED_QUERY_CACHE_MAX_BYTES = 32 << 20
+_TILED_QUERY_CACHE_MAX_BATCHES = 4096
+_TILED_QUERY_CACHE_MIN_BLOCKS = 4
+# One cached batch also retains a Python list entry, an MLX array wrapper,
+# and allocator/runtime bookkeeping. A probe with 4096 one-row arrays used
+# ~7.2 MiB of process RSS for only 48 KiB of float32 cells; charging 4 KiB
+# per batch covers that overhead and bounds tiny explicit chunk sizes.
+_TILED_QUERY_CACHE_BATCH_OVERHEAD = 4096
 # Byte bound on the complete CPU centering stage while building window blocks.
 # Besides the rows*m float64 work matrix, center_rows_stable holds midpoint,
 # scale, reduction, and mask vectors. 128 bytes per row conservatively covers
@@ -146,6 +165,11 @@ _CENTER_ROW_BYTES = 128
 # and one temporary) against the four budgeted. The refinement runs after
 # the device memory has been released
 _REFINE_MEM_BUDGET = 1 << 28  # ~256 MiB
+# Optional float64-normalized target rows plus inverse sigmas retained while
+# repairing dense near-zero self-join candidates. The cache is built only
+# after a dense replay band is observed; it shares the repair phase's live
+# GPU block, so charge this additional allowance in estimated_peak_bytes.
+_REPAIR_NORMALIZED_CACHE_MAX_BYTES = 64 << 20
 
 
 def refine_chunk_rows(m: int) -> int:
@@ -257,13 +281,17 @@ def estimated_peak_bytes(
       by batch — each batch is synchronized before the next allocates and
       the trailing batch is computed at full width — so exactly one set of
       intermediates exists (the next batch's query windows, built while it
-      runs, are within the per-row query allowance). Tiled top-k joins also
-      merge each device result into the running set on the host; the two
-      concatenations, tie keys, full lexsort permutation, gather results,
-      and sorting workspace are included here;
+      runs for AB/tiled joins, are within the per-row query allowance).
+      Tiled top-k joins merge on the GPU for 2 <= k <= 16 when the fused
+      reducer runs; the estimate conservatively charges the larger CPU
+      merge workspace used by the other paths. When at least four target
+      blocks reuse packed query batches, their bounded data and host-object
+      allowance is charged in addition to the normal batch budget;
     - near-zero repair: the resident block, bounded rescan/refinement batches,
       and the candidate and side-winner arrays used when every query row
-      needs its float32 near-ties checked;
+      needs its float32 near-ties checked. A dense normalized k=1 self-join
+      may also retain up to 64 MiB of float64-normalized target windows and
+      inverse sigmas while it replays candidates;
     - assembly: after the device memory is released, the float64
       refinement chunk plus the numeric outputs, the top-k reordering
       temporaries, and the object-dtype ``mparray`` STUMPY's output layout
@@ -322,25 +350,46 @@ def estimated_peak_bytes(
         # MassEngine.tile_rows (the nominal upper bound), while blocks are
         # subsequently balanced and can be narrower than that bound.
         if tiled:
-            batch = _tiled_batch(max(4, _TILE_WINDOW_BYTES // (4 * m)), m, k, self_join, fused)
+            batch, query_cache = tiled_query_cache_plan(
+                target_rows=l, window=m, query_rows=l_q, k=k,
+                self_join=self_join, fused=fused,
+                tile_rows=max(4, _TILE_WINDOW_BYTES // (4 * m)),
+                chunk_size=None,
+            )
         else:
             batch = _dense_batch(l, m, k, self_join, fused)
+            query_cache = 0
         batch = min(batch, max(1, l_q))
         # Keep the whole advertised device budget as conservative headroom
-        # when automatic sizing is used. A one-row floor can exceed it.
-        device_batch = max(_CHUNK_MEM_BUDGET, one_row)
+        # when automatic sizing is used. The query cache has its own bounded
+        # allowance so enabling it never changes GEMM batch shape or scores.
+        # A one-row floor can exceed the nominal batch budget.
+        device_batch = max(_CHUNK_MEM_BUDGET, one_row) + query_cache
     else:
         batch = min(int(chunk_size), max(1, l_q))
-        device_batch = batch * one_row
+        if tiled:
+            batch, query_cache = tiled_query_cache_plan(
+                target_rows=l, window=m, query_rows=l_q, k=k,
+                self_join=self_join, fused=fused,
+                tile_rows=max(4, _TILE_WINDOW_BYTES // (4 * m)),
+                chunk_size=batch,
+            )
+        else:
+            query_cache = 0
+        device_batch = batch * one_row + query_cache
     # P (float64) and I (int64) per neighbor, IL/IR. The sweep fills only the
     # indices (P is allocated by the refinement, in the assembly phase), so
     # in the sweep term the 8 B/cell for P is headroom.
     numeric = l_q * (16 * k + 16)
-    accum = l_q * 12 * k if (tiled and k > 1) else 0  # tiled top-k merge state
+    # The GPU path holds old running values, one materialized block, and the
+    # newly merged values at once. Together they need up to
+    # 3*(8*k+16) bytes/row on a self join; numeric above already charges
+    # 16*k+16 of those. The CPU merge needs less persistent state.
+    accum = l_q * (12 * k + 32) if (tiled and k > 1) else 0
     if tiled and k > 1:
-        # the _merge_topk workspace (see _TILED_MERGE_CELL); the automatic
-        # tiled batch already charges it per row against the budget, and it
-        # is added here once more as headroom
+        # The CPU _merge_topk workspace (see _TILED_MERGE_CELL) also covers
+        # the smaller Metal merge buffers. Automatic batches already charge
+        # it per row; include it once more here as headroom.
         host_batch = batch * k * _TILED_MERGE_CELL
     elif k > 1:
         # Dense output conversion holds one float32 value copy (only its
@@ -356,7 +405,18 @@ def estimated_peak_bytes(
     # add up to < (24*k + 64) bytes per query row. The replay's score matrix
     # and float64 query/refinement work are separately bounded.
     repair_batch = (24 << 20) + max(8 << 20, m * 24 + _CENTER_ROW_BYTES)
-    repair = block + l_q * (24 * k + 64) + repair_batch
+    # The optional dense-band cache is a full matrix plus one inverse sigma
+    # per target row. It is built only for normalized k=1 self-joins
+    # after the replay observes enough candidates, but this public helper has
+    # no data-dependent density or normalization parameter, so model the
+    # eligible worst case. Build scratch fits in repair_batch's allowance.
+    cache_bytes = l * (m + 1) * 8
+    repair_cache = (
+        cache_bytes
+        if self_join and k == 1 and cache_bytes <= _REPAIR_NORMALIZED_CACHE_MAX_BYTES
+        else 0
+    )
+    repair = block + l_q * (24 * k + 64) + repair_batch + repair_cache
     refine = refine_chunk_rows(m) * m * 8 * 4
     reorder = l_q * 16 * k if k > 1 else 0  # argsort order + one reordered copy live
     # Object-array pointers plus CPython's allocation-size footprint for the
@@ -410,14 +470,67 @@ def _batch_row_bytes(width: int, m: int, k: int, self_join: bool, fused: bool) -
 
 def _dense_batch(l: int, m: int, k: int, self_join: bool, fused: bool) -> int:
     per_row = _batch_row_bytes(l, m, k, self_join, fused)
-    return max(1, min(1024, _CHUNK_MEM_BUDGET // per_row))
+    # A tall AB join against a narrow target is dominated by many small GEMM
+    # and reduction launches at 1024 rows. Larger batches still fit well
+    # within the byte budget. Leave tiny targets and long windows on the
+    # existing path: MLX can select a different GEMM accumulation kernel
+    # when the query row count changes (observed at m >= 1024, l <= 128).
+    cap = 8192 if fused and not self_join and 4 <= l <= 1024 and m <= 512 else 1024
+    return max(1, min(cap, _CHUNK_MEM_BUDGET // per_row))
 
 
 def _tiled_batch(tile_rows: int, m: int, k: int, self_join: bool, fused: bool) -> int:
     per_row = _batch_row_bytes(tile_rows, m, k, self_join, fused)
     if k > 1:
-        per_row += k * _TILED_MERGE_CELL  # the host merge runs while the block is live
+        per_row += k * _TILED_MERGE_CELL  # conservative for the Metal merge too
     return max(1, min(4096, _CHUNK_MEM_BUDGET // per_row))
+
+
+def tiled_query_cache_plan(
+    *,
+    target_rows: int,
+    window: int,
+    query_rows: int,
+    k: int,
+    self_join: bool,
+    fused: bool,
+    tile_rows: int,
+    chunk_size: int | None,
+) -> tuple[int, int]:
+    """Choose the tiled query batch and a safe packed-query cache allowance.
+
+    The cache retains the exact batches packed for the first target block.
+    The final batch overlaps earlier rows to keep GEMM shape stable, so its
+    float32 storage is less than ``(query_rows + batch) * window * 4`` bytes.
+    Charge one conservative host-object allowance for every retained batch.
+    Keep the original batch size: changing GEMM shape can change float32
+    rankings near a tie. The cache gets its own bounded memory allowance,
+    charged to the peak estimate. An explicit oversized batch skips caching.
+    """
+    base = (
+        min(int(chunk_size), query_rows)
+        if chunk_size is not None
+        else min(query_rows, _tiled_batch(tile_rows, window, k, self_join, fused))
+    )
+    nblocks = -(-target_rows // tile_rows)
+    nbatches = -(-query_rows // base)
+    cache_bound = (
+        (query_rows + base) * window * 4
+        + nbatches * _TILED_QUERY_CACHE_BATCH_OVERHEAD
+    )
+    if (
+        nblocks < _TILED_QUERY_CACHE_MIN_BLOCKS
+        or cache_bound > _TILED_QUERY_CACHE_MAX_BYTES
+        or nbatches > _TILED_QUERY_CACHE_MAX_BATCHES
+    ):
+        return base, 0
+
+    per_row = _batch_row_bytes(tile_rows, window, k, self_join, fused)
+    if k > 1:
+        per_row += k * _TILED_MERGE_CELL
+    if base * per_row > _CHUNK_MEM_BUDGET:
+        return base, 0
+    return base, cache_bound
 
 
 def default_chunk_size(
@@ -428,7 +541,9 @@ def default_chunk_size(
     The budget is enforced (floor of one row), never overridden for
     throughput: callers who want bigger batches pass ``chunk_size``. The
     per-row cost depends on the reduction that runs (``fused`` defaults to
-    ``_fused_reducer(k)``); batches are capped at 1024 rows.
+    ``_fused_reducer(k)``). Most batches are capped at 1024 rows; fused AB
+    joins with 4–1024 target windows and m <= 512 can use up to 8192 rows,
+    still subject to the same byte budget.
     """
     fused = _fused_reducer(k) if fused is None else fused
     return min(_dense_batch(engine.l, engine.m, k, self_join, fused), max(1, l_q))
@@ -439,11 +554,16 @@ def tiled_chunk_size(
 ) -> int:
     """Query rows per batch in tiled mode: intermediates span one tile, not l.
 
-    Top-k batches also charge the host merge workspace per row; batches are
-    capped at 4096 rows.
+    Top-k batches also charge the CPU merge workspace per row, conservatively
+    covering the Metal merge; batches are capped at 4096 rows.
     """
     fused = _fused_reducer(k) if fused is None else fused
-    return min(_tiled_batch(engine.tile_rows, engine.m, k, self_join, fused), max(1, l_q))
+    batch, _ = tiled_query_cache_plan(
+        target_rows=engine.l, window=engine.m, query_rows=l_q, k=k,
+        self_join=self_join, fused=fused, tile_rows=engine.tile_rows,
+        chunk_size=None,
+    )
+    return batch
 
 
 class MassEngine:
@@ -498,9 +618,11 @@ class MassEngine:
             blk = None
             out = np.empty((j1 - j0, self.m), dtype=np.float32)
         step = _center_rows(self.m)
-        for s in range(0, j1 - j0, step):
-            e = min(s + step, j1 - j0)
-            if self.normalize:
+
+        if self.normalize:
+            output_ref = weakref.ref(out)
+
+            def pack_rows(s: int, e: int) -> None:
                 work = w[s:e].copy()
                 center_rows_stable(work)
                 rms = np.sqrt(np.einsum("ij,ij->i", work, work) / self.m)
@@ -509,9 +631,66 @@ class MassEngine:
                 safe_rms = np.where(active & (rms > 0.0), rms, 1.0)
                 work /= safe_rms[:, None]
                 work[~active] = 0.0
-                out[s:e] = work
-                del active, rms, safe_rms, work
+                # Work-item arguments and their traceback must not retain a
+                # strong view of the MLX block after a worker error. The
+                # parent keeps `out` alive until every worker has joined.
+                output = output_ref()
+                if output is None:
+                    raise RuntimeError("target packing output was released before workers finished")
+                try:
+                    output[s:e] = work
+                finally:
+                    del output
+                # Each worker owns disjoint rows of the evaluated block.
+                # Their total live float64 work is at most one centering step.
+
+            rows = j1 - j0
+            workers = min(8, os.cpu_count() or 1)
+            parallel = (
+                blk is not None
+                and workers > 1
+                and rows >= 1024
+                and rows * self.m >= 1 << 20
+                and step >= 256
+                and step * self.m >= 1 << 18
+            )
+            if parallel:
+                # Reuse one pool for this block, but finish every bounded
+                # centering step before scheduling the next one. Splitting a
+                # step across workers keeps its aggregate float64 temporary
+                # within the same _CENTER_BYTES allowance as serial packing.
+                futures = []
+                future = None
+                try:
+                    with ThreadPoolExecutor(max_workers=workers) as pool:
+                        for start in range(0, rows, step):
+                            end = min(start + step, rows)
+                            count = end - start
+                            if count < 256 or count * self.m < 1 << 18:
+                                pack_rows(start, end)
+                                continue
+                            work_count = min(workers, max(1, count // 128))
+                            width = -(-count // work_count)
+                            futures = [
+                                pool.submit(pack_rows, s, min(s + width, end))
+                                for s in range(start, end, width)
+                            ]
+                            for future in futures:
+                                future.result()
+                except BaseException:
+                    # The pool has finished every writer. Drop its Future
+                    # references and our own block/view before the caller's
+                    # error handler clears MLX's cache. Keep the original
+                    # exception and worker traceback for debugging.
+                    futures.clear()
+                    del future, futures, pack_rows, out, blk
+                    raise
             else:
+                for s in range(0, rows, step):
+                    pack_rows(s, min(s + step, rows))
+        else:
+            for s in range(0, j1 - j0, step):
+                e = min(s + step, j1 - j0)
                 out[s:e] = w[s:e] - self.target.mu[j0 + s : j0 + e, None]
         if blk is None:
             blk = mx.array(out)

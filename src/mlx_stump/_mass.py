@@ -115,6 +115,190 @@ class _MassInfo:
     scale: float = 1.0
 
 
+class PreparedTarget:
+    """An immutable snapshot of a target for repeated ``mass``/``match`` queries.
+
+    Normalized targets retain their preprocessed flags and, when the window
+    matrix fits the engine's resident limit, its packed GPU matrix. Larger
+    targets still stream bounded blocks for each query. Raw distances depend
+    on a shared affine frame of *both* the target and query, so raw calls use
+    the ordinary per-query preprocessing path to preserve its arithmetic.
+    """
+
+    def __init__(
+        self,
+        T: ArrayLike,
+        m: int,
+        *,
+        normalize: bool = True,
+        M_T: ArrayLike | None = None,
+        Σ_T: ArrayLike | None = None,
+        T_subseq_isfinite: ArrayLike | None = None,
+        T_subseq_isconstant: IsConstantSpec = None,
+    ) -> None:
+        T = np.asarray(T)
+        owned = False
+        if T.ndim == 2 and T.shape[1] == 1:
+            T = T.flatten()
+            owned = True
+        # A flattened column is already a private copy. A 1-D input needs
+        # one copy so later mutations of the caller's array cannot change us.
+        self._T = check_series(T, "T", copy=not owned)
+        self.m = check_window_size(m, self._T.shape[0])
+        self.normalize = bool(normalize)
+        self._closed = False
+        self._prep = None
+        self._engine = None
+        self._M_T = self._Σ_T = None
+        self._T_subseq_isfinite = None
+        self._T_subseq_isconstant = None
+        l = self._T.shape[0] - self.m + 1
+
+        if M_T is not None and Σ_T is not None:
+            self._M_T, self._Σ_T = _check_stats(M_T, Σ_T, l)
+        if self.normalize:
+            try:
+                # T_subseq_isfinite has no normalized role, just as in mass().
+                self._prep = preprocess_series(
+                    self._T, self.m, isconstant=T_subseq_isconstant, stacklevel=3
+                )
+                if self._M_T is not None:
+                    bad_mean = np.isinf(self._M_T)
+                    if bad_mean.any():
+                        self._prep.isfinite = self._prep.isfinite & ~bad_mean
+                        self._prep.isfinite_mx = mx.array(self._prep.isfinite)
+                    # The mask has absorbed the only relevant metadata. Repeated
+                    # queries must not revalidate/copy l-wide compatibility arrays.
+                    self._M_T = self._Σ_T = None
+                self._engine = MassEngine(self._prep)
+            except BaseException as exc:
+                if self._prep is not None:
+                    self._prep.release_device()
+                self._prep = self._engine = None
+                free_gpu_after_error(exc)
+                raise
+        else:
+            self._T_subseq_isfinite = _check_isfinite_override(T_subseq_isfinite, l)
+            if T_subseq_isconstant is not None:
+                # It is a compatibility control in raw mode, but validate a
+                # callable/array now against the private target snapshot.
+                process_isconstant(
+                    self._T, self.m, T_subseq_isconstant, "T_subseq_isconstant"
+                )
+
+    def _require_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("This prepared target has been closed.")
+
+    def mass(
+        self,
+        Q: ArrayLike,
+        *,
+        Q_subseq_isconstant: IsConstantSpec = None,
+        query_idx: int | None = None,
+    ) -> np.ndarray:
+        """Return a distance profile using this target snapshot."""
+        self._require_open()
+        return _mass(
+            Q,
+            self._T,
+            self._M_T,
+            self._Σ_T,
+            self.normalize,
+            2.0,
+            self._T_subseq_isfinite,
+            self._T_subseq_isconstant,
+            Q_subseq_isconstant,
+            query_idx,
+            copy_series=False,
+            prepared=self if self.normalize else None,
+            stacklevel=3,
+        )[0]
+
+    def match(
+        self,
+        Q: ArrayLike,
+        *,
+        max_distance=None,
+        max_matches: int | None = None,
+        atol: float = 1e-8,
+        query_idx: int | None = None,
+        Q_subseq_isconstant: IsConstantSpec = None,
+    ) -> np.ndarray:
+        """Find matches using this target snapshot and float64 refinement."""
+        self._require_open()
+        from ._match import _match
+
+        return _match(
+            Q,
+            self._T,
+            self._M_T,
+            self._Σ_T,
+            max_distance,
+            max_matches,
+            atol,
+            query_idx,
+            self.normalize,
+            2.0,
+            self._T_subseq_isfinite,
+            self._T_subseq_isconstant,
+            Q_subseq_isconstant,
+            target_owned=True,
+            prepared=self if self.normalize else None,
+            stacklevel=3,
+        )
+
+    def close(self) -> None:
+        """Release the packed matrix and preprocessing buffers immediately."""
+        if self._closed:
+            return
+        self._closed = True
+        if self._engine is not None:
+            self._engine.W_T = None
+        self._engine = None
+        if self._prep is not None:
+            self._prep.release_device()
+        self._prep = None
+        self._T = None
+        self._M_T = self._Σ_T = None
+        self._T_subseq_isfinite = self._T_subseq_isconstant = None
+        mx.clear_cache()
+
+    def __enter__(self) -> PreparedTarget:
+        self._require_open()
+        return self
+
+    def __exit__(self, _type, _value, _traceback) -> None:
+        self.close()
+
+
+def prepare_target(
+    T: ArrayLike,
+    m: int,
+    *,
+    normalize: bool = True,
+    M_T: ArrayLike | None = None,
+    Σ_T: ArrayLike | None = None,
+    T_subseq_isfinite: ArrayLike | None = None,
+    T_subseq_isconstant: IsConstantSpec = None,
+) -> PreparedTarget:
+    """Prepare an owned target for repeated ``.mass(Q)``/``.match(Q)`` calls.
+
+    Target-specific flags and compatibility statistics are fixed at creation.
+    The usual ``mass`` and ``match`` functions remain unchanged. Use
+    ``close()`` or a ``with`` block to release retained GPU storage promptly.
+    """
+    return PreparedTarget(
+        T,
+        m,
+        normalize=normalize,
+        M_T=M_T,
+        Σ_T=Σ_T,
+        T_subseq_isfinite=T_subseq_isfinite,
+        T_subseq_isconstant=T_subseq_isconstant,
+    )
+
+
 def mass(
     Q: ArrayLike,
     T: ArrayLike,
@@ -222,6 +406,7 @@ def _mass(
     zero_query: bool = True,
     keep_sigma: bool = False,
     copy_series: bool = True,
+    prepared: PreparedTarget | None = None,
     stacklevel: int,
 ) -> tuple[np.ndarray, _MassInfo]:
     """``mass``, plus the resolved flags and statistics ``match`` reuses.
@@ -248,6 +433,8 @@ def _mass(
     Q = check_series(Q, "Q")
     T = check_series(T, "T", copy=copy_series)
     m = check_window_size(int(Q.shape[0]), T.shape[0])
+    if prepared is not None and m != prepared.m:
+        raise ValueError(f"`Q` must have length {prepared.m} for this prepared target.")
     l = T.shape[0] - m + 1
     info = _MassInfo()
 
@@ -313,11 +500,15 @@ def _mass(
         if normalize:
             # T_subseq_isfinite is deliberately NOT applied here: STUMPY documents
             # it as ignored when normalize=True (it only feeds mass_absolute)
-            prep = preprocess_series(
-                T, m, isconstant=T_subseq_isconstant, stacklevel=stacklevel + 1
+            prep = (
+                prepared._prep
+                if prepared is not None
+                else preprocess_series(
+                    T, m, isconstant=T_subseq_isconstant, stacklevel=stacklevel + 1
+                )
             )
             info.isconstant, info.isfinite = prep.isconstant, prep.isfinite
-            if user_stats:
+            if user_stats and prepared is None:
                 # The supplied arrays are compatibility metadata: every raw window
                 # still goes through the same local float64 centering and RMS
                 # normalization, so the profile equals the no-stats call exactly.
@@ -345,7 +536,7 @@ def _mass(
             Qs = Qc / s
             del Qc
 
-            engine = MassEngine(prep)
+            engine = prepared._engine if prepared is not None else MassEngine(prep)
             Qb = mx.array(Qs.astype(np.float32))[None, :]
             del Qs
             sig_inv_q = mx.array([0.0 if q_const else 1.0], dtype=mx.float32)
@@ -410,7 +601,7 @@ def _mass(
         # cached in MLX after the call raises
         engine = W = d2 = Qb = None
         sig_inv_q = isconst_q = isfinite_q = ssq_q = mu_q_mx = None
-        if prep is not None:
+        if prep is not None and prepared is None:
             prep.release_device()
         free_gpu_after_error(exc)
         raise
@@ -419,7 +610,8 @@ def _mass(
     # (window block, query batch, per-window stats) BEFORE clearing MLX's
     # buffer cache, or they would enter it when this function returns
     del engine
-    prep.release_device()
+    if prepared is None:
+        prep.release_device()
     mx.clear_cache()
     # Reuse the profile buffer: allocating a second l-wide float64 array here
     # needlessly overlaps the final GPU/cache teardown phase.
