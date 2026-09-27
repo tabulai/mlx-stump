@@ -27,7 +27,8 @@
    whose rounding grows with position: 98% of the windows of a long random
    walk were "repaired" two-pass (O(n·m)), and the documented ~1e-6
    variance-error cap did not hold. Sums are block-local now, with a
-   position-independent bound that makes the cap true.
+   position-independent bound that makes the cap true (one pairwise tree
+   per window since the final review: test_sixth_review_final_prep.py).
 7. Preprocessing's O(n) temporaries (int64 cumsums, van Herk copies, an
    inf->NaN copy of the series, unused raw-mode ``sig_inv``/``sig_inv_mx``/
    ``isconstant_mx``, and a second flag resolution in ``match``) peaked at
@@ -357,7 +358,7 @@ def test_topk_band_with_a_forced_first_pick():
     assert zq[0, 1] == 3_000 and zq[0, 0] == 0.0
 
 
-# ---------------------------------------------- 6. block-local rolling sums
+# ------------------------------------ 6. position-independent rolling sums
 EDGE_SHAPES = [
     (1, 1), (5, 1), (5, 5), (6, 5), (7, 3), (9, 3), (10, 4), (11, 10),
     (100, 99), (100, 100), (101, 10), (257, 16), (1000, 7), (1024, 1024), (1025, 512),
@@ -365,7 +366,7 @@ EDGE_SHAPES = [
 
 
 @pytest.mark.parametrize(("n", "w"), EDGE_SHAPES)
-def test_block_local_sums_agree_with_fsum(n, w):
+def test_rolling_sums_agree_with_fsum(n, w):
     rng = np.random.default_rng(n * 7919 + w)
     ints = rng.integers(-1000, 1000, n).astype(np.float64)
     exact = np.array([math.fsum(ints[j : j + w]) for j in range(n - w + 1)])
@@ -375,7 +376,7 @@ def test_block_local_sums_agree_with_fsum(n, w):
     ref = np.array([math.fsum(x[j : j + w]) for j in range(n - w + 1)])
     mag = np.array([math.fsum(np.abs(x[j : j + w])) for j in range(n - w + 1)])
     err = np.abs(_rolling_sum_local(x, w) - ref)
-    # every partial sum is part of the window: error bounded by its own magnitudes
+    # every partial sum sums the window's own values: error bounded by its magnitudes
     assert np.all(err <= max(w - 1, 1) * np.finfo(float).eps * mag)
 
 

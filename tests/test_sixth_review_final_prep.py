@@ -9,7 +9,9 @@
    tiled integer pattern, and a k=3 row kept its 3 nearest copies on 857 of
    1091 rows). Window sums now come from one fixed pairwise (doubling) tree
    per window, so identical windows get identical statistics; the repair
-   test uses the error bound re-derived for pairwise summation.
+   test uses the error bound re-derived for pairwise summation. Past
+   ``_ROLLING_CHUNK`` the ~2w-long level buffers are summed in place, so
+   very wide windows peak no higher than the old sums did.
 2. [integration F1] ``match``/``aamp_match`` with an unsigned NumPy
    ``query_idx``: ``idx - excl_zone`` wrapped on NumPy 2 (the query was
    reported twice) and became a float on NumPy 1.24 (TypeError). The index
@@ -77,6 +79,7 @@ from mlx_stump._preprocess import (
 )
 
 from .conftest import random_walk
+from .test_sixth_review_engine import _force_fallback, _force_tiles
 
 stumpy = pytest.importorskip("stumpy")
 
@@ -92,13 +95,12 @@ EPS = np.finfo(np.float64).eps
 
 def _run(monkeypatch, T, m, *, fused, tiled, columns=37, **kwargs):
     """stump() on the fused kernels or the forced compiled fallback, dense or
-    forced tiled (the helpers of test_sixth_review_engine.py)."""
+    forced tiled (with the helpers of test_sixth_review_engine.py)."""
     with monkeypatch.context() as mp:
         if not fused:
-            mp.setattr(eng, "_fused_reducer", lambda k: False)
+            _force_fallback(mp)
         if tiled:
-            mp.setattr(eng, "_MATMUL_WINDOW_BYTES", 0)
-            mp.setattr(eng, "_TILE_WINDOW_BYTES", columns * m * 4)
+            _force_tiles(mp, m, columns)
         return mlx_stump.stump(T, m, **kwargs)
 
 
@@ -226,6 +228,27 @@ def test_pairwise_sums_are_chunk_independent_and_within_their_bound(monkeypatch,
     np.testing.assert_array_equal(_rolling_sum_local(ints, w), exact)
 
 
+def test_wide_window_levels_are_summed_in_one_buffer(monkeypatch):
+    """Past _ROLLING_CHUNK a chunk's level buffer is ~2w long; its levels are
+    summed in place, so one such buffer is alive instead of two (two, plus
+    a view pinning the previous chunk's, took raw preprocessing at w = n/2
+    to 5.69x the series against 4.75x for the old sums), bit-identically."""
+    n, w = 40_000, 20_000
+    x = random_walk(n, seed=4)
+    ref = _rolling_sum_local(x, w)  # w <= _ROLLING_CHUNK: the allocating path
+    monkeypatch.setattr(prep_mod, "_ROLLING_CHUNK", 64)
+    tracemalloc.start()
+    try:
+        base = tracemalloc.get_traced_memory()[0]
+        got = _rolling_sum_local(x, w)
+        peak = tracemalloc.get_traced_memory()[1] - base
+    finally:
+        tracemalloc.stop()
+    assert got.tobytes() == ref.tobytes()
+    level = (w + w - 1) * 8  # step = max(chunk, w) windows plus the w - 1 overlap
+    assert peak - got.nbytes <= 1.25 * level, peak / level
+
+
 def test_rolling_sum_depth_bounds_every_terms_additions():
     """The depth used by the error bound is the tree's true maximum."""
     for w in range(1, 300):
@@ -239,7 +262,7 @@ def test_pairwise_repair_bound_caps_the_surviving_variance_error(monkeypatch):
     """Windows on a unit offset whose variance sits from 0.25x to 4x the
     pairwise repair threshold ``H*(1.5*D + 3)*eps*S2/w``: those well below
     it are repaired two-pass, those well above are not (the old
-    ``1.5*eps*S2`` test, 4x wider at w=48, repaired both), and every window
+    ``1.5*eps*S2`` test, 6x wider at w=48, repaired both), and every window
     keeps a relative variance error of at most ``1/(H - 1)``."""
     H = prep_mod._SIGMA_REPAIR_HEADROOM
     w = 48
@@ -488,8 +511,10 @@ def test_mass_interrupted_in_the_block_loop_leaves_nothing_cached(monkeypatch, n
     with pytest.raises(KeyboardInterrupt):
         mlx_stump.mass(Q, T, normalize=normalize)
     gc.collect()
-    assert mx.get_cache_memory() == 0
-    assert mx.get_active_memory() == active
+    # < 1 MiB like test_third_review_fixes.py (MLX may keep a small runtime
+    # baseline); the leak this guards against was the whole window block
+    assert mx.get_cache_memory() < MIB
+    assert mx.get_active_memory() - active < MIB
     monkeypatch.setattr(eng.MassEngine, name, orig)
     assert np.isfinite(mlx_stump.mass(Q, T[:5000], normalize=normalize)).all()
 

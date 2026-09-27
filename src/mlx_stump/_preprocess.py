@@ -373,28 +373,38 @@ def _rolling_sum_local(x: np.ndarray, w: int) -> np.ndarray:
     with position; sums of block-local partial sums depend on the window's
     offset in its block.)
     O(n log w), streamed in ``_ROLLING_CHUNK`` windows so that the level
-    buffers stay bounded; the chunking does not change a single bit.
+    buffers stay bounded; the chunking does not change a single bit. A
+    chunk's level buffer holds ``step + w - 1`` values, ``step =
+    max(_ROLLING_CHUNK, w)``: past ``_ROLLING_CHUNK`` it is ~2w long, so
+    those levels are then summed in place (one buffer instead of two).
     """
     n = x.shape[0]
     l = n - w + 1
     out = np.empty(max(l, 0))
     step = max(_ROLLING_CHUNK, w)
+    in_place = w > _ROLLING_CHUNK
     for s in range(0, l, step):
         e = min(s + step, l)
-        cur = x[s : e + w - 1]  # level 0: runs of length 1
+        cur = x[s : e + w - 1]  # level 0: runs of length 1 (the caller's data)
         span, offset, first = 1, 0, True
         while True:
-            if w & span:
-                run = cur[offset : offset + e - s]
+            if w & span:  # (no named view: it would pin the buffer into the next chunk)
                 if first:
-                    out[s:e] = run
+                    out[s:e] = cur[offset : offset + e - s]
                     first = False
                 else:
-                    out[s:e] += run
+                    out[s:e] += cur[offset : offset + e - s]
                 offset += span
             if 2 * span > w:
                 break
-            cur = cur[:-span] + cur[span:]  # sums of the length-2*span runs
+            if in_place and span > 1:
+                # the same sums, written over the level they come from:
+                # NumPy's overlap rules give the as-if-copied result, and
+                # with the input ahead of the output they need no copy
+                np.add(cur[:-span], cur[span:], out=cur[:-span])
+                cur = cur[:-span]
+            else:
+                cur = cur[:-span] + cur[span:]  # sums of the length-2*span runs
             span *= 2
     return out
 
