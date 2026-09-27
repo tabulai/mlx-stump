@@ -1,4 +1,4 @@
-"""`stump`: the matrix profile, computed on the Metal GPU via batched MASS."""
+"""`stump`: the matrix profile, computed via batched MASS on MLX's active device."""
 
 from __future__ import annotations
 
@@ -1067,8 +1067,8 @@ def _stump(
 def _check_device_id(device_id) -> None:
     """Validate STUMPY's CUDA ``device_id`` loosely: an int or a list of them.
 
-    It selects nothing here. An Apple silicon Mac has one GPU, which MLX
-    already uses, so the ids are only checked for shape and then ignored.
+    It selects nothing here. The GPU wrappers check MLX's active device
+    separately, so the ids are only checked for shape and then ignored.
     """
     ids = [device_id] if isinstance(device_id, (int, np.integer)) else device_id
     try:
@@ -1082,6 +1082,18 @@ def _check_device_id(device_id) -> None:
         raise ValueError(
             "`device_id` must be a non-negative integer or a non-empty list of them "
             f"but found {device_id!r}."
+        )
+
+
+def _require_metal_gpu(entry: str) -> None:
+    """Reject CPU execution through an explicitly GPU-named public API."""
+    metal = mx.metal.is_available()
+    device = mx.default_device()
+    if not metal or device != mx.gpu:
+        raise RuntimeError(
+            f"`{entry}` requires an available Metal GPU as MLX's active device "
+            f"(metal_available={metal}, default_device={device}). "
+            "Select `mx.gpu` or use the unsuffixed API for CPU execution."
         )
 
 
@@ -1134,11 +1146,12 @@ def gpu_stump(
     """:func:`stump` under ``stumpy.gpu_stump``'s positional signature.
 
     ``device_id`` (an int or a list of ints, as in STUMPY) is validated and
-    then ignored, because the one Apple GPU is always used. This wrapper
-    exists because a bare ``gpu_stump = stump`` alias would silently bind a
+    then ignored. An available Metal GPU must be MLX's active device. This
+    wrapper exists because a bare ``gpu_stump = stump`` alias would silently bind a
     positional ``device_id`` to ``normalize``.
     """
     _check_device_id(device_id)
+    _require_metal_gpu("gpu_stump")
     return _stump(
         T_A,
         m,
@@ -1168,8 +1181,10 @@ def gpu_aamp(
     """:func:`aamp` under ``stumpy.gpu_aamp``'s positional signature.
 
     ``device_id`` is validated and ignored as in :func:`gpu_stump`.
+    An available Metal GPU must be MLX's active device.
     """
     _check_device_id(device_id)
+    _require_metal_gpu("gpu_aamp")
     return _stump(
         T_A,
         m,

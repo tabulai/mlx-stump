@@ -543,6 +543,7 @@ def _assert_matches(ours, ref, T_A, T_B, m, k, normalize):
         )
 
 
+@pytest.mark.gpu
 def test_wrappers_positional_golden():
     T = _walk(500, seed=71)
     T_B = _walk(350, seed=72)
@@ -575,6 +576,7 @@ def test_wrappers_positional_golden():
     )
 
 
+@pytest.mark.gpu
 def test_wrappers_run_the_same_computation():
     T = _walk(400, seed=73)
     T_B = _walk(300, seed=74)
@@ -595,6 +597,7 @@ def test_wrappers_run_the_same_computation():
 
 
 @pytest.mark.parametrize("device_id", [0, 3, np.int64(1), [0, 1], (0,), np.arange(2)])
+@pytest.mark.gpu
 def test_device_id_accepted_and_ignored(device_id):
     T = _walk(200, seed=76)
     ref = mlx_stump.stump(T, 10)
@@ -612,6 +615,7 @@ def test_device_id_rejected(device_id):
             fn(T, 10, device_id=device_id)
 
 
+@pytest.mark.gpu
 def test_aamp_rejects_other_p_norms():
     T = _walk(100, seed=78)
     for call in (
@@ -646,7 +650,15 @@ def _call(entry, T_A, m, T_B=None, ignore_trivial=True, normalize=True, flags=No
     return mlx_stump.gpu_aamp(T_A, m, T_B, ignore_trivial)
 
 
-@pytest.mark.parametrize("entry", ["stump", "aamp", "gpu_stump", "gpu_aamp"])
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "stump",
+        "aamp",
+        pytest.param("gpu_stump", marks=pytest.mark.gpu),
+        pytest.param("gpu_aamp", marks=pytest.mark.gpu),
+    ],
+)
 def test_warnings_point_at_the_callers_line(entry):
     """Every warning, raised in the implementation or in a preprocessing
     helper one frame deeper, is attributed to this file (the caller)."""

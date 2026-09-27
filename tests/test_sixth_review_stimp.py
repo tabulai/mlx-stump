@@ -477,6 +477,7 @@ def test_signatures_match_stumpy():
 
 
 @pytest.mark.parametrize("device_id", [0, 1, np.int64(0), [0], [0, 1]])
+@pytest.mark.gpu
 def test_gpu_stimp_ignores_a_valid_device_id(device_id):
     T = random_walk(300, seed=12)
     ours = mlx_stump.gpu_stimp(T, 5, 40, 5, device_id)
@@ -493,6 +494,7 @@ def test_gpu_stimp_rejects_an_invalid_device_id(device_id):
         mlx_stump.gpu_stimp(random_walk(100, seed=0), 5, 20, 1, device_id)
 
 
+@pytest.mark.gpu
 def test_gpu_stimp_positional_normalize_is_the_sixth_argument():
     T = random_walk(300, seed=13)
     raw = mlx_stump.gpu_stimp(T, 5, 30, 5, 0, False)
@@ -542,7 +544,9 @@ def test_series_is_copied_and_byte_order_is_accepted():
 
 
 # ------------------------------------------------------- 5. warnings
-@pytest.mark.parametrize("cls", [mlx_stump.stimp, mlx_stump.gpu_stimp])
+@pytest.mark.parametrize(
+    "cls", [mlx_stump.stimp, pytest.param(mlx_stump.gpu_stimp, marks=pytest.mark.gpu)]
+)
 def test_update_warnings_point_at_the_callers_line(cls):
     """Warnings from the per-window stump call and from its preprocessing
     helpers (one frame deeper) are attributed to the ``update()`` line."""
