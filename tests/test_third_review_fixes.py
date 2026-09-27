@@ -155,7 +155,7 @@ def test_mass_is_blockwise():
 def test_engine_build_is_byte_budgeted():
     """A dense window matrix used to be centered in one float64 temporary of
     the same row count (a 500 MiB matrix cost 2 GB RSS); the centering step
-    is byte-budgeted now, so the build costs 2*block + 64 MiB. (m=1000 keeps
+    is byte-budgeted now, so the build costs block + 64 MiB. (m=1000 keeps
     the 246 MiB matrix under the dense cap; a tiled target builds nothing
     at construction and would make this test vacuous.)"""
     n, m = 65_536, 1_000

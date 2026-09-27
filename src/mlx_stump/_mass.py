@@ -9,7 +9,7 @@ import mlx.core as mx
 import numpy as np
 from numpy.typing import ArrayLike
 
-from ._engine import MassEngine, refine_chunk_rows
+from ._engine import MassEngine, free_gpu_after_error, refine_chunk_rows
 from ._preprocess import (
     IsConstantSpec,
     apply_affine_frame,
@@ -23,32 +23,6 @@ from ._preprocess import (
     rowwise_l2_inplace,
     split_float32,
 )
-
-
-def _free_gpu_after_error(exc: BaseException) -> None:
-    """Return a failed call's GPU buffers to the system.
-
-    The success path releases its device arrays and clears MLX's cache
-    itself. Call this from an inline ``except`` handler (a decorator would
-    add a frame and shift every warning's ``stacklevel``) after dropping
-    the handler frame's own device references. The finished frames below
-    the handler (the block generator, the distance helpers) are kept alive
-    by the traceback with their locals, e.g. the window block: clear those
-    of mlx-stump's own frames (user frames stay intact for post-mortem
-    debugging), wait for work still in flight, then clear the cache.
-    (Private copy of the engine's helper, to be deduplicated.)
-    """
-    tb = exc.__traceback__
-    tb = tb.tb_next if tb is not None else None  # the handler's frame is executing
-    while tb is not None:
-        if tb.tb_frame.f_globals.get("__name__", "").startswith("mlx_stump."):
-            try:
-                tb.tb_frame.clear()
-            except RuntimeError:  # a still-executing or suspended frame
-                pass
-        tb = tb.tb_next
-    mx.synchronize()  # a batch still in flight holds its buffers until it completes
-    mx.clear_cache()
 
 
 def _as_flag(value, name: str, Q: np.ndarray | None = None) -> bool | None:
@@ -434,7 +408,7 @@ def _mass(
         sig_inv_q = isconst_q = isfinite_q = ssq_q = mu_q_mx = None
         if prep is not None:
             prep.release_device()
-        _free_gpu_after_error(exc)
+        free_gpu_after_error(exc)
         raise
 
     # nothing of the GPU phase is needed any more: drop every device array
