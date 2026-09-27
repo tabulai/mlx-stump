@@ -42,9 +42,9 @@ cell) measured only 1.2–2.2× faster than the fused engine in a prototype, so
 it remains future work. See [Roadmap](#roadmap).
 
 CI runs the suite on macOS 14/15 with Python 3.10/3.12/3.14 plus one job at
-the exact declared dependency floors (Python 3.10 with numpy 1.24.0, mlx
-0.30.0 and STUMPY 1.13.0), and fails any test run whose MLX default device
-is not the Metal GPU (`MLX_STUMP_REQUIRE_METAL=1`).
+the exact declared dependency floors (numpy 1.24.0, mlx 0.30.0 and STUMPY
+1.13.0, on the newest Python 3.10.x), and fails any test run whose MLX
+default device is not the Metal GPU (`MLX_STUMP_REQUIRE_METAL=1`).
 
 ## Install
 
@@ -228,9 +228,11 @@ error negligible in practice by:
    against an independent float64 oracle and STUMPY. The exclusion zone is
    `ceil(m / stumpy.config.STUMPY_EXCL_ZONE_DENOM)`, read at call time
    whenever STUMPY has been imported (otherwise STUMPY's default
-   denominator of 4). Any positive finite denominator works, however
-   extreme: a zone wider than the series gives STUMPY's all-inf self-join
-   profile. Exact ties resolve by STUMPY's own rule: in self-joins the
+   denominator of 4). Any positive denominator whose zone `ceil(m/denom)`
+   is finite works (the suite tests down to 1e-12): a zone wider than the
+   series gives STUMPY's all-inf self-join profile. A denominator so small
+   that `m/denom` overflows (any subnormal one) raises `OverflowError`, as
+   STUMPY does. Exact ties resolve by STUMPY's own rule: in self-joins the
    nearest-in-time candidate wins, and the left one on an equal offset (the
    order of STUMPY's diagonal traversal), for `I_`, `left_I_`, `right_I_`
    and every top-k column; AB-joins take the lowest index (raw top-k ties
@@ -466,14 +468,18 @@ python bench/bench_stump.py --sizes 524288 1048576 --m 200 --repeat 1 --seed 0 -
   m=4000, k=1 and k=5: RSS grew 555–571 MiB against 508–516 MiB
   estimates). `mass`/`match` evaluate one block at a time and never hold
   more, and every device array is dropped before the cache is cleared, so
-  no per-series allocation stays cached after a call returns or raises: an
-  error or Ctrl-C in the GPU phase of `stump`, `mass` or `match` releases
-  the window block and batch buffers before the exception propagates. MLX
-  may retain a small runtime/allocator baseline (2.6 MiB on one
-  hosted-runner image). For `stump`, pass `chunk_size` to trade memory for
-  larger batches, and pass the same value to `estimated_peak_bytes` because
-  an explicit batch is allowed to exceed the automatic 384 MiB budget.
-  `mass` and `match` always use automatic block streaming.
+  no per-series allocation stays cached after a call returns, and an error
+  or Ctrl-C in the GPU phase of `stump`, `mass` or `match` releases the
+  window block and batch buffers before the exception propagates. One gap
+  remains before that phase: a normalized `stump` AB-join whose
+  `T_B_subseq_isconstant` flags fail validation (or whose `T_B` callable
+  raises) leaves `T_A`'s already-uploaded window statistics in MLX's cache
+  (5.8 MiB at n=1e6, m=50). MLX may retain a small runtime/allocator
+  baseline (2.6 MiB on one hosted-runner image). For `stump`, pass
+  `chunk_size` to trade memory for larger batches, and pass the same value
+  to `estimated_peak_bytes` because an explicit batch is allowed to exceed
+  the automatic 384 MiB budget. `mass` and `match` always use automatic
+  block streaming.
 - Out-of-range `query_idx` values (including negative ones) raise
   `ValueError`. STUMPY silently wraps `query_idx <= -m` through numpy
   negative indexing and fabricates a zero-distance match at a negative
@@ -613,10 +619,14 @@ python bench/bench_stump.py --sizes 524288 1048576 --m 200 --repeat 1 --seed 0 -
   variation warns that those smallest raw distances may be unreliable. This
   is not an absolute-units limit: uniformly rescaling an ordinary finite
   series from subnormal-scale values through ~1e300 remains scale-safe.
-  `stimp`'s raw `pan()` is scale-safe too: it runs under
-  `np.errstate(all="raise")` and emits no floating-point `RuntimeWarning`
-  on `2**-1060`-, 1e307- and 1.7e308-scale series, or on one mixing
-  1e-300- and 1e305-scale halves.
+  `stimp`'s raw `pan()` also runs cleanly under `np.errstate(all="raise")`
+  on `2**-1060`-, 1e307- and 1.7e308-scale series and on one mixing
+  1e-300- and 1e305-scale halves, but it is not scale-invariant at the
+  extremes: its normalization is STUMPY's `(max(T) − min(T))·sqrt(m)`,
+  which under- or overflows there, so the pan saturates exactly as
+  STUMPY's does (a unit-amplitude random walk rescaled to `2**-1060` or
+  1.7e308 changes 296 of 2,400 binary pan cells, bit for bit like
+  `stumpy.aamp_stimp`; at 1e307 none change).
 - `stimp`/`gpu_stimp` differ from STUMPY's pan matrix profile in three
   ways. `P_` returns read-only views of the internal pan array (use
   `.copy()` to edit one), where STUMPY's are writeable. `min_m`, `max_m`
