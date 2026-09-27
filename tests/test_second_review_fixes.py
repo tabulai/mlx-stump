@@ -20,12 +20,13 @@ import warnings
 
 import numpy as np
 import pytest
-import stumpy
 
 import mlx_stump
 from mlx_stump._engine import _CHUNK_MEM_BUDGET, default_chunk_size, tiled_chunk_size
 
 from .conftest import tie_tolerance
+
+stumpy = pytest.importorskip("stumpy")
 
 
 # ------------------------------------------------- 1: refinement cancellation
@@ -174,28 +175,48 @@ class _FakeEngine:
         self.tile_rows = tile_rows
 
 
+# measured device bytes per QT cell (sixth review): the fused Metal kernels
+# hold only QT; the compiled fallback's figures cover the larger of MLX 0.30
+# and 0.32 (see _engine._fallback_cell; small-k top-k)
+_CELL = {
+    (True, 1, True): 4,
+    (True, 1, False): 4,
+    (True, 2, True): 4,
+    (True, 2, False): 4,
+    (False, 1, True): 16,
+    (False, 1, False): 8,
+    (False, 2, True): 56,
+    (False, 2, False): 36,
+}
+
+
 @pytest.mark.parametrize(
     "l,m", [(65_337, 200), (2_000_000, 200), (10_000_000, 200), (16_385, 16_384)]
 )
-@pytest.mark.parametrize("k,self_join", [(1, True), (2, True), (4, False)])
-def test_default_chunk_size_respects_budget(l, m, k, self_join):
+@pytest.mark.parametrize("k,self_join", [(1, True), (1, False), (2, True), (4, False)])
+@pytest.mark.parametrize("fused", [True, False])
+def test_default_chunk_size_respects_budget(l, m, k, self_join, fused):
     """The budget is a real ceiling now: no 16-row floor, and the per-row
     query-window batch (which grows with m) is accounted for. A single row
-    may exceed the budget only when even chunk_size=1 does (b == 1)."""
+    may exceed the budget only when even chunk_size=1 does (b == 1). The
+    per-cell cost is that of the reduction that runs."""
     eng = _FakeEngine(l, m)
-    b = default_chunk_size(eng, l_q=l, k=k, self_join=self_join)
-    per_row = l * (16 if k == 1 else (48 if self_join else 40)) + m * 24
+    b = default_chunk_size(eng, l_q=l, k=k, self_join=self_join, fused=fused)
+    per_row = l * _CELL[(fused, min(k, 2), self_join)] + m * 24
     assert b >= 1
     assert b * per_row <= _CHUNK_MEM_BUDGET or b == 1
 
 
-def test_tiled_chunk_size_respects_budget():
+@pytest.mark.parametrize("fused", [True, False])
+def test_tiled_chunk_size_respects_budget(fused):
     for l, m, tile_rows in [(10_000_000, 200, 327_680), (65_537, 32_768, 2_048)]:
         eng = _FakeEngine(l, m, tile_rows=tile_rows)
-        for k, self_join, cell in [(1, True, 16), (2, True, 48), (2, False, 40)]:
-            b = tiled_chunk_size(eng, l_q=l, k=k, self_join=self_join)
+        for k, self_join in [(1, True), (1, False), (2, True), (2, False)]:
+            b = tiled_chunk_size(eng, l_q=l, k=k, self_join=self_join, fused=fused)
+            cell = _CELL[(fused, k, self_join)]
+            merge = 96 * k if k > 1 else 0  # host top-k merge workspace, per row
             assert b >= 1
-            assert b * (eng.tile_rows * cell + m * 24) <= _CHUNK_MEM_BUDGET or b == 1
+            assert b * (eng.tile_rows * cell + m * 24 + merge) <= _CHUNK_MEM_BUDGET or b == 1
 
 
 # --------------------------------------- adversarial-verification round two
@@ -302,22 +323,21 @@ def test_aamp_mixed_scale_centered():
     assert sorted(int(i) for _, i in M) == sorted(int(i) for _, i in Mr)
 
 
-def test_match_refinement_is_chunked():
+def test_match_refinement_is_chunked(monkeypatch):
     """max_distance=inf selects every finite entry for refinement; that must
     stream in byte-budgeted chunks (it used to materialize all l*m float64
     windows at once — ~GiBs for long series), with identical results."""
-    import mlx_stump._stump as st
+    import mlx_stump._engine as eng
 
     rng = np.random.default_rng(11)
     T = rng.standard_normal(3000)
     Q = rng.standard_normal(21)
     expected = mlx_stump.match(Q, T, max_distance=float("inf"))
-    orig = st._REFINE_MEM_BUDGET
-    st._REFINE_MEM_BUDGET = 21 * 8 * 4 * 7  # ~7 rows per chunk
-    try:
-        got = mlx_stump.match(Q, T, max_distance=float("inf"))
-    finally:
-        st._REFINE_MEM_BUDGET = orig
+    # one budget, read at call time, drives stump/match/mass refinement and
+    # the memory estimate alike
+    monkeypatch.setattr(eng, "_REFINE_MEM_BUDGET", 21 * 8 * 4 * 7)
+    assert eng.refine_chunk_rows(21) == 7
+    got = mlx_stump.match(Q, T, max_distance=float("inf"))
     np.testing.assert_array_equal(expected.astype(float), got.astype(float))
 
 

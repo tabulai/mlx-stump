@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-import stumpy
 
 import mlx_stump
 
@@ -14,6 +13,8 @@ from .conftest import (
     assert_profile_close,
     tie_tolerance,
 )
+
+stumpy = pytest.importorskip("stumpy")
 
 
 @pytest.mark.parametrize("k", [2, 3])
@@ -85,5 +86,5 @@ def test_aamp_ab_join():
 
 def test_aamp_p_not_2_raises():
     T = DATASETS["white_noise"](200, seed=25)
-    with pytest.raises(NotImplementedError, match="p=2.0"):
+    with pytest.raises(NotImplementedError, match=r"p=2\.0"):
         mlx_stump.stump(T, 8, normalize=False, p=1.0)

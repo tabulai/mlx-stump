@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import subprocess
-import sys
-
 import numpy as np
 import pytest
 
@@ -16,6 +13,8 @@ from mlx_stump._engine import (
     estimated_peak_bytes,
     resident_block_bytes,
 )
+
+from .conftest import run_isolated
 
 
 def test_topk_estimate_uses_allocator_footprint_and_ab_lengths():
@@ -37,13 +36,16 @@ def test_topk_estimate_uses_allocator_footprint_and_ab_lengths():
     )
 
 
-def test_estimate_models_explicit_chunk_size_override():
-    """A caller-selected batch may deliberately exceed the automatic cap."""
-    l, m, k = 4_951, 50, 2
-    automatic = estimated_peak_bytes(l, m, k=k)
-    explicit = estimated_peak_bytes(l, m, k=k, chunk_size=l)
+@pytest.mark.parametrize("fused,l,cell", [(False, 4_951, 56), (True, 20_000, 4)])
+def test_estimate_models_explicit_chunk_size_override(fused, l, cell):
+    """A caller-selected batch may deliberately exceed the automatic cap.
+    ``cell`` is the measured device bytes per QT cell of the self-join top-k
+    reduction that runs (the fused kernel or the compiled fallback)."""
+    m, k = 50, 2
+    automatic = estimated_peak_bytes(l, m, k=k, fused=fused)
+    explicit = estimated_peak_bytes(l, m, k=k, chunk_size=l, fused=fused)
 
-    one_row = l * 48 + m * 24 + _CENTER_ROW_BYTES  # plus local-normalization scratch
+    one_row = l * cell + m * 24 + _CENTER_ROW_BYTES  # plus local-normalization scratch
     numeric = l * (16 * k + 16)
     assert explicit >= resident_block_bytes(l, m) + l * one_row + numeric
     assert explicit > 2 * automatic
@@ -56,16 +58,18 @@ def test_estimate_includes_one_row_centering_floor():
     """A single enormous window can exceed the nominal 64 MiB CPU budget."""
     l, m = 5, 10_000_000
     block = resident_block_bytes(l, m)
-    actual_upload_floor = 2 * block + max(1 << 26, m * 8 + _CENTER_ROW_BYTES)
+    # the block is built in place in its device buffer (no staging copy)
+    actual_upload_floor = block + max(1 << 26, m * 8 + _CENTER_ROW_BYTES)
     assert estimated_peak_bytes(l, m, chunk_size=1) >= actual_upload_floor
 
 
-def test_explicit_small_m_batch_estimate_includes_query_row_scratch():
+@pytest.mark.parametrize("fused,cell", [(False, 16), (True, 4)])
+def test_explicit_small_m_batch_estimate_includes_query_row_scratch(fused, cell):
     """A huge explicit batch retains local-normalization vectors per row."""
     l, m, l_q = 1_000, 3, 1_000_000
     one_query_row = m * 24 + _CENTER_ROW_BYTES
-    expected = resident_block_bytes(l, m) + l_q * (l * 16 + one_query_row)
-    assert estimated_peak_bytes(l, m, l_q=l_q, chunk_size=l_q) >= expected
+    expected = resident_block_bytes(l, m) + l_q * (l * cell + one_query_row)
+    assert estimated_peak_bytes(l, m, l_q=l_q, chunk_size=l_q, fused=fused) >= expected
 
 
 @pytest.mark.parametrize(
@@ -98,13 +102,16 @@ def test_tiled_topk_estimate_includes_host_merge_workspace():
     assert block < l * m * 4  # real tiled geometry from the RSS reproducer
 
     # tiled_chunk_size sizes against the nominal tile_rows upper bound even
-    # though the balanced resident block can be narrower.
+    # though the balanced resident block can be narrower. k=2000 runs the
+    # compiled fallback (52 B per AB top-k cell for its single-stage
+    # selection); the per-row outputs and the host merge workspace are
+    # charged per row as well.
     tile_rows = max(4, _TILE_WINDOW_BYTES // (4 * m))
-    per_row = tile_rows * 40 + m * 24 + _CENTER_ROW_BYTES  # AB top-k + query scratch
+    per_row = tile_rows * 52 + (8 * k + 16) + m * 24 + _CENTER_ROW_BYTES + 96 * k
     batch = min(4_096, max(1, _CHUNK_MEM_BUDGET // per_row), l_q)
     numeric = l_q * (16 * k + 16)
     accum = l_q * 12 * k
-    merge_workspace = batch * k * 80
+    merge_workspace = batch * k * 96  # measured peak 85 B/neighbour/row at k=2
     sweep = block + _CHUNK_MEM_BUDGET + numeric + accum + merge_workspace
 
     assert estimated_peak_bytes(l, m, k=k, self_join=False, l_q=l_q) >= sweep
@@ -197,24 +204,16 @@ def test_raw_constant_flags_are_consistently_validated_then_ignored():
 def test_exact_affine_certificate_has_bounded_auxiliary_memory():
     """A legal million-sample scaled duplicate must not build bigint lists."""
     source = r"""
-import resource
-import sys
-import numpy as np
 from mlx_stump._match import _exact_positive_affine_rows
 
-unit = 1 if sys.platform == "darwin" else 1024
 m = 1_000_000
 Q = np.arange(m, dtype=np.float64)
 W = 2.0 * Q + 1.0
-before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * unit
+before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * _unit
 assert _exact_positive_affine_rows(Q, W)[0]
-peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * unit
-print((peak - before) / 2**20)
 """
-    result = subprocess.run(
-        [sys.executable, "-c", source], capture_output=True, text=True, check=True
-    )
-    growth_mib = float(result.stdout.strip().splitlines()[-1])
+    before, peak, _ = run_isolated(source)
+    growth_mib = peak - before
     assert growth_mib < 64.0, f"affine certificate grew RSS by {growth_mib:.1f} MiB"
 
 
@@ -222,49 +221,33 @@ print((peak - before) / 2**20)
 def test_high_precision_non_affine_fallback_has_bounded_memory():
     """The rare Decimal path must stream rather than retain four huge lists."""
     source = r"""
-import resource
-import sys
-import numpy as np
 from mlx_stump._match import _refine_candidates
 
-unit = 1 if sys.platform == "darwin" else 1024
 m = 1_000_000
 Q = np.random.default_rng(1).standard_normal(m)
 W = Q.copy()
 W[2] = np.nextafter(W[2], np.inf)
-before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * unit
+before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * _unit
 distance = _refine_candidates(Q, W, [0], True, False, np.array([False]))[0]
-peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * unit
 assert distance > 0.0
-print((peak - before) / 2**20)
 """
-    result = subprocess.run(
-        [sys.executable, "-c", source], capture_output=True, text=True, check=True
-    )
-    growth_mib = float(result.stdout.strip().splitlines()[-1])
+    before, peak, _ = run_isolated(source)
+    growth_mib = peak - before
     assert growth_mib < 64.0, f"Decimal refinement grew RSS by {growth_mib:.1f} MiB"
 
 
 def test_default_threshold_has_one_linear_scratch_array():
     """Computing the default cutoff must not retain three profile copies."""
     source = r"""
-import resource
-import sys
-import numpy as np
 from mlx_stump._match import _default_max_distance
 
-unit = 1 if sys.platform == "darwin" else 1024
 D = np.linspace(0.0, 1.0, 4_000_000, dtype=np.float64)
-before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * unit
+before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * _unit
 value = _default_max_distance(D)
 assert np.isfinite(value)
-peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * unit
-print((peak - before) / 2**20)
 """
-    result = subprocess.run(
-        [sys.executable, "-c", source], capture_output=True, text=True, check=True
-    )
-    growth_mib = float(result.stdout.strip().splitlines()[-1])
+    before, peak, _ = run_isolated(source)
+    growth_mib = peak - before
     assert growth_mib < 56.0, f"default threshold grew RSS by {growth_mib:.1f} MiB"
 
 

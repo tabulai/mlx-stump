@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import pathlib
 import time
 
 import numpy as np
@@ -23,13 +24,20 @@ import numpy as np
 import mlx_stump
 
 
-def _time(fn, repeat: int) -> float:
-    best = np.inf
+def _time(fn, repeat: int):
+    """Best wall time of ``repeat`` calls, and the last call's result.
+
+    The previous result is released before the clock starts, so every timed
+    call sees the same memory state; reusing the last result for the
+    precision columns avoids one more untimed full run per size.
+    """
+    best, out = np.inf, None
     for _ in range(repeat):
+        out = None
         t0 = time.perf_counter()
-        fn()
+        out = fn()
         best = min(best, time.perf_counter() - t0)
-    return best
+    return best, out
 
 
 def _discord_topk(P: np.ndarray, excl: int, k: int = 10) -> set[int]:
@@ -57,14 +65,24 @@ def provenance(stumpy_threads: int | None = None) -> str:
     def _run(*cmd):
         try:
             return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout.strip()
-        except Exception:  # noqa: BLE001 - provenance is best effort
+        except Exception:  # provenance is best effort
             return "unknown"
 
     chip = _run("sysctl", "-n", "machdep.cpu.brand_string")
-    commit = _run("git", "rev-parse", "--short", "HEAD")
-    tree_state = _run("git", "status", "--porcelain", "--untracked-files=normal")
-    if tree_state not in ("", "unknown"):
-        commit += "+dirty"
+    # Ask git about the tree the imported package lives in (not the current
+    # directory), and only when the imported file is tracked there: a
+    # `pip install .` copy, even one in the checkout's gitignored .venv, is
+    # not that checkout's HEAD. The dirty check covers the whole worktree, so
+    # edits to this script count too.
+    pkg = str(pathlib.Path(mlx_stump.__file__).resolve().parent)
+    tracked = _run("git", "-C", pkg, "ls-files", "--error-unmatch", "--", "__init__.py")
+    if tracked in ("", "unknown"):
+        commit = "installed build, commit unknown"
+    else:
+        commit = _run("git", "-C", pkg, "rev-parse", "--short", "HEAD")
+        tree_state = _run("git", "-C", pkg, "status", "--porcelain", "--untracked-files=normal")
+        if tree_state not in ("", "unknown"):
+            commit += "+dirty"
     try:
         import stumpy
 
@@ -93,7 +111,7 @@ def main() -> None:
     stumpy_threads = None
     if use_stumpy:
         try:
-            import stumpy  # noqa: F811
+            import stumpy
         except ImportError:
             print("stumpy not installed - GPU-only run (from a checkout: pip install '.[bench]')")
             use_stumpy = False
@@ -141,11 +159,9 @@ def main() -> None:
 
     for n in args.sizes:
         T = rng.standard_normal(n).cumsum()
-        t_ours = _time(lambda T=T: mlx_stump.stump(T, m), args.repeat)
-        mp = mlx_stump.stump(T, m)
+        t_ours, mp = _time(lambda T=T: mlx_stump.stump(T, m), args.repeat)
         if use_stumpy:
-            t_ref = _time(lambda T=T: stumpy.stump(T, m), args.repeat)
-            ref = stumpy.stump(T, m)
+            t_ref, ref = _time(lambda T=T: stumpy.stump(T, m), args.repeat)
             dP = float(np.max(np.abs(mp.P_ - ref.P_)))
             agree = float(np.mean(mp.I_ == ref.I_))
             overlap = len(_discord_topk(mp.P_, excl) & _discord_topk(ref.P_, excl))
@@ -155,6 +171,7 @@ def main() -> None:
             )
         else:
             print(f"| {n:,} | {t_ours:.3f} | - | - | - | - | - |")
+        mp = ref = None  # release before the next size's clock starts
 
 
 if __name__ == "__main__":

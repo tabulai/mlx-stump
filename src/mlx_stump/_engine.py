@@ -29,6 +29,30 @@ any length. (An FFT cross-correlation fallback was used here previously; it
 operated on the raw float32 series, could not center per-window, and was
 numerically wrong for near-constant data.)
 
+Sweep reduction. Each batch's QT is reduced to per-row minima (``k == 1``;
+self-joins also keep the left and right minima) or top-k lists by one of two
+bit-identical implementations, chosen by the single predicate
+``_fused_reducer(k)``:
+
+- ``_kernels.FusedReduce`` (a Metal GPU that is MLX's default device,
+  ``k <= 16``, and kernels that launch there, probed once per process): one
+  threadgroup per query row reads each QT element once and evaluates the
+  distance in registers, so QT is the only ``(B, width)`` buffer of the
+  batch;
+- ``ReduceStep``, one ``mx.compile`` graph (the CPU device, ``k > 16``, and
+  the reference in the tests), which materializes the distances, masked
+  variants and top-k sort buffers.
+
+Both evaluate ``_znorm_sq`` / ``_abs_sq`` with the same float32 operations
+and constants (``reduce_consts``: ``1/m`` is rounded once on the host) and
+select lexicographically by ``(d2, key)``. The key reproduces STUMPY's
+exact-tie rule: its self-join diagonal traversal visits candidates in
+ascending offset, the left one first, and keeps the first of equal values,
+so ``key = 2*|j - i| + (j > i)``; AB-joins keep the lowest column,
+``key = j``. Candidates that tie only in float32 (their float64 distances
+differ below float32 resolution) go through the same rule, so which of
+those wins is arbitrary with respect to float64.
+
 Memory accounting. Three byte budgets bound each ordinary computation;
 documented one-row/one-block floors can exceed a nominal budget at extreme
 ``m``:
@@ -37,14 +61,21 @@ documented one-row/one-block floors can exceed a nominal budget at extreme
   ``_MATMUL_WINDOW_BYTES``, else one ``_TILE_WINDOW_BYTES`` column block at a
   time (each block is released before the next one is built);
 - the live per-batch GPU intermediates, ``_CHUNK_MEM_BUDGET``
-  (``default_chunk_size``/``tiled_chunk_size`` size the query batch to it);
+  (``default_chunk_size``/``tiled_chunk_size`` size the query batch to it at
+  the measured bytes per QT cell of the reduction that runs, ``_FUSED_CELL``
+  or ``_fallback_cell``; only one batch is in flight, the next batch's query
+  windows being built on the CPU while it runs);
 - CPU-side float64 temporaries: the block-centering step (``_CENTER_BYTES``),
   the sigma repair in preprocessing and the float64 refinement chunks (see
   ``_preprocess`` / ``_stump``), each a fixed budget independent of ``n``.
 
-Building a block stages it in numpy before the device copy, so the block
-exists twice for the duration of the upload. ``estimated_peak_bytes`` puts
-the pieces together; the O(n) per-series arrays are on top of it.
+A block is built in place: each centered float64 chunk is cast straight
+into the block's own device buffer (unified memory), so no block-sized host
+staging copy exists. ``estimated_peak_bytes`` puts the pieces together; the
+O(n) per-series arrays are on top of it. A ``stump`` call that raises
+(including Ctrl-C) releases its device arrays and MLX's cache before the
+exception propagates, as a successful call does before it returns
+(``free_gpu_after_error``).
 
 Distance special cases follow STUMPY's semantics:
 - z-normalized: d = sqrt(2m(1 - rho)), rho from the mean-centered covariance;
@@ -62,18 +93,44 @@ import numpy as np
 from ._preprocess import PreprocessedSeries, center_rows_stable
 
 _INF = float("inf")
+_U64_MAX = np.uint64(2**64 - 1)
+# columns per first-stage chunk of the compiled fallback's top-k selection
+_TOPK_CHUNK = 1024
 
-# budget for the live per-chunk GPU intermediates (the query window batch,
-# QT, squared distances, the masked left/right variants, and the top-k
-# sort/gather buffers). Actual peak memory also includes the per-call
-# constants (the window matrix or one tile of it) on top of this.
+# budget for the live per-batch GPU intermediates (the query window batch,
+# QT, the reduction outputs and, on the compiled fallback, the squared
+# distances, masked left/right variants and top-k sort/gather buffers).
+# Actual peak memory also includes the per-call constants (the window
+# matrix or one tile of it) and the O(l) per-series device arrays (window
+# stats and masks: 6 B per window and series normalized, 13 B raw, plus the
+# fallback's 4 B column index per target window) on top of this. The
+# k == 1 sweeps fill the budget: their cells carry no headroom (the fused
+# kernels on MLX 0.30 and 0.32, the fallback on 0.30), so measured peaks
+# exceed block + budget by part of those arrays: at n=131072, m=50 by
+# +0.8 MiB (fused, raw self-join; the arrays are 1.6 MiB), +2.4 MiB (fused,
+# raw AB-join; 3.25 MiB) and +2.3 MiB (fallback on 0.30, raw AB-join;
+# 3.75 MiB).
 _CHUNK_MEM_BUDGET = 3 << 27  # ~384 MiB
+# Device bytes per QT cell (batch row x target column) live during one
+# batch, measured as the slope of MLX's peak over two explicit batch sizes
+# (n=32768, m=50; normalized and raw alike). The fused kernels materialize
+# QT and nothing else of that shape: 4.0 on MLX 0.30 and 0.32. The compiled
+# fallback (_fallback_cell) also holds d2 and the masked left/right
+# variants and, for k > 1, the uint64 (d2, key) selection keys and sort
+# buffers.
+_FUSED_CELL = 4
+# host bytes per neighbour per row of the tiled top-k merge (_stump's
+# _merge_topk: the block result, both 2k-wide concatenations, the self-join
+# tie keys, the full lexsort permutation, the gathered outputs, and NumPy's
+# sort workspace). tracemalloc peaks: 84.6 at k=2, 71 at k=16, 70 at k=100.
+_TILED_MERGE_CELL = 96
 # cap for materializing the (l, m) target window matrix on the GPU in one
 # piece; above it the engine switches to tiled column blocks. The tiled
-# sweep runs the same compiled reduce step per block and measured as fast
-# as or faster than the dense one (n=524288, m=200: 47.7 s tiled/128 MiB
-# vs 47.9 s dense in one run, 38.8 s vs 52.8 s in another, at about half
-# the peak memory), so the cap trades nothing for memory.
+# sweep runs the same reduction per block and measured as fast as or faster
+# than the dense one at about half the peak memory (n=524288, m=200, fused
+# kernels: 26.2 s tiled/128 MiB vs 28.3 s dense, medians of 3 interleaved
+# runs, peak 401 vs 785 MiB, identical output; the compiled step earlier
+# gave 47.7 s vs 47.9 s), so the cap trades nothing for memory.
 _MATMUL_WINDOW_BYTES = 1 << 28  # ~256 MiB
 # size of one materialized target window block in tiled mode
 _TILE_WINDOW_BYTES = 1 << 27  # ~128 MiB
@@ -83,9 +140,11 @@ _TILE_WINDOW_BYTES = 1 << 27  # ~128 MiB
 # their observed allocator peak (72-80 B/row) and ufunc transients.
 _CENTER_BYTES = 1 << 26  # ~64 MiB
 _CENTER_ROW_BYTES = 128
-# byte budget for the float64 window copies held live by one refinement
-# chunk (two fancy-indexed window blocks plus their centered copies); the
-# refinement runs after the device memory has been released
+# byte budget for the float64 window copies live at once across all the
+# refinement threads, which split one chunk of refine_chunk_rows(m) rows;
+# each thread holds at most three window blocks of its rows (query, target
+# and one temporary) against the four budgeted. The refinement runs after
+# the device memory has been released
 _REFINE_MEM_BUDGET = 1 << 28  # ~256 MiB
 
 
@@ -96,6 +155,54 @@ def refine_chunk_rows(m: int) -> int:
 def _center_rows(m: int) -> int:
     """Window rows centered per float64 step so the temporary fits ``_CENTER_BYTES``."""
     return max(1, _CENTER_BYTES // (m * 8 + _CENTER_ROW_BYTES))
+
+
+def _writable_host_view(a: mx.array) -> np.ndarray | None:
+    """A writable NumPy view of the evaluated, freshly allocated float32
+    array ``a``'s own buffer, or None when MLX does not export one.
+
+    An evaluated ``mx.zeros`` owns a private, C-contiguous buffer in unified
+    memory, exported writable through the buffer protocol (checked on MLX
+    0.30 and 0.32, on the GPU and the CPU device), and later device work on
+    ``a`` reads what the host wrote. Only arrays nothing else references
+    may be written this way: MLX treats arrays as immutable.
+    """
+    try:
+        mv = memoryview(a)
+    except (TypeError, ValueError, BufferError):
+        return None
+    if mv.readonly or not mv.c_contiguous or mv.format != "f" or mv.shape != tuple(a.shape):
+        return None
+    return np.asarray(mv)
+
+
+def free_gpu_after_error(exc: BaseException) -> None:
+    """Return the GPU phase's memory to the system while ``exc`` propagates.
+
+    Call it inline from the ``except`` clause of the function that owns the
+    device arrays, after releasing its own references (a decorator would
+    add a frame and shift every ``stacklevel``). The traceback keeps the
+    finished mlx-stump frames below the handler alive, and with them the
+    window block, the reducer and the batch arrays in their locals: those
+    frames are cleared (the user's frames stay intact for post-mortem
+    debugging). A batch still in flight (``mx.async_eval``) holds its
+    buffers until it completes, so the stream is synchronized before MLX's
+    cache is cleared.
+    """
+    tb = exc.__traceback__
+    tb = tb.tb_next if tb is not None else None  # the handler's own frame is still executing
+    while tb is not None:
+        if tb.tb_frame.f_globals.get("__name__", "").startswith("mlx_stump."):
+            try:
+                tb.tb_frame.clear()
+            except RuntimeError:  # an executing or suspended frame
+                pass
+        tb = tb.tb_next
+    for release in (mx.synchronize, mx.clear_cache):
+        try:
+            release()
+        except Exception:  # never mask the exception being handled
+            pass
 
 
 def resident_block_bytes(l: int, m: int) -> int:
@@ -123,29 +230,37 @@ def estimated_peak_bytes(
     self_join: bool = True,
     l_q: int | None = None,
     chunk_size: int | None = None,
+    fused: bool | None = None,
 ) -> int:
     """Estimate of the bytes one join needs beyond its O(n) per-series arrays.
 
     ``l`` is the number of target windows (the side the engine
     materializes), ``l_q`` the number of query windows (the output rows;
     defaults to ``l``), and ``chunk_size`` has the same meaning as in
-    :func:`mlx_stump.stump`. With no explicit chunk size, the automatic
-    byte-budgeted batch is modeled; with one, the requested batch (clamped
-    to ``l_q``) is modeled, including requests that deliberately exceed the
-    automatic ~384 MiB device budget. The largest of three phases:
+    :func:`mlx_stump.stump`. ``fused`` selects the sweep reduction being
+    modeled; by default it is the one this process would run
+    (``_fused_reducer(k)``: the fused Metal kernels on the GPU for
+    ``k <= 16``, else the compiled fallback, whose batches are smaller).
+    With no explicit chunk size, the automatic byte-budgeted batch is
+    modeled; with one, the requested batch (clamped to ``l_q``) is modeled,
+    including requests that deliberately exceed the automatic ~384 MiB
+    device budget. The largest of three phases:
 
-    - upload: the block staged in numpy plus its device copy plus the
-      centering temporary;
+    - upload: the block, which is built in place in its device buffer, plus
+      the centering temporary;
     - sweep: the resident block plus the per-batch intermediates budget (or
       one batch row, when even a single row exceeds the budget), plus the
-      numeric profile/index outputs (float64 + int64 per neighbor,
-      left/right indices; the tiled sweep also keeps float32/int64 top-k
-      accumulators). The budget is enforced batch by batch — each batch is
-      synchronized before the next allocates and the trailing batch is
-      computed at full width — so exactly one set of intermediates exists.
-      Tiled top-k joins also merge each device result into the running set
-      on the host; the two concatenations, full stable-argsort permutation,
-      gather results, and sorting workspace are included here;
+      numeric outputs: the int64 neighbor and left/right indices the sweep
+      fills, and the float64 profile, which only the refinement allocates
+      but which is charged here too, as headroom (the tiled sweep also
+      keeps float32/int64 top-k accumulators). The budget is enforced batch
+      by batch — each batch is synchronized before the next allocates and
+      the trailing batch is computed at full width — so exactly one set of
+      intermediates exists (the next batch's query windows, built while it
+      runs, are within the per-row query allowance). Tiled top-k joins also
+      merge each device result into the running set on the host; the two
+      concatenations, tie keys, full lexsort permutation, gather results,
+      and sorting workspace are included here;
     - assembly: after the device memory is released, the float64
       refinement chunk plus the numeric outputs, the top-k reordering
       temporaries, and the object-dtype ``mparray`` STUMPY's output layout
@@ -158,7 +273,13 @@ def estimated_peak_bytes(
     It is an estimate with headroom, not a hard cap: MLX's allocator rounds
     buffers up (about +0.5% observed), the O(n) series and stat arrays are
     not included, and the figures are MLX's own active-memory peak plus
-    host memory (GPU-written buffers are invisible to RSS on macOS).
+    host memory (GPU-written buffers are invisible to RSS on macOS). The
+    phases are also not perfectly disjoint in process terms: Metal returns
+    cleared buffers asynchronously (tens to ~200 ms after
+    ``mx.clear_cache()``) and macOS keeps freed large host temporaries
+    resident, so at large ``m`` the refinement's float64 chunks can land on
+    part of the sweep's footprint (tiled n=60000, m=4000: RSS grew 555-571
+    MiB against a 508-516 MiB estimate).
     """
     for name, value in (("l", l), ("m", m), ("k", k)):
         if not (
@@ -183,22 +304,24 @@ def estimated_peak_bytes(
         and chunk_size >= 1
     ):
         raise ValueError("`chunk_size` must be a positive integer.")
+    if fused is not None and not isinstance(fused, (bool, np.bool_)):
+        raise ValueError("`fused` must be a boolean or None.")
     l, m, k, l_q = int(l), int(m), int(k), int(l_q)
     self_join = bool(self_join)
+    fused = _fused_reducer(k) if fused is None else bool(fused)
     block = resident_block_bytes(l, m)
     full = l * m * 4
     tiled = full > _MATMUL_WINDOW_BYTES
     width = block // (m * 4)  # columns of the resident block
-    cell = 16 if k == 1 else (48 if self_join else 40)
-    one_row = width * cell + _query_batch_bytes(m)
+    one_row = _batch_row_bytes(width, m, k, self_join, fused)
     if chunk_size is None:
         # Match the actual sizing helpers. Tiled batches are sized against
         # MassEngine.tile_rows (the nominal upper bound), while blocks are
         # subsequently balanced and can be narrower than that bound.
-        sizing_width = max(4, _TILE_WINDOW_BYTES // (4 * m)) if tiled else l
-        sizing_row = sizing_width * cell + _query_batch_bytes(m)
-        batch_cap = 4096 if tiled else 1024
-        batch = max(1, min(batch_cap, _CHUNK_MEM_BUDGET // sizing_row))
+        if tiled:
+            batch = _tiled_batch(max(4, _TILE_WINDOW_BYTES // (4 * m)), m, k, self_join, fused)
+        else:
+            batch = _dense_batch(l, m, k, self_join, fused)
         batch = min(batch, max(1, l_q))
         # Keep the whole advertised device budget as conservative headroom
         # when automatic sizing is used. A one-row floor can exceed it.
@@ -206,17 +329,20 @@ def estimated_peak_bytes(
     else:
         batch = min(int(chunk_size), max(1, l_q))
         device_batch = batch * one_row
-    numeric = l_q * (16 * k + 16)  # P (float64) and I (int64) per neighbor, IL/IR
+    # P (float64) and I (int64) per neighbor, IL/IR. The sweep fills only the
+    # indices (P is allocated by the refinement, in the assembly phase), so
+    # in the sweep term the 8 B/cell for P is headroom.
+    numeric = l_q * (16 * k + 16)
     accum = l_q * 12 * k if (tiled and k > 1) else 0  # tiled top-k merge state
     if tiled and k > 1:
-        # _merge_topk holds the float32/int64 block result, two 2k-wide
-        # concatenations, the full int64 stable-argsort result, both gathered
-        # outputs, and NumPy's stable-sort workspace. 64 B/cell covers the
-        # named arrays; 80 B/cell leaves headroom for the sort implementation.
-        host_batch = batch * k * 80
+        # the _merge_topk workspace (see _TILED_MERGE_CELL); the automatic
+        # tiled batch already charges it per row against the budget, and it
+        # is added here once more as headroom
+        host_batch = batch * k * _TILED_MERGE_CELL
     elif k > 1:
-        # Dense output conversion holds one float64 value copy and one int64
-        # index copy for the current batch alongside the persistent outputs.
+        # Dense output conversion holds one float32 value copy (only its
+        # finiteness is used), its masks, and one int64 index copy for the
+        # current batch alongside the persistent outputs: < 16 B per cell.
         host_batch = batch * k * 16
     else:
         # Value/index and (for self-joins) left/right conversion vectors.
@@ -230,9 +356,14 @@ def estimated_peak_bytes(
     # undercounted the canonical k=100 process peak by ~25 MiB.
     boxed = l_q * (2 * k + 2) * (8 + 32)
     assembly = refine + numeric + reorder + boxed
-    # _center_rows has a one-row floor when a single float64 window plus its
-    # rowwise scratch exceeds the nominal centering budget. Model it too.
-    upload = 2 * block + max(_CENTER_BYTES, m * 8 + _CENTER_ROW_BYTES)
+    # The block is centered chunk by chunk straight into its device buffer
+    # (no NumPy staging copy). _center_rows has a one-row floor when a single
+    # float64 window plus its rowwise scratch exceeds the nominal centering
+    # budget. Model it too. _build_block_T's staged fallback (an MLX that
+    # does not export the buffer writable) would hold one more block; it is
+    # only a safety net, and the tests keep it from being taken on the
+    # supported MLX versions.
+    upload = block + max(_CENTER_BYTES, m * 8 + _CENTER_ROW_BYTES)
     return max(upload, sweep, assembly)
 
 
@@ -243,30 +374,67 @@ def _query_batch_bytes(m: int) -> int:
     return m * 24 + _CENTER_ROW_BYTES
 
 
-def default_chunk_size(engine: MassEngine, l_q: int, k: int = 1, self_join: bool = False) -> int:
+def _fallback_cell(k: int, self_join: bool) -> int:
+    """Device bytes per QT cell of the compiled fallback, covering the larger
+    of MLX 0.30 and 0.32 (which needs 4 fewer): measured 16/8 (self/AB) at
+    k=1; with the two-stage top-k selection 52/32 at k=5-16, 56/36 at k=100
+    and 62/42 at k=256 (the chunk winners add ~40*k/_TOPK_CHUNK); 68/48 for
+    the single-stage selection used above k=256. The top-k cells keep 4 B of
+    headroom on MLX 0.30; the k == 1 cells are exact there (see
+    ``_CHUNK_MEM_BUDGET``)."""
+    if k == 1:
+        return 16 if self_join else 8
+    if 4 * k <= _TOPK_CHUNK:
+        return (56 if self_join else 36) + (40 * k) // _TOPK_CHUNK
+    return 72 if self_join else 52
+
+
+def _batch_row_bytes(width: int, m: int, k: int, self_join: bool, fused: bool) -> int:
+    """Device bytes one query row of a batch holds against ``width`` target
+    columns: its QT row (plus the fallback's distance/sort intermediates),
+    its reduction outputs, and its query window."""
+    cell = _FUSED_CELL if fused else _fallback_cell(k, bool(self_join))
+    # k == 1: up to six 4-byte vectors; top-k: values + indices, left/right
+    out = 24 if k == 1 else 8 * k + 16
+    return width * cell + out + _query_batch_bytes(m)
+
+
+def _dense_batch(l: int, m: int, k: int, self_join: bool, fused: bool) -> int:
+    per_row = _batch_row_bytes(l, m, k, self_join, fused)
+    return max(1, min(1024, _CHUNK_MEM_BUDGET // per_row))
+
+
+def _tiled_batch(tile_rows: int, m: int, k: int, self_join: bool, fused: bool) -> int:
+    per_row = _batch_row_bytes(tile_rows, m, k, self_join, fused)
+    if k > 1:
+        per_row += k * _TILED_MERGE_CELL  # the host merge runs while the block is live
+    return max(1, min(4096, _CHUNK_MEM_BUDGET // per_row))
+
+
+def default_chunk_size(
+    engine: MassEngine, l_q: int, k: int = 1, self_join: bool = False, fused: bool | None = None
+) -> int:
     """Query rows per GPU batch such that live intermediates fit the budget.
 
     The budget is enforced (floor of one row), never overridden for
-    throughput: callers who want bigger batches pass ``chunk_size``.
+    throughput: callers who want bigger batches pass ``chunk_size``. The
+    per-row cost depends on the reduction that runs (``fused`` defaults to
+    ``_fused_reducer(k)``); batches are capped at 1024 rows.
     """
-    if k == 1:
-        per_row = engine.l * 16  # QT + d2 + two masked left/right variants, float32
-    else:
-        # the top-k path additionally holds argpartition/argsort index and
-        # gather intermediates: ~48 bytes/cell measured for self-joins
-        # (which also carry the masked left/right variants), ~40 without
-        per_row = engine.l * (48 if self_join else 40)
-    per_row += _query_batch_bytes(engine.m)
-    b = max(1, min(1024, _CHUNK_MEM_BUDGET // per_row))
-    return min(b, max(1, l_q))
+    fused = _fused_reducer(k) if fused is None else fused
+    return min(_dense_batch(engine.l, engine.m, k, self_join, fused), max(1, l_q))
 
 
-def tiled_chunk_size(engine: MassEngine, l_q: int, k: int = 1, self_join: bool = False) -> int:
-    """Query rows per batch in tiled mode: intermediates span one tile, not l."""
-    cell = 16 if k == 1 else (48 if self_join else 40)
-    per_row = engine.tile_rows * cell + _query_batch_bytes(engine.m)
-    b = max(1, min(4096, _CHUNK_MEM_BUDGET // per_row))
-    return min(b, max(1, l_q))
+def tiled_chunk_size(
+    engine: MassEngine, l_q: int, k: int = 1, self_join: bool = False, fused: bool | None = None
+) -> int:
+    """Query rows per batch in tiled mode: intermediates span one tile, not l.
+
+    Top-k batches also charge the host merge workspace per row; batches are
+    capped at 4096 rows.
+    """
+    fused = _fused_reducer(k) if fused is None else fused
+    return min(_tiled_batch(engine.tile_rows, engine.m, k, self_join, fused), max(1, l_q))
 
 
 class MassEngine:
@@ -305,10 +473,21 @@ class MassEngine:
         window embedded in a much larger-range series enough to change its
         nearest neighbor; local normalization removes that conditioning.
         Raw-distance windows keep the shared affine frame and rolling mean.
+
+        The centered chunks are written straight into the block's own MLX
+        buffer (unified memory, exported writable) rather than staged in a
+        NumPy copy first: a freed block-sized staging array stays resident
+        on macOS, which put RSS above ``estimated_peak_bytes`` at large
+        ``m``. The float32 values and the transposed layout are unchanged.
         """
         source = self.target.T if self.normalize else self.target.Ts
         w = np.lib.stride_tricks.sliding_window_view(source, self.m)[j0:j1]
-        out = np.empty((j1 - j0, self.m), dtype=np.float32)
+        blk = mx.zeros((j1 - j0, self.m), dtype=mx.float32)
+        mx.eval(blk)  # waits for the fill: the host writes below come after it
+        out = _writable_host_view(blk)
+        if out is None:  # not exported writable by this MLX: stage in NumPy
+            blk = None
+            out = np.empty((j1 - j0, self.m), dtype=np.float32)
         step = _center_rows(self.m)
         for s in range(0, j1 - j0, step):
             e = min(s + step, j1 - j0)
@@ -325,7 +504,10 @@ class MassEngine:
                 del active, rms, safe_rms, work
             else:
                 out[s:e] = w[s:e] - self.target.mu[j0 + s : j0 + e, None]
-        return mx.array(out).T
+        if blk is None:
+            blk = mx.array(out)
+        del out
+        return blk.T
 
     def target_blocks(self) -> Iterator[tuple[int, int, mx.array]]:
         """Yield (j0, j1, block) covering all target windows in column order.
@@ -338,9 +520,10 @@ class MassEngine:
 
         Only one block is meant to be alive at a time: the generator drops
         its own reference after yielding, and callers must ``del`` theirs
-        before advancing (a ``for`` target is only rebound on the next
-        iteration), or the previous block stays resident while the next one
-        is built.
+        (and every batch result computed from it) before advancing (a
+        ``for`` target is only rebound on the next iteration), or the
+        previous block stays resident while the next one is built, and the
+        cache clear where the blocks narrow cannot release it.
         """
         if not self.tiled:
             yield 0, self.l, self.W_T
@@ -350,30 +533,18 @@ class MassEngine:
         j0 = 0
         for b in range(nblocks):
             j1 = j0 + base + (1 if b < extra else 0)
+            if b == extra and b > 0:
+                # The blocks narrow by one column here, once per sweep. MLX
+                # reuses a cached buffer only within 2 pages (32 KiB) of the
+                # request, so the wider blocks' window block (m >= ~8192) and
+                # batch buffers (QT at a chunk_size above ~4096 rows) would
+                # otherwise stay cached next to fresh, narrower ones.
+                mx.clear_cache()
             block = self._build_block_T(j0, j1)
             mx.eval(block)
             yield j0, j1, block
             del block
             j0 = j1
-
-    def sliding_dot_products(self, Q_batch: mx.array) -> mx.array:
-        """Centered QT for a (B, m) float32 centered query batch -> (B, l).
-
-        Materializes the full (B, l) row. In tiled mode each block's product
-        is evaluated before the next block is built, so only one block is
-        resident at a time; callers that also need the distances bounded per
-        block (``mass``, the tiled ``stump`` sweep) loop ``target_blocks``
-        themselves instead.
-        """
-        if not self.tiled:
-            return mx.matmul(Q_batch, self.W_T)
-        parts = []
-        for _, _, block in self.target_blocks():
-            part = mx.matmul(Q_batch, block)
-            mx.eval(part)  # a lazy product would pin every block until concatenation
-            parts.append(part)
-            del block
-        return mx.concatenate(parts, axis=1)
 
     def znorm_sq_distances(
         self,
@@ -440,8 +611,17 @@ class MassEngine:
         )
 
 
-def _znorm_sq(QT, sig_inv_q, isconstant_q, isfinite_q, sig_inv_t, isconst_t, isfinite_t, m):
-    rho = QT * (sig_inv_q[:, None] * sig_inv_t[None, :] * (1.0 / m))
+def _znorm_sq(
+    QT, sig_inv_q, isconstant_q, isfinite_q, sig_inv_t, isconst_t, isfinite_t, m, inv_m=None
+):
+    # ``m``/``inv_m`` are Python floats (eager ``mass``) or the 0-d float32
+    # arrays of the compiled sweep step. The step must not compute 1/m on the
+    # device or receive it as a Python constant: mx.compile writes scalar
+    # constants into the kernel source with ~7 significant digits (1/7 came
+    # out 3 ulp off) and recompiles for every new value.
+    if inv_m is None:
+        inv_m = 1.0 / m
+    rho = QT * (sig_inv_q[:, None] * sig_inv_t[None, :] * inv_m)
     # Correlation is mathematically in [-1, 1]. Float32 covariance/stat
     # rounding can stray by an ulp on either side, so enforce both distance
     # bounds; a lower-only clamp allowed raw MASS to exceed 2*sqrt(m).
@@ -472,100 +652,230 @@ def _argmin_and_value(d2):
     return I, P2
 
 
-def _topk(d2, k: int):
-    """Per-row k smallest squared distances (ascending) and their columns."""
-    kk = min(k, d2.shape[1])
-    part = mx.argpartition(d2, kth=kk - 1, axis=1)[:, :kk]
-    vals = mx.take_along_axis(d2, part, axis=1)
-    order = mx.argsort(vals, axis=1)
-    vals = mx.take_along_axis(vals, order, axis=1)
-    idxs = mx.take_along_axis(part, order, axis=1)
-    return vals, idxs
+def _last_argmin_and_value(d2, j):
+    """Like ``_argmin_and_value`` but the LAST minimum wins exact ties.
+
+    The block-local index comes from the ``(1, W)`` column-index input ``j``
+    rather than from ``d2.shape``: a shape-derived Python int would enter the
+    compiled graph as a literal and cost a fresh Metal compile (~0.2 s) for
+    every new series length.
+    """
+    rev = d2[:, ::-1]
+    r = mx.argmin(rev, axis=1)
+    P2 = mx.take_along_axis(rev, r[:, None], axis=1)[:, 0]
+    return mx.take(j[0, ::-1], r) - j[0, 0], P2
+
+
+def _topk(d2, key, k: int):
+    """Per-row k smallest ``(d2, key)`` pairs in lexicographic order: the
+    squared distances and their (non-negative, < 2**31) keys.
+
+    One uint64 per cell, ``|d2| bits << 32 | key``, orders exactly like
+    ``(d2, key)`` for the non-negative (or infinite) distances used here
+    (clearing the sign bit makes -0.0 tie with +0.0, as float comparisons
+    do) and carries both halves, so a values-only partition suffices and the
+    caller decodes the column from the key. Wide rows are selected in two
+    stages: the k smallest of every ``_TOPK_CHUNK``-column chunk, then of
+    those. That is exact, because each of a row's k smallest keys is among
+    its chunk's k smallest, and it replaces the full-row multi-block sort
+    with single-block sorts (a 65437-wide row: 1.3 ms vs 3.2 ms per 96 rows,
+    and less memory). Padding columns hold the maximal key and never reach
+    the output, since every row has at least ``kk`` real columns.
+    """
+    B, W = d2.shape
+    kk = min(k, W)
+    mag = mx.view(d2, mx.uint32) & 0x7FFFFFFF
+    comp = (mag.astype(mx.uint64) << 32) | key.astype(mx.uint64)
+    if W > _TOPK_CHUNK and 4 * kk <= _TOPK_CHUNK:
+        nc = -(-W // _TOPK_CHUNK)
+        comp = mx.pad(comp, ((0, 0), (0, nc * _TOPK_CHUNK - W)), constant_values=mx.array(_U64_MAX))
+        comp = mx.partition(comp.reshape(B * nc, _TOPK_CHUNK), kth=kk - 1, axis=1)[:, :kk]
+        comp = comp.reshape(B, nc * kk)
+    top = mx.sort(mx.partition(comp, kth=kk - 1, axis=1)[:, :kk], axis=1)
+    return mx.view((top >> 32).astype(mx.uint32), mx.float32), (top & 0xFFFFFFFF).astype(mx.int32)
+
+
+def reduce_consts(m: int) -> np.ndarray:
+    """``[m, 1/m, 2m, 4m]`` in float32; ``1/m`` is rounded once, on the host.
+
+    The fused kernels read all four from one buffer; ``ReduceStep`` receives
+    ``m`` and the same ``1/m`` as 0-d arrays and forms ``2m`` and ``4m`` on
+    the device, which is exact in float32 for integer ``m``. Sharing these
+    values is part of what makes the two reductions bit-identical.
+    """
+    m = float(m)
+    return np.array([m, 1.0 / m, 2.0 * m, 4.0 * m], dtype=np.float32)
+
+
+def _fused_reducer(k: int) -> bool:
+    """The one dispatch predicate: does this process run the fused kernels?
+
+    True only on a Metal GPU that is MLX's default device, for ``k`` within
+    the top-k kernel's range, and when the ``k`` kernels launch on this GPU
+    (``_kernels.launch_threadgroup``: probed once per process and ``k``;
+    a failure warns and falls back). Both the reducer choice
+    (``make_reducer``) and the batch sizing (``default_chunk_size``,
+    ``tiled_chunk_size``, ``estimated_peak_bytes``) are derived from it, so a
+    batch sized for the fused path's 4 B/cell never reaches the fallback.
+    """
+    from ._kernels import FUSED_TOPK_MAX, launch_threadgroup
+
+    return (
+        k <= FUSED_TOPK_MAX
+        and mx.metal.is_available()
+        and mx.default_device() == mx.gpu
+        and launch_threadgroup(k) is not None
+    )
+
+
+def make_reducer(
+    query: PreprocessedSeries,
+    engine: MassEngine,
+    *,
+    normalize: bool,
+    self_join: bool,
+    excl: int,
+    k: int,
+    fused: bool,
+):
+    """The sweep reduction for one ``stump`` call: ``FusedReduce`` when
+    ``fused`` (``_fused_reducer(k)``), else the compiled ``ReduceStep``."""
+    kwargs = dict(
+        normalize=normalize,
+        self_join=self_join,
+        excl=excl,
+        k=k,
+        consts=reduce_consts(engine.m),
+    )
+    if fused:
+        from ._kernels import FusedReduce
+
+        return FusedReduce(query, engine.target, **kwargs)
+    return ReduceStep(query, engine.target, **kwargs)
 
 
 class ReduceStep:
-    """One compiled kernel: squared distances + the per-row reductions.
+    """Compiled fallback reduction: squared distances + the per-row selections.
 
-    Only ``m``/``excl``/``k`` are baked in as constants; every array — the QT
-    block, both series' stats, and the row/column index vectors — is an
-    explicit argument. (Closure-capturing the target arrays would alias a
-    traced input for single-chunk self-joins, which MLX's compile rejects.)
-    Running the whole chain as one compiled graph is what keeps the
-    per-chunk cost memory-bound instead of dispatch-bound — the uncompiled
-    op-by-op form materializes every elementwise intermediate and ran the
-    tiled sweep ~2.5x slower than the dense one.
+    This is the reference the fused Metal kernels (``_kernels.FusedReduce``)
+    are tested against bit for bit, and it runs whenever they cannot: on the
+    CPU device, without Metal, and for ``k > FUSED_TOPK_MAX``.
 
-    ``full`` reduces a chunk against the whole target row; ``block`` against
-    the target columns ``j0:j1`` (tiled mode). Both take ``(QT, a, b, qf,
-    i_col)`` where ``(a, b)`` are the query-side ``(sig_inv, isconstant)``
-    slices (z-normalized) or ``(ssq, mu)`` slices (absolute) and ``i_col``
-    the ``(B, 1)`` query row indices. Outputs, in order:
+    Every array — the QT block, both series' stats, the row/column index
+    vectors and the constants ``m``, ``1/m`` and ``excl`` (0-d arrays) — is an
+    explicit input, so one trace serves every window size; only ``k`` is
+    structural (the argpartition ``kth``). (Closure-capturing the target
+    arrays would also alias a traced input for single-chunk self-joins, which
+    MLX's compile rejects.) Running the chain as one compiled graph keeps the
+    per-batch cost memory-bound instead of dispatch-bound; the uncompiled
+    op-by-op form ran the tiled sweep ~2.5x slower.
+
+    ``full(QT, s0)`` reduces the batch whose first query row is ``s0``
+    against the whole target; ``block(QT, s0, j0, j1)`` against target
+    columns ``j0:j1`` (tiled mode). Indices are block-local. Outputs:
 
     - self-join, k == 1: ``I, P2, Il, Pl2, Ir, Pr2``;
     - self-join, k > 1: ``vals2, idxs, Il, Pl2, Ir, Pr2`` (the top-k set
       excludes the trivial-match zone);
     - AB-join: ``I, P2`` (k == 1) or ``vals2, idxs``.
 
-    Left/right regions already exclude the trivial-match zone, and their
-    combined minimum IS the global minimum; on exact ties the left
-    (lower-index) candidate wins, matching a full-row argmin.
+    Tie rule (STUMPY's): every selection is lexicographic in ``(d2, key)``.
+    Self-joins use ``key = 2*|j - i| + (j > i)`` — the order in which
+    STUMPY's diagonal traversal visits candidates (ascending offset, the left
+    one first) and so the one its strict comparisons keep: the nearest-in-time
+    candidate wins and the left one on an equal offset. Hence the left
+    minimum is the LAST minimum over ``j <= i - excl - 1`` and the right one
+    the FIRST over ``j >= i + excl + 1``. AB-joins use ``key = j`` (lowest
+    column). Rows with no finite candidate report an infinite value; their
+    index is meaningless and callers map it to -1.
     """
 
     def __init__(
-        self, engine: MassEngine, *, normalize: bool, self_join: bool, excl: int, k: int = 1
+        self,
+        query: PreprocessedSeries,
+        target: PreprocessedSeries,
+        *,
+        normalize: bool,
+        self_join: bool,
+        excl: int,
+        k: int,
+        consts: np.ndarray,
     ):
-        t = engine.target
-        m = float(engine.m)
         self.k = k
         self.self_join = self_join
         if normalize:
-            self.t_a, self.t_b = t.sig_inv_mx, t.isconstant_mx
+            self._q = (query.sig_inv_mx, query.isconstant_mx, query.isfinite_mx)
+            self._t = (target.sig_inv_mx, target.isconstant_mx, target.isfinite_mx)
 
-            def dist(QT, a, b, qf, t_a, t_b, t_f):
-                return _znorm_sq(QT, a, b, qf, t_a, t_b, t_f, m)
+            def dist(QT, a, b, qf, t_a, t_b, t_f, m, inv_m):
+                return _znorm_sq(QT, a, b, qf, t_a, t_b, t_f, m, inv_m)
 
         else:
-            self.t_a, self.t_b = t.ssq_mx, t.mu_mx
+            self._q = (query.ssq_mx, query.mu_mx, query.isfinite_mx)
+            self._t = (target.ssq_mx, target.mu_mx, target.isfinite_mx)
 
-            def dist(QT, a, b, qf, t_a, t_b, t_f):
+            def dist(QT, a, b, qf, t_a, t_b, t_f, m, inv_m):
                 return _abs_sq(QT, a, b, qf, t_a, t_b, t_f, m)
 
-        self.t_f = t.isfinite_mx
-        self.j_row = mx.arange(engine.l)[None, :]
+        # A zone of l columns already excludes every self-join candidate
+        # (offsets are below l); clamping keeps i +/- (excl + 1) inside int32
+        # for an extreme STUMPY_EXCL_ZONE_DENOM, which otherwise wrapped the
+        # zone negative and reported every row as its own neighbour.
+        self._consts = (
+            mx.array(consts[0]),
+            mx.array(consts[1]),
+            mx.array(min(int(excl), int(target.l)), dtype=mx.int32),
+        )
+        self._j_full = mx.arange(target.l)[None, :]
 
         if self_join:
 
-            def step(QT, a, b, qf, i_col, t_a, t_b, t_f, j):
-                d2 = dist(QT, a, b, qf, t_a, t_b, t_f)
-                dl = mx.where(j <= i_col - (excl + 1), d2, _INF)
-                Il, Pl2 = _argmin_and_value(dl)
-                dr = mx.where(j >= i_col + (excl + 1), d2, _INF)
-                Ir, Pr2 = _argmin_and_value(dr)
+            def step(QT, a, b, qf, i_col, t_a, t_b, t_f, j, m, inv_m, excl):
+                d2 = dist(QT, a, b, qf, t_a, t_b, t_f, m, inv_m)
+                # nearest candidate on each side: last minimum on the left,
+                # first on the right
+                Il, Pl2 = _last_argmin_and_value(mx.where(j <= i_col - (excl + 1), d2, _INF), j)
+                Ir, Pr2 = _argmin_and_value(mx.where(j >= i_col + (excl + 1), d2, _INF))
                 if k == 1:
-                    left_better = Pl2 <= Pr2
+                    # combine by (d2, offset) on GLOBAL columns (block mode)
+                    i, jr = i_col[:, 0], j[0]
+                    left_better = (Pl2 < Pr2) | ((Pl2 == Pr2) & ((i - jr[Il]) <= (jr[Ir] - i)))
                     I = mx.where(left_better, Il, Ir)
                     P2 = mx.where(left_better, Pl2, Pr2)
                     return I, P2, Il, Pl2, Ir, Pr2
-                vals2, idxs = _topk(mx.where(mx.abs(i_col - j) <= excl, _INF, d2), k)
+                off = j - i_col
+                key = 2 * mx.abs(off) + (off > 0)
+                vals2, top = _topk(mx.where(mx.abs(off) <= excl, _INF, d2), key, k)
+                half = top >> 1
+                idxs = i_col + mx.where((top & 1) == 1, half, -half) - j[0, 0]
                 return vals2, idxs, Il, Pl2, Ir, Pr2
 
         else:
 
-            def step(QT, a, b, qf, i_col, t_a, t_b, t_f, j):
-                d2 = dist(QT, a, b, qf, t_a, t_b, t_f)
+            def step(QT, a, b, qf, i_col, t_a, t_b, t_f, j, m, inv_m, excl):
+                d2 = dist(QT, a, b, qf, t_a, t_b, t_f, m, inv_m)
                 if k == 1:
                     return _argmin_and_value(d2)
-                return _topk(d2, k)
+                vals2, top = _topk(d2, j, k)
+                return vals2, top - j[0, 0]
 
         self._compiled = mx.compile(step)
 
-    def full(self, QT, a, b, qf, i_col):
-        return self._compiled(QT, a, b, qf, i_col, self.t_a, self.t_b, self.t_f, self.j_row)
+    def full(self, QT, s0: int):
+        s0 = int(s0)
+        e = s0 + QT.shape[0]
+        qa, qb, qf = (x[s0:e] for x in self._q)
+        i_col = mx.arange(s0, e)[:, None]
+        return self._compiled(QT, qa, qb, qf, i_col, *self._t, self._j_full, *self._consts)
 
-    def block(self, QT, a, b, qf, i_col, j0: int, j1: int, j_row):
-        return self._compiled(
-            QT, a, b, qf, i_col, self.t_a[j0:j1], self.t_b[j0:j1], self.t_f[j0:j1], j_row
-        )
+    def block(self, QT, s0: int, j0: int, j1: int):
+        s0, j0, j1 = int(s0), int(j0), int(j1)
+        e = s0 + QT.shape[0]
+        qa, qb, qf = (x[s0:e] for x in self._q)
+        i_col = mx.arange(s0, e)[:, None]
+        t = (x[j0:j1] for x in self._t)
+        j_row = mx.arange(j0, j1)[None, :]
+        return self._compiled(QT, qa, qb, qf, i_col, *t, j_row, *self._consts)
 
 
 def query_windows(

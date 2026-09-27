@@ -2,27 +2,32 @@
 
 from __future__ import annotations
 
-import warnings
+import math
+from collections.abc import Callable
 from decimal import Decimal, localcontext
 
 import numpy as np
+from numpy.typing import ArrayLike
 
-from ._mass import _as_flag, mass
+from ._engine import refine_chunk_rows
+from ._mass import _mass, _raw_window_distances
 from ._preprocess import (
-    EXCL_ZONE_DENOM,
+    IsConstantSpec,
     apply_affine_frame,
     center_rows_stable,
-    process_isconstant,
-    rolling_isfinite,
-    rolling_mean_sigma,
-    rowwise_l2_inplace,
-    stable_center_scale,
+    check_series,
+    exclusion_zone,
 )
-from ._stump import _refine_chunk_rows
 
 # refinement/threshold rounds for a data-dependent max_distance (the loop
 # converges as soon as a round refines nothing new, typically in 2-3 rounds)
 _MAX_REFINE_ROUNDS = 8
+# _find_matches keeps STUMPY's argmin-per-match loop up to this many matches
+# (a few O(l) passes beat sorting the candidates) ...
+_SMALL_MAX_MATCHES = 8
+# ... and otherwise walks the sorted candidates in chunks of this many
+# indices (Python ints cost ~36 bytes each; never materialize all of them)
+_WALK_CHUNK = 1 << 16
 
 # The refinement below forms each z-normalized row with float64 pairwise
 # reductions and then sums squared component differences.  For two exactly
@@ -430,7 +435,7 @@ def _refine_candidates(Q, T, js, normalize, q_const, t_const):
     if js.size == 0:
         return out
     m = Q.shape[0]
-    chunk = _refine_chunk_rows(m)
+    chunk = refine_chunk_rows(m)
     if normalize:
         Wfull = np.lib.stride_tricks.sliding_window_view(T, m)
         # Put every raw row into its own bounded midpoint/range frame before
@@ -493,15 +498,10 @@ def _refine_candidates(Q, T, js, normalize, q_const, t_const):
                 d[collapsed_non_affine] = np.minimum(tiny_distances, 2.0 * np.sqrt(m))
             out[s : s + chunk] = np.where(q_const & tc, 0.0, np.where(q_const ^ tc, np.sqrt(m), d))
     else:
-        # the engine computes on the zero-filled series; mirror it so a user
+        # the engine computes on the zero-filled series; mirror it (per
+        # gathered window, with no zero-filled copy of the series) so a user
         # T_subseq_isfinite override cannot inject NaN into the profile
-        Tf = np.where(np.isfinite(T), T, 0.0)
-        Wfull = np.lib.stride_tricks.sliding_window_view(Tf, m)
-        for s in range(0, js.size, chunk):
-            idx = js[s : s + chunk]
-            with np.errstate(over="ignore", under="ignore", invalid="ignore"):
-                diff = Wfull[idx].astype(np.float64) - Q[None, :]
-            out[s : s + chunk] = rowwise_l2_inplace(diff)
+        out = _raw_window_distances(Q, T, js)
     return out
 
 
@@ -567,7 +567,19 @@ def _find_matches(
     query_idx=None,
     atol=1e-8,
 ) -> np.ndarray:
-    """Greedy nearest-first selection with exclusion zones (STUMPY port)."""
+    """Greedy nearest-first selection with exclusion zones (STUMPY port).
+
+    STUMPY re-runs ``argmin`` over the whole profile after every accepted
+    match, O(l) per match. Excluded entries become inf and ``argmin``
+    returns the first minimum, so each step takes the lowest (value, index)
+    pair not yet excluded: walking the candidates in stable ascending order
+    and skipping excluded ones visits exactly the same sequence in
+    O(l log l). STUMPY's loop is kept where it is exact by construction and
+    the walk is not: an ``argmin`` stops at the first NaN or ``-inf`` (which
+    ``match`` never produces), and a negative ``excl_zone`` excludes
+    nothing. It is also kept for at most ``_SMALL_MAX_MATCHES`` matches,
+    where a few passes beat sorting.
+    """
     D = np.array(D, dtype=np.float64, copy=True)
     if max_distance is None:
         max_distance = _default_max_distance
@@ -577,28 +589,166 @@ def _find_matches(
 
     if max_matches is None:
         max_matches = np.inf
-
-    if query_idx is not None:
-        candidate_idx = query_idx
-    else:
-        candidate_idx = np.argmin(D)
+    elif isinstance(max_matches, np.ndarray) and max_matches.size == 1:
+        max_matches = max_matches.reshape(())  # see _match: math.ceil needs a scalar
 
     matches = []
-    for _ in range(len(D)):
-        if (
-            D[candidate_idx] > atol + max_distance
-            or ~np.isfinite(D[candidate_idx])
-            or len(matches) >= max_matches
-        ):
-            break
-        matches.append([D[candidate_idx], int(candidate_idx)])
-        _apply_exclusion_zone(D, candidate_idx, excl_zone, np.inf)
-        candidate_idx = np.argmin(D)
+    if max_matches <= _SMALL_MAX_MATCHES or excl_zone < 0 or not np.all(D > -np.inf):
+        if query_idx is not None:
+            candidate_idx = query_idx
+        else:
+            candidate_idx = np.argmin(D)
 
+        for _ in range(len(D)):
+            if (
+                D[candidate_idx] > atol + max_distance
+                or ~np.isfinite(D[candidate_idx])
+                or len(matches) >= max_matches
+            ):
+                break
+            matches.append([D[candidate_idx], int(candidate_idx)])
+            _apply_exclusion_zone(D, candidate_idx, excl_zone, np.inf)
+            candidate_idx = np.argmin(D)
+
+        return np.array(matches, dtype=object)
+
+    cutoff = atol + max_distance
+    l = D.shape[0]
+    excluded = bytearray(l)
+
+    def take(c: int) -> None:
+        matches.append([D[c], c])
+        lo, hi = max(0, c - excl_zone), min(l, c + excl_zone + 1)
+        excluded[lo:hi] = b"\x01" * (hi - lo)
+
+    if query_idx is not None:
+        c = int(query_idx)
+        if D[c] > cutoff or not np.isfinite(D[c]):
+            return np.array(matches, dtype=object)
+        take(c)
+    with np.errstate(invalid="ignore"):
+        # a NaN cutoff admits every finite entry, as STUMPY's comparison does
+        ok = np.isfinite(D) & ~(D > cutoff)
+    if max_matches < l:
+        # every visited candidate lies in the (2*excl_zone + 1)-wide zone of
+        # one of at most ceil(max_matches) accepted matches, so only that
+        # many entries of the stable order can matter. Keeping every value
+        # <= the k-th smallest keeps its ties too: the stable prefix is intact.
+        k = math.ceil(max_matches) * (2 * excl_zone + 1)
+        if k < np.count_nonzero(ok):
+            vals = D[ok]
+            vals.partition(k - 1)
+            ok &= D <= vals[k - 1]
+            del vals
+    cand = np.flatnonzero(ok)
+    del ok
+    order = cand[np.argsort(D[cand], kind="stable")]
+    del cand
+    for s in range(0, order.size, _WALK_CHUNK):
+        for c in order[s : s + _WALK_CHUNK].tolist():
+            if len(matches) >= max_matches:
+                return np.array(matches, dtype=object)
+            if not excluded[c]:
+                take(c)
     return np.array(matches, dtype=object)
 
 
 def match(
+    Q: ArrayLike,
+    T: ArrayLike,
+    M_T: ArrayLike | None = None,
+    Σ_T: ArrayLike | None = None,
+    max_distance: float | Callable[[np.ndarray], ArrayLike] | None = None,
+    max_matches: int | None = None,
+    atol: float = 1e-8,
+    query_idx: int | None = None,
+    normalize: bool = True,
+    p: float = 2.0,
+    T_subseq_isfinite: ArrayLike | None = None,
+    T_subseq_isconstant: IsConstantSpec = None,
+    Q_subseq_isconstant: IsConstantSpec = None,
+) -> np.ndarray:
+    """Find all subsequences of ``T`` matching query ``Q``, nearest first.
+
+    Drop-in for ``stumpy.match``: returns an object array of
+    ``[distance, index]`` rows sorted by distance, using STUMPY's default
+    ``max_distance`` (``max(mean(D) - 2*std(D), min(D))``) and exclusion-zone
+    semantics. ``max_distance`` may be a number (fixed threshold) or a
+    callable receiving the distance profile and returning a number or a
+    size-1 array. A data-dependent threshold
+    (the default, or a callable) is evaluated on successively refined
+    profiles until it stops moving — the float32 GPU profile first, then
+    once per float64 refinement round (typically 2-3 calls in total, at
+    most 9; STUMPY calls it exactly once, on its float64 profile) —
+    so the threshold that selects the matches comes from a profile that is
+    float64-refined throughout the threshold band. With a fixed threshold
+    and a finite ``max_matches``, only the windows that could be among the
+    greedy picks are refined.
+    ``normalize=False`` supports ``p=2.0`` only. Precomputed ``M_T``/``Σ_T``
+    follow the ``mass`` contract. In normalized mode they are compatibility
+    metadata: an infinite ``M_T`` marks its window non-finite, while finite
+    statistics leave every raw window on the same local float64 centering and
+    RMS-normalization path as a no-stats call.
+    In raw mode the pair is only
+    shape-validated and is otherwise ignored. It never skips preprocessing.
+    Constant flags may be boolean arrays or STUMPY-style callables
+    ``f(a, w)``; each is evaluated once per call.
+    """
+    return _match(
+        Q,
+        T,
+        M_T,
+        Σ_T,
+        max_distance,
+        max_matches,
+        atol,
+        query_idx,
+        normalize,
+        p,
+        T_subseq_isfinite,
+        T_subseq_isconstant,
+        Q_subseq_isconstant,
+        stacklevel=3,
+    )
+
+
+def aamp_match(
+    Q: ArrayLike,
+    T: ArrayLike,
+    T_subseq_isfinite: ArrayLike | None = None,
+    max_distance: float | Callable[[np.ndarray], ArrayLike] | None = None,
+    max_matches: int | None = None,
+    atol: float = 1e-8,
+    query_idx: int | None = None,
+    p: float = 2.0,
+) -> np.ndarray:
+    """Non-normalized ``match`` with ``stumpy.aamp_match``'s signature and semantics.
+
+    Positional calls ported from STUMPY bind the same parameters. Unlike
+    ``match(..., normalize=False)``, which zeroes the query's own entry as
+    ``mass_absolute`` does, ``query_idx`` keeps its true distance here,
+    exactly as in ``stumpy.aamp_match`` (which ``stumpy.match`` also
+    dispatches to when ``normalize=False``): the query window is still
+    considered first, but a mismatched window is reported at its real
+    distance, and nothing is returned when that distance exceeds the
+    threshold. ``p=2.0`` only.
+    """
+    return _match(
+        Q,
+        T,
+        max_distance=max_distance,
+        max_matches=max_matches,
+        atol=atol,
+        query_idx=query_idx,
+        normalize=False,
+        p=p,
+        T_subseq_isfinite=T_subseq_isfinite,
+        zero_query=False,
+        stacklevel=3,
+    )
+
+
+def _match(
     Q,
     T,
     M_T=None,
@@ -612,68 +762,73 @@ def match(
     T_subseq_isfinite=None,
     T_subseq_isconstant=None,
     Q_subseq_isconstant=None,
-):
-    """Find all subsequences of ``T`` matching query ``Q``, nearest first.
+    *,
+    zero_query: bool = True,
+    stacklevel: int,
+) -> np.ndarray:
+    """``match``; ``zero_query=False`` gives ``aamp_match``'s ``query_idx``.
 
-    Drop-in for ``stumpy.match``: returns an object array of
-    ``[distance, index]`` rows sorted by distance, using STUMPY's default
-    ``max_distance`` (``max(mean(D) - 2*std(D), min(D))``) and exclusion-zone
-    semantics. ``max_distance`` may be a number (fixed threshold) or a
-    callable receiving the distance profile. A data-dependent threshold
-    (the default, or a callable) is evaluated on successively refined
-    profiles until it stops moving — the float32 GPU profile first, then
-    once per float64 refinement round (typically 2-3 calls in total, at
-    most 9; STUMPY calls it exactly once, on its float64 profile) —
-    so the threshold that selects the matches comes from a profile that is
-    float64-refined throughout the threshold band.
-    ``normalize=False`` supports ``p=2.0`` only. Precomputed ``M_T``/``Σ_T``
-    follow the ``mass`` contract. In normalized mode they are compatibility
-    metadata: an infinite ``M_T`` marks its window non-finite, while finite
-    statistics leave every raw window on the same local float64 centering and
-    RMS-normalization path as a no-stats call.
-    In raw mode the pair is only
-    shape-validated and is otherwise ignored. It never skips preprocessing.
+    ``stacklevel`` (required) is that of a warning issued directly in this
+    function.
     """
     Q = np.asarray(Q)
     if Q.ndim == 2 and Q.shape[1] == 1:
         Q = Q.flatten()
     T = np.asarray(T)
+    owned = False
     if T.ndim == 2 and T.shape[1] == 1:
         T = T.flatten()
+        owned = True
+    if not normalize and Q.dtype.kind in "fc" and not np.all(np.isfinite(Q)):
+        # stumpy.aamp_match (where stumpy.match sends normalize=False) checks
+        # Q's values before any dtype: a float32 query holding NaN is a
+        # ValueError there
+        raise ValueError("Q contains illegal values (NaN or inf)")
+    # Validate before reading any value, as STUMPY's normalized match does
+    # (a dtype error outranks the NaN check). Q is m samples; T is only
+    # checked, not copied: mass makes its own copy of the series, unless
+    # this function already holds a private one (a flattened or byte-swapped
+    # input), which mass then uses as is.
+    Q = check_series(Q, "Q")
+    T_in = T
+    T = check_series(T, "T", copy=False)
+    owned = owned or T is not T_in
+    del T_in
     if np.any(np.isnan(Q)) or np.any(np.isinf(Q)):
         raise ValueError("Q contains illegal values (NaN or inf)")
 
     m = Q.shape[-1]
-    excl_zone = int(np.ceil(m / EXCL_ZONE_DENOM))
+    excl_zone = exclusion_zone(m)
 
-    D = mass(
+    # mass resolves every constant flag (evaluating a callable once) and,
+    # in raw mode, already holds the target's rolling sigma in the shared
+    # frame the refinement margin needs: reuse both instead of recomputing
+    D, info = _mass(
         Q,
         T,
-        M_T=M_T,
-        Σ_T=Σ_T,
-        normalize=normalize,
-        p=p,
-        T_subseq_isfinite=T_subseq_isfinite,
-        T_subseq_isconstant=T_subseq_isconstant,
-        Q_subseq_isconstant=Q_subseq_isconstant,
-        query_idx=query_idx,
+        M_T,
+        Σ_T,
+        normalize,
+        p,
+        T_subseq_isfinite,
+        T_subseq_isconstant,
+        Q_subseq_isconstant,
+        query_idx,
+        zero_query=zero_query,
+        keep_sigma=not normalize,
+        copy_series=not owned,
+        stacklevel=stacklevel + 1,
     )
+    if query_idx is not None:
+        # mass() range-checked it; a NumPy unsigned index would wrap (or
+        # become a float on NumPy 1.x) in the exclusion-zone arithmetic
+        query_idx = int(query_idx)
     l = D.shape[0]
 
-    Qf = np.asarray(Q, dtype=np.float64)
-    Tf = np.asarray(T, dtype=np.float64)
-    q_const = _as_flag(Q_subseq_isconstant, "Q_subseq_isconstant")
-    if q_const is None:
-        q_const = bool(np.min(Qf) == np.max(Qf))
+    Qf, Tf = Q, T
+    q_const = info.q_const
     if normalize:
-        T_nan = np.where(np.isinf(Tf), np.nan, Tf)
-        with warnings.catch_warnings():
-            # the mass() call above already resolved these flags and warned
-            warnings.simplefilter("ignore")
-            t_const = process_isconstant(
-                T_nan, m, T_subseq_isconstant, "T_subseq_isconstant"
-            )
-        t_const &= rolling_isfinite(np.isfinite(Tf), m)
+        t_const = info.isconstant  # the user's flags or detection, & finite
     else:
         # mass() already validated the compatibility control. Constants have
         # no special case in raw Euclidean refinement.
@@ -688,41 +843,92 @@ def match(
             return _default_max_distance(D)
         if fixed:
             return float(max_distance)
-        return float(max_distance(D))
+        val = max_distance(D)
+        if isinstance(val, np.ndarray) and val.size == 1:
+            # STUMPY compares with the result directly, so a size-1 array
+            # such as np.nanpercentile(D, [1]) is a valid threshold there
+            val = val.reshape(())
+        return float(val)
 
     # float32 search noise bound (distance units); every entry within it of
     # the threshold is re-evaluated in float64 before the threshold is applied
     margin = 0.1 * (m / 50.0) ** 0.25
     if not normalize:
         # absolute distances (and their float32 noise) scale with the data's
-        # units; use the same shared frame mass() standardized with
-        finite = np.concatenate([Qf, Tf[np.isfinite(Tf)]])
-        center, scale = stable_center_scale(finite)
-        del finite
-        # the engine's float32 cancellation noise also scales with each
-        # window's OWN energy: an extreme-amplitude window's exact match can
-        # read thousands above zero, so widen its refinement cutoff
-        # per-window or it would never be re-evaluated
-        # Use standardized zero for invalid points, as preprocessing does;
-        # otherwise a raw-zero sentinel can contaminate rolling margin stats
-        # long after a NaN leaves a huge-offset window. The affine transform
-        # also repairs the rare opposite-sign max-float subtraction overflow.
-        T_scaled = apply_affine_frame(np.where(np.isfinite(Tf), Tf, center), center, scale)
-        Q_scaled = apply_affine_frame(Qf, center, scale)
-        _, sig_t_scaled = rolling_mean_sigma(T_scaled, m)
-        sig_t_scaled[~rolling_isfinite(np.isfinite(Tf), m)] = np.inf
+        # units, and the engine's float32 cancellation noise also scales
+        # with each window's OWN energy: an extreme-amplitude window's exact
+        # match can read thousands above zero, so widen its refinement
+        # cutoff per-window or it would never be re-evaluated. mass() hands
+        # over its shared frame and the rolling sigma it computed there
+        # (invalid points at standardized zero, known-constant windows
+        # exactly 0): a second O(n) pass would only repeat its sigma repair.
+        sig_t_scaled = info.sigma
+        info.sigma = None
+        sig_t_scaled[~info.isfinite] = np.inf
+        Q_scaled = apply_affine_frame(Qf, info.center, info.scale)
         noise = 3.0 * np.sqrt(np.finfo(np.float32).eps * m)
         with np.errstate(over="ignore", under="ignore", invalid="ignore"):
-            margin = scale * (margin + noise * (sig_t_scaled + float(Q_scaled.std())))
-        del Q_scaled, T_scaled, sig_t_scaled
+            # scale * (margin + noise * (sigma + std_q)), evaluated in place
+            sig_t_scaled += float(Q_scaled.std())
+            sig_t_scaled *= noise
+            sig_t_scaled += margin
+            sig_t_scaled *= info.scale
+        margin = sig_t_scaled
+        del Q_scaled, sig_t_scaled
+    del info
 
     refined = np.zeros(l, dtype=bool)
     if query_idx is not None:
-        # mass() already fixed this entry (0, or inf under a non-finite
-        # T_subseq_isfinite override); STUMPY thresholds with it in place
-        refined[query_idx] = True
+        if zero_query:
+            # mass() already fixed this entry (0, or inf under a non-finite
+            # T_subseq_isfinite override); STUMPY thresholds with it in place
+            refined[query_idx] = True
+        else:
+            # aamp_match keeps the true distance here and considers this
+            # window first whatever its rank: it is reported if it passes
+            # the threshold, so it must carry its float64 value
+            if np.isfinite(D[query_idx]):
+                D[query_idx] = _refine_candidates(
+                    Qf, Tf, [query_idx], normalize, q_const, t_const
+                )[0]
+            refined[query_idx] = True
+
+    if isinstance(max_matches, np.ndarray) and max_matches.size == 1:
+        # STUMPY only compares the count (`len(matches) >= max_matches`), so
+        # any size-1 array works there; math.ceil below needs a scalar
+        max_matches = max_matches.reshape(())
+    cap = np.inf
+    if fixed and max_matches is not None and 0 < max_matches < l:
+        # Top-k with a fixed threshold. k greedy picks (query_idx included)
+        # exclude at most (k-1)(2*excl_zone+1) windows, so at each of the k
+        # steps some window of any s-set is still available: every pick is
+        # <= U, the largest float64 distance in that set. An unrefined
+        # window with D32 > U + margin has a true distance > U (the same
+        # one-sided float32 bound the threshold cutoff relies on), so it
+        # can neither be picked nor displace a pick: refine only the band
+        # below U + margin instead of everything below the threshold.
+        # (Comparisons only: max_matches is never converted to float, so
+        # huge integers, inf and NaN simply skip this.)
+        s = (math.ceil(max_matches) - 1) * (2 * excl_zone + 1) + 1
+        if s < l:
+            Dp = np.where(np.isfinite(D), D, np.inf)
+            Dp.partition(s - 1)
+            v = Dp[s - 1]
+            del Dp
+            if np.isfinite(v):
+                part = np.flatnonzero(D <= v)  # >= s windows (ties included)
+                todo = part[~refined[part]]
+                if todo.size:
+                    D[todo] = _refine_candidates(Qf, Tf, todo, normalize, q_const, t_const)
+                    refined[todo] = True
+                U = float(np.max(D[part]))
+                del part, todo
+                if np.isfinite(U):
+                    with np.errstate(over="ignore", invalid="ignore"):
+                        cap = U + margin
 
     def _refine_upto(cutoff) -> int:
+        cutoff = np.minimum(cutoff, cap)
         js = np.nonzero((D <= cutoff) & np.isfinite(D) & ~refined)[0]
         if js.size:
             D[js] = _refine_candidates(Qf, Tf, js, normalize, q_const, t_const)

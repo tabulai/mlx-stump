@@ -116,6 +116,9 @@ def test_release_build_is_locked_reproducible_and_tests_both_artifacts():
     assert "--no-deps --no-build-isolation" in text
     assert text.count("-m pip check") >= 2
     assert text.count('"site-packages" in module.as_posix()') >= 2
+    # the artifacts it uploads are tested on the Metal GPU, as in ci.yml
+    assert text.count('MLX_STUMP_REQUIRE_METAL: "1"') == text.count("-m pytest") == 2
+    assert text.count(" -q -rs") == 2
     for floating in (
         "pip install build",
         "pip install --upgrade pip",
@@ -129,6 +132,7 @@ def test_release_build_is_locked_reproducible_and_tests_both_artifacts():
 @pytest.mark.skipif(not _CI_WORKFLOW.exists(), reason="workflow files are not shipped in the sdist")
 def test_ci_exercises_the_locked_reproducible_artifact_path():
     text = _CI_WORKFLOW.read_text(encoding="utf-8")
+    test = text[text.index("  test:") : text.index("  build:")]
     build = text[text.index("  build:") :]
     assert 'python-version: "3.12.10"' in build
     assert ".github/requirements/release-build.txt" in build
@@ -136,6 +140,15 @@ def test_ci_exercises_the_locked_reproducible_artifact_path():
     assert "verify_reproducible_dist.py" in build
     assert "--no-isolation" in build
     assert "--no-deps --no-build-isolation" in build
+    # lint once, with the hash-locked ruff the release gate uses, not with the
+    # floating `ruff>=` of the dev extra in every matrix job
+    lint = "ruff check src tests bench .github/scripts"
+    assert lint not in test
+    assert build.index("release-build.txt") < build.index(lint) < build.index("python -m build")
+    # every job is bounded, and every test run must happen on the Metal GPU
+    assert "timeout-minutes:" in test and "timeout-minutes:" in build
+    assert 'MLX_STUMP_REQUIRE_METAL: "1"' in test
+    assert build.count('MLX_STUMP_REQUIRE_METAL: "1"') == build.count("-m pytest") == 2
 
 
 @pytest.mark.skipif(not _WORKFLOW.exists(), reason="workflow files are not shipped in the sdist")

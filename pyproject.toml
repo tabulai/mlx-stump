@@ -74,13 +74,15 @@ target-version = "py310"
 src = ["src", "tests"]
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "UP", "B"]
+# RUF100: a stale `# noqa` must not outlive the finding it silenced
+select = ["E", "F", "W", "I", "UP", "B", "RUF100"]
 # E741: single-letter names like `l`/`I` are matrix-profile convention (STUMPY uses them)
 ignore = ["E741"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "--strict-markers"
 markers = [
-    "gpu: test requires a Metal GPU (skipped on CPU-only runners)",
+    "gpu: measures Metal behavior; skipped when mx.metal.is_available() is False",
     "slow: long-running test",
 ]

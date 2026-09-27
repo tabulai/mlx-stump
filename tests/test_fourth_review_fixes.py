@@ -28,17 +28,17 @@
 from __future__ import annotations
 
 import pathlib
-import subprocess
-import sys
-import textwrap
 import warnings
 
 import numpy as np
 import pytest
-import stumpy
 
 import mlx_stump
 from mlx_stump._engine import _CHUNK_MEM_BUDGET, estimated_peak_bytes, resident_block_bytes
+
+from .conftest import run_isolated
+
+stumpy = pytest.importorskip("stumpy")
 
 MIB = 1 << 20
 _REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -159,22 +159,15 @@ def test_large_topk_within_estimate():
     """The canonical top-k process peak stays below the published estimate."""
     n, m, k = 50_000, 50, 100
     l = n - m + 1
-    src = textwrap.dedent(
+    before, peak, _ = run_isolated(
         f"""
-        import resource, sys
-        import numpy as np
-        import mlx_stump
-        unit = 1 if sys.platform == "darwin" else 1024
         T = np.random.default_rng(0).standard_normal({n}).cumsum()
         mlx_stump.stump(T[:4096], {m}, k={k})  # warm-up: Metal/JIT baseline
-        before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * unit
+        before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * _unit
         mp = mlx_stump.stump(T, {m}, k={k})
-        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * unit
-        print("RESULT", (peak - before) / 2**20)
         """
     )
-    out = subprocess.run([sys.executable, "-c", src], capture_output=True, text=True, check=True)
-    growth = float([ln for ln in out.stdout.splitlines() if ln.startswith("RESULT")][-1].split()[1])
+    growth = peak - before
     est = estimated_peak_bytes(l, m, k=k) / MIB
     assert growth <= est, f"RSS grew {growth:.0f} MiB vs estimate {est:.0f} MiB"
 

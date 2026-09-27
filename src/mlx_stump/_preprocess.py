@@ -14,17 +14,60 @@ and a subsequence is "constant" when its rolling min equals its rolling max
 
 from __future__ import annotations
 
+import inspect
+import numbers
+import sys
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import mlx.core as mx
 import numpy as np
+from numpy.typing import ArrayLike
 
-# matches stumpy.config.STUMPY_EXCL_ZONE_DENOM
+# default of stumpy.config.STUMPY_EXCL_ZONE_DENOM
 EXCL_ZONE_DENOM = 4
 
+# STUMPY's callable constant-flag spec f(a, w) -> boolean array of shape (l,)
+IsConstantFunc = Callable[[np.ndarray, int], ArrayLike]
+# a constant-flag spec: a boolean array, or STUMPY's callable f(a, w)
+IsConstantSpec = ArrayLike | IsConstantFunc | None
 
-def stable_center_scale(a: np.ndarray) -> tuple[float, float]:
+
+def excl_zone_denom():
+    """The exclusion-zone denominator in effect for this call.
+
+    STUMPY reads ``stumpy.config.STUMPY_EXCL_ZONE_DENOM`` at call time, and it
+    is the only knob STUMPY offers for the trivial-match exclusion zone
+    ``ceil(m / denom)``. Honour it whenever STUMPY has been imported so a
+    mixed pipeline uses one zone, and fall back to STUMPY's default of 4
+    otherwise. STUMPY is not a dependency: never import it here. The raw
+    value is kept (STUMPY accepts any positive real, e.g. 2.5 or 0.5).
+    """
+    cfg = sys.modules.get("stumpy.config")
+    denom = EXCL_ZONE_DENOM
+    if cfg is not None:
+        denom = getattr(cfg, "STUMPY_EXCL_ZONE_DENOM", EXCL_ZONE_DENOM)
+    if (
+        isinstance(denom, (bool, np.bool_))
+        or not isinstance(denom, numbers.Real)
+        or not denom > 0
+        or not np.isfinite(denom)
+    ):
+        raise ValueError(
+            f"`STUMPY_EXCL_ZONE_DENOM` must be a finite positive number but found {denom!r}."
+        )
+    return denom
+
+
+def exclusion_zone(m: int, denom=None) -> int:
+    """``ceil(m / denom)``, STUMPY's trivial-match exclusion-zone half width."""
+    if denom is None:
+        denom = excl_zone_denom()
+    return int(np.ceil(m / denom))
+
+
+def stable_center_scale(a: np.ndarray, *, overwrite: bool = False) -> tuple[float, float]:
     """Return a finite affine frame for finite values without squaring.
 
     The values are first mapped by a midpoint/max-deviation frame, then their
@@ -33,7 +76,8 @@ def stable_center_scale(a: np.ndarray) -> tuple[float, float]:
     underflow merely because all values use tiny units. Any positive affine
     frame is sufficient for the GPU arithmetic: normalized distances are
     invariant to it, while the absolute path multiplies by ``scale`` on
-    return.
+    return. ``overwrite=True`` lets a private float64 buffer serve as the
+    scratch space (the same arithmetic, without another n-wide copy).
     """
     a = np.asarray(a, dtype=np.float64)
     finite_mask = np.isfinite(a)
@@ -63,11 +107,12 @@ def stable_center_scale(a: np.ndarray) -> tuple[float, float]:
     # diagnostics rely on standardized data having mean 0 and sigma 1).
     # No raw value is squared until it is O(1).
     with np.errstate(over="ignore", under="ignore", invalid="ignore"):
-        if all_finite:
+        if all_finite and not overwrite:
             bounded = np.subtract(finite, midpoint)
         else:
             # Boolean compaction already made `finite` a private writable
-            # copy, so reuse it rather than holding two O(n) float64 arrays.
+            # copy (or the caller handed over its own buffer), so reuse it
+            # rather than holding two O(n) float64 arrays.
             bounded = finite
             bounded -= midpoint
         bounded /= radius
@@ -84,6 +129,30 @@ def stable_center_scale(a: np.ndarray) -> tuple[float, float]:
     if not np.isfinite(scale) or scale == 0.0:
         scale = radius
     return float(center), float(scale)
+
+
+def finite_center_scale(*parts: np.ndarray) -> tuple[float, float]:
+    """:func:`stable_center_scale` of the finite values of ``parts``, in order.
+
+    Bit-identical to ``stable_center_scale(np.concatenate([p[np.isfinite(p)]
+    for p in parts]))``, without its compacted-length copies: the finite
+    values are gathered chunk by chunk into one buffer of the full combined
+    length, which then serves as the scratch space. A freed block shorter
+    than the series cannot host the n-sized preprocessing arrays that
+    follow, so with more than a page of non-finite values the compacted
+    copies made macOS malloc take ~0.45-0.7 GiB of fresh memory at n=3e7.
+    (``np.compress`` into the buffer would not help: it builds an int64
+    index array of the compacted length.)
+    """
+    buf = np.empty(sum(p.shape[0] for p in parts))  # full length: malloc reuses it
+    pos = 0
+    for p in parts:
+        for s in range(0, p.shape[0], _ROLLING_CHUNK):
+            c = p[s : s + _ROLLING_CHUNK]
+            c = c[np.isfinite(c)]
+            buf[pos : pos + c.shape[0]] = c
+            pos += c.shape[0]
+    return stable_center_scale(buf[:pos], overwrite=True)
 
 
 def apply_affine_frame(a: np.ndarray, center: float, scale: float) -> np.ndarray:
@@ -150,22 +219,43 @@ def rowwise_l2_inplace(a: np.ndarray) -> np.ndarray:
     return np.where(finite, norm, np.inf)
 
 
-def check_series(T, name: str) -> np.ndarray:
-    """Validate a time series the way STUMPY does; return a float64 copy."""
+def check_series(T, name: str, copy: bool = True) -> np.ndarray:
+    """Validate a time series the way STUMPY does; return a float64 copy.
+
+    Byte-swapped float64 (``'>f8'`` on Apple Silicon, e.g. read from FITS or
+    HDF5) is float64 all the same: it is accepted and returned in native
+    byte order. ``copy=False`` validates only and returns the input array
+    itself (for callers that hand the series on to a function making its
+    own copy); a byte-swapped input is still converted, so the result is
+    always native.
+    """
     T = np.asarray(T)
-    if T.dtype != np.float64:
+    if T.dtype.newbyteorder("=") != np.float64:
         raise TypeError(
             f"{np.float64} dtype expected but found {T.dtype} in {name}. "
             "Please change the input dtype with `.astype(np.float64)`."
         )
     if T.ndim != 1:
         raise ValueError(f"{name} is {T.ndim}-dimensional and must be 1-dimensional.")
-    return T.copy()
+    if copy or not T.dtype.isnative:
+        return T.astype(np.float64, order="C")
+    return T
 
 
-def check_window_size(m, n: int | None = None, warn_n: int | None = None) -> int:
+def check_window_size(
+    m,
+    n: int | None = None,
+    warn_n: int | None = None,
+    denom=None,
+    stacklevel: int = 3,
+) -> int:
     """Validate ``m``; with ``warn_n`` (self-joins), also emit STUMPY's
-    advisory when the exclusion zone starves the central subsequence."""
+    advisory when the exclusion zone starves the central subsequence.
+
+    ``denom`` defaults to the configured STUMPY_EXCL_ZONE_DENOM; pass the
+    value read once per call when the caller also uses it for the search.
+    ``stacklevel`` is the advisory's ``warnings.warn`` level; the default
+    points at the caller of a public function that calls this directly."""
     if not np.issubdtype(type(m), np.integer):
         raise TypeError(f"`m` must be an integer but found {type(m)}.")
     m = int(m)
@@ -174,12 +264,12 @@ def check_window_size(m, n: int | None = None, warn_n: int | None = None) -> int
     if n is not None and m > n:
         raise ValueError(f"The window size must be less than or equal to {n}.")
     if warn_n is not None:
-        excl_zone = int(np.ceil(m / EXCL_ZONE_DENOM))
+        excl_zone = exclusion_zone(m, denom)
         if (warn_n - m + 1) // 2 <= excl_zone:
             warnings.warn(
                 f"The window size, 'm = {m}', may be too large and could lead to "
                 "meaningless results. Consider reducing 'm' where necessary",
-                stacklevel=3,
+                stacklevel=stacklevel,
             )
     return m
 
@@ -201,30 +291,140 @@ def _rolling_reduce(a: np.ndarray, w: int, op: np.ufunc, fill: float) -> np.ndar
     return op(suffix[:l], prefix[w - 1 : w - 1 + l])
 
 
+# windows per chunk of the O(n) rolling passes: bounds their int64 / float64
+# temporaries to ~12 MiB instead of several copies of the series (n=1e7:
+# rolling_isconstant peaks at 0.26x the series instead of 5x, same speed)
+_ROLLING_CHUNK = 1 << 18
+
+
 def rolling_isconstant(T: np.ndarray, m: int) -> np.ndarray:
-    """A window is constant iff its min equals its max (NaN windows are not)."""
-    lo = _rolling_reduce(T, m, np.minimum, np.inf)
-    hi = _rolling_reduce(T, m, np.maximum, -np.inf)
-    return lo == hi
+    """A window is constant iff its min equals its max (NaN windows are not).
+
+    NaN propagates through the min/max, but an all-inf window compares
+    equal (inf == inf), so callers holding a series with inf AND the result
+    with the finite-window mask; that equals the result on the series with
+    inf replaced by NaN. Min/max are exact, so evaluating chunks of windows
+    (each on its own ``m - 1`` overlap) changes nothing but the temporaries.
+    """
+    l = T.shape[0] - m + 1
+    out = np.empty(l, dtype=bool)
+    step = max(_ROLLING_CHUNK, m)  # keeps the (m - 1)-sample overlap <= 2x
+    for s in range(0, l, step):
+        e = min(s + step, l)
+        seg = T[s : e + m - 1]
+        lo = _rolling_reduce(seg, m, np.minimum, np.inf)
+        hi = _rolling_reduce(seg, m, np.maximum, -np.inf)
+        np.equal(lo, hi, out=out[s:e])
+        del lo, hi
+    return out
 
 
 def rolling_isfinite(isfinite_pt: np.ndarray, m: int) -> np.ndarray:
     """True where the length-m window contains only finite values."""
-    bad = (~isfinite_pt).astype(np.int64)
-    csum = np.zeros(bad.shape[0] + 1, dtype=np.int64)
-    np.cumsum(bad, out=csum[1:])
-    return (csum[m:] - csum[:-m]) == 0
+    l = isfinite_pt.shape[0] - m + 1
+    if np.all(isfinite_pt):
+        return np.ones(l, dtype=bool)
+    out = np.empty(l, dtype=bool)
+    step = max(_ROLLING_CHUNK, m)
+    for s in range(0, l, step):
+        e = min(s + step, l)
+        # running count of non-finite points over this chunk's windows only
+        bad = np.zeros(e - s + m, dtype=np.int64)
+        np.cumsum(~isfinite_pt[s : e + m - 1], out=bad[1:])
+        np.equal(bad[m:], bad[:-m], out=out[s:e])
+    return out
 
 
 # byte bound on the float64 window copies held by one sigma-repair chunk
 _SIGMA_REPAIR_BYTES = 1 << 25  # ~32 MiB
-# repair every window whose variance is within this factor of the cumsum
-# noise floor: a window *at* K times the floor still carries ~1/K relative
-# variance error, so a bare factor-8 bound left percent-level sigma errors
-# on windows just above it (e.g. ordinary noise windows crushed by global
-# standardization when the series contains a huge-amplitude segment),
-# corrupting both the float32 search and the reported profile
+# repair every window whose variance is within this factor of its one-pass
+# rounding bound: a window *at* K times the bound can still carry ~1/K
+# relative variance error, so a bare small factor left percent-level sigma
+# errors on windows just above it (e.g. ordinary noise windows crushed by
+# global standardization when the series contains a huge-amplitude
+# segment), corrupting both the float32 search and the reported profile
 _SIGMA_REPAIR_HEADROOM = 1 << 20
+
+
+def _rolling_sum_depth(w: int) -> int:
+    """Most additions any term passes through in :func:`_rolling_sum_local`.
+
+    A level-``b`` run sum has depth ``b``. The runs of ``w``'s set bits
+    ``b_0 < ... < b_{p-1} = L`` then join the window sum lowest first, so a
+    term of run ``k >= 1`` sees ``b_k + 1 + (p - 1 - k)`` additions and one
+    of run 0 sees ``b_0 + p - 1``; distinct bits give ``b_k <= L - (p-1-k)``,
+    so neither exceeds ``L + 1 = w.bit_length()``.
+    """
+    return int(w).bit_length()
+
+
+def _rolling_sum_local(x: np.ndarray, w: int) -> np.ndarray:
+    """``sum(x[j:j+w])`` for every window, by one fixed pairwise tree.
+
+    Level ``b`` holds the sums of every length-``2**b`` run, each the sum of
+    two level-``b-1`` runs; a window adds the runs of ``w``'s set bits, the
+    lowest first. Every window is summed by the same operation tree over
+    its own values, so bitwise-identical windows get bitwise-identical sums
+    wherever they lie (their exact ties stay exact ties downstream: the
+    same mean, variance, repair decision and float32 row), and the error is
+    pairwise, to first order at most ``_rolling_sum_depth(w) * eps/2`` of
+    the window's own sum of magnitudes. (Differences of whole-series
+    cumulative sums carry the rounding of the running prefix, which grows
+    with position; sums of block-local partial sums depend on the window's
+    offset in its block.)
+    O(n log w), streamed in ``_ROLLING_CHUNK`` windows so that the level
+    buffers stay bounded; the chunking does not change a single bit. A
+    chunk's level buffer holds ``step + w - 1`` values, ``step =
+    max(_ROLLING_CHUNK, w)``: past ``_ROLLING_CHUNK`` it is ~2w long, so
+    those levels are then summed in place (one buffer instead of two).
+    """
+    n = x.shape[0]
+    l = n - w + 1
+    out = np.empty(max(l, 0))
+    step = max(_ROLLING_CHUNK, w)
+    in_place = w > _ROLLING_CHUNK
+    for s in range(0, l, step):
+        e = min(s + step, l)
+        cur = x[s : e + w - 1]  # level 0: runs of length 1 (the caller's data)
+        span, offset, first = 1, 0, True
+        while True:
+            if w & span:  # (no named view: it would pin the buffer into the next chunk)
+                if first:
+                    out[s:e] = cur[offset : offset + e - s]
+                    first = False
+                else:
+                    out[s:e] += cur[offset : offset + e - s]
+                offset += span
+            if 2 * span > w:
+                break
+            if in_place and span > 1:
+                # the same sums, written over the level they come from:
+                # NumPy's overlap rules give the as-if-copied result, and
+                # with the input ahead of the output they need no copy
+                np.add(cur[:-span], cur[span:], out=cur[:-span])
+                cur = cur[:-span]
+            else:
+                cur = cur[:-span] + cur[span:]  # sums of the length-2*span runs
+            span *= 2
+    return out
+
+
+def _two_pass_repair(
+    a: np.ndarray, w: int, idx: np.ndarray, mu: np.ndarray, var: np.ndarray
+) -> None:
+    """Recompute ``mu``/``var`` of windows ``idx`` directly from their values.
+
+    Streams the float64 window copies in ``_SIGMA_REPAIR_BYTES`` chunks.
+    """
+    windows = np.lib.stride_tricks.sliding_window_view(a, w)
+    chunk = max(1, _SIGMA_REPAIR_BYTES // (w * 8))
+    for s in range(0, idx.size, chunk):
+        rows = idx[s : s + chunk]
+        wv = windows[rows]  # fancy indexing copies, so in-place is safe
+        mu_exact = wv.mean(axis=1)
+        mu[rows] = mu_exact
+        wv -= mu_exact[:, None]
+        var[rows] = np.einsum("ij,ij->i", wv, wv) / w
 
 
 def rolling_mean_sigma(
@@ -232,74 +432,117 @@ def rolling_mean_sigma(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Float64 rolling mean and standard deviation.
 
-    The O(n) cumulative-sum pass is exact enough everywhere except
-    small-variance windows (e.g. a flatlined sensor with tiny jitter, or any
-    window whose variance global standardization crushed toward the cumsum
-    noise floor), where ``E[x^2] - mu^2`` cancels and leaves large relative
-    error. Windows whose computed variance falls within
-    ``_SIGMA_REPAIR_HEADROOM`` of a per-window error bound are therefore
-    recomputed directly, two-pass, from the raw window values — an
-    O(suspects * w) repair, streamed in byte-budgeted chunks, that caps the
-    surviving relative variance error at ~1/headroom (~1e-6).
+    Window sums come from one fixed pairwise tree per window (see
+    :func:`_rolling_sum_local`): a window's statistics depend on its own
+    values only, never on its position, so identical windows get identical
+    ``mu``/``sigma``. Error bound, to first order with ``u = eps/2`` and
+    ``D = _rolling_sum_depth(w)`` (at most ``log2(w) + 1`` additions per
+    term): the sum ``S`` is off by at most ``D*u*sum|x|``, the sum of
+    squares ``S2`` by ``(D+1)*u*s2`` (with the squaring), ``S2/w`` by
+    ``(D+2)*u*s2/w``, and ``mu*mu`` by ``(2D+3)*u*s2/w`` (using
+    ``|mu|*sum|x|/w <= s2/w`` and ``mu^2 <= s2/w``, Cauchy-Schwarz); with
+    the final subtraction's ``u*s2/w``, the one-pass variance
+    ``S2/w - mu^2`` is off by at most ``B = (1.5*D + 3)*eps*S2/w``,
+    independent of the window's position in the series. That bound is only
+    relatively large for small-variance windows (e.g. a flatlined sensor
+    with tiny jitter, or any window whose variance global standardization
+    crushed toward it), where ``E[x^2] - mu^2`` cancels. Windows whose
+    computed variance is at most ``_SIGMA_REPAIR_HEADROOM * B`` are
+    therefore recomputed directly, two-pass, from the raw window values —
+    an O(suspects * w) repair, streamed in byte-budgeted chunks — and every
+    other window has true variance above ``(headroom - 1) * B``, so its
+    relative variance error is at most ``1/(headroom - 1)`` (~1e-6).
 
     ``known_constant`` (optional, ``(n-w+1,)`` bool) marks windows whose min
     equals their max: their mean is any of their values and their variance
     is exactly 0, so they are written directly instead of being re-read (a
     constant series would otherwise "repair" every window it has).
     """
-    csum = np.zeros(a.shape[0] + 1)
-    np.cumsum(a, out=csum[1:])
-    mu = (csum[w:] - csum[:-w]) / w
-    csq = np.zeros(a.shape[0] + 1)
-    np.cumsum(a * a, out=csq[1:])
-    var = (csq[w:] - csq[:-w]) / w - mu * mu
-    np.maximum(var, 0.0, out=var)
-
-    # cancellation bound: the cumsum difference errors scale with the prefix
-    # magnitudes (csq is nondecreasing), the mu^2 term with |csum|
     eps = np.finfo(np.float64).eps
-    bound = eps * (csq[w:] + 2.0 * np.abs(mu) * (np.abs(csum[w:]) + np.abs(csum[:-w]))) / w * 8.0
-    suspects = np.nonzero(var <= bound * _SIGMA_REPAIR_HEADROOM)[0]
+    # the scaled bound H * B = H * (1.5*D + 3) * eps * S2 / w, per unit S2
+    bound = _SIGMA_REPAIR_HEADROOM * (1.5 * _rolling_sum_depth(w) + 3.0) * eps / w
+    # tiny values may square or scale into the subnormal range: harmless
+    # for these statistics, so a caller's underflow policy must not trip
+    with np.errstate(under="ignore"):
+        s2 = _rolling_sum_local(a * a, w)  # the squared series dies here
+        mu = _rolling_sum_local(a, w)
+        mu /= w
+        var = s2 / w
+        for s in range(0, var.shape[0], _ROLLING_CHUNK):
+            e = s + _ROLLING_CHUNK
+            var[s:e] -= mu[s:e] * mu[s:e]
+        np.maximum(var, 0.0, out=var)
+        s2 *= bound
+    suspects = np.nonzero(var <= s2)[0]
+    del s2
     if known_constant is not None:
         kc = np.nonzero(known_constant)[0]
         mu[kc] = a[kc]
         var[kc] = 0.0
         suspects = suspects[~known_constant[suspects]]
     if suspects.size:
-        windows = np.lib.stride_tricks.sliding_window_view(a, w)
-        chunk = max(1, _SIGMA_REPAIR_BYTES // (w * 8))
-        for s in range(0, suspects.size, chunk):
-            idx = suspects[s : s + chunk]
-            wv = windows[idx]  # fancy indexing copies, so in-place is safe
-            mu_exact = wv.mean(axis=1)
-            mu[idx] = mu_exact
-            wv -= mu_exact[:, None]
-            var[idx] = np.einsum("ij,ij->i", wv, wv) / w
+        _two_pass_repair(a, w, suspects, mu, var)
 
-    return mu, np.sqrt(var)
+    return mu, np.sqrt(var, out=var)
 
 
 def split_float32(x: np.ndarray) -> np.ndarray:
     """``(..., 2)`` float32 ``[hi, lo]`` with ``hi + lo == x`` to ~float64.
 
     ``lo`` is the float64 residual of the float32 rounding, itself rounded
-    to float32 (relative 6e-8 of a quantity already 6e-8 of ``x``).
+    to float32 (relative 6e-8 of a quantity already 6e-8 of ``x``). Written
+    in chunks straight into the result, so the float64 temporaries stay
+    bounded instead of costing ~3x the input.
     """
-    hi = np.asarray(x, dtype=np.float64).astype(np.float32)
-    lo = (np.asarray(x, dtype=np.float64) - hi.astype(np.float64)).astype(np.float32)
-    return np.stack([hi, lo], axis=-1)
+    x = np.asarray(x, dtype=np.float64)
+    out = np.empty(x.shape + (2,), dtype=np.float32)
+    flat, pairs = x.reshape(-1), out.reshape(-1, 2)
+    for s in range(0, flat.shape[0], _ROLLING_CHUNK):
+        chunk = flat[s : s + _ROLLING_CHUNK]
+        hi = chunk.astype(np.float32)
+        pairs[s : s + _ROLLING_CHUNK, 0] = hi
+        pairs[s : s + _ROLLING_CHUNK, 1] = chunk - hi  # float64 residual, cast once
+    return out
 
 
-def process_isconstant(T_nan: np.ndarray, m: int, user_isconstant, name: str) -> np.ndarray:
-    """Resolve a user-supplied isconstant spec against STUMPY's rules."""
-    if user_isconstant is None:
-        return rolling_isconstant(T_nan, m)
-    if callable(user_isconstant):
-        raise NotImplementedError(
-            f"Callable `{name}` is not supported yet; pass a boolean array instead."
+def call_isconstant(func, T: np.ndarray, m: int, name: str):
+    """Evaluate a callable constant-flag spec with STUMPY's contract.
+
+    STUMPY calls ``func(a, w)`` on the series with inf replaced by NaN and
+    rejects a function with any other required argument (extra arguments
+    are curried with ``functools.partial``). The callable gets a private
+    copy, so it cannot modify the caller's series. Returns its raw result.
+    """
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):  # no introspectable signature: just call it
+        params = {}
+    required = {k for k, v in params.items() if v.default is inspect.Parameter.empty}
+    incompatible = required - {"a", "w"}
+    if incompatible:
+        raise ValueError(
+            f"Incompatible arguments {incompatible} found in `{name}`. Please provide "
+            f"the custom function `{name}` with arguments `a`, a 1-D array, and `w`, "
+            "the window size."
         )
+    return func(np.where(np.isinf(T), np.nan, T), m)
+
+
+def process_isconstant(T: np.ndarray, m: int, user_isconstant, name: str) -> np.ndarray:
+    """Resolve a user-supplied isconstant spec against STUMPY's rules.
+
+    ``T`` is the series as given (inf allowed). ``user_isconstant`` is never
+    ``None`` here (every caller checks first; :func:`preprocess_series`
+    detects the default flags itself). An array spec only needs ``T``'s
+    length. A callable is evaluated once through :func:`call_isconstant`;
+    like an array, its result must be a boolean array of shape ``(l,)``.
+    Flags on non-finite windows are returned as given (the caller switches
+    them off with STUMPY's warning).
+    """
+    if callable(user_isconstant):
+        user_isconstant = call_isconstant(user_isconstant, T, m, name)
     isconstant = np.asarray(user_isconstant)
-    l = T_nan.shape[0] - m + 1
+    l = T.shape[0] - m + 1
     if isconstant.dtype != np.bool_ or isconstant.shape != (l,):
         raise ValueError(f"`{name}` must be a boolean array of shape ({l},).")
     return isconstant.copy()
@@ -319,7 +562,6 @@ class PreprocessedSeries:
     isfinite: np.ndarray  # (l,) window all-finite
     isconstant: np.ndarray  # (l,) window min == max
     mu: np.ndarray | None  # (l,) rolling mean of Ts (raw mode only)
-    sig_inv: np.ndarray | None  # (l,) inverse sigma of Ts (raw mode only)
     ssq: np.ndarray | None  # (l,) CENTERED sum of squares m*sigma^2 (normalize=False only)
     # device-side float32 copies. Windows are centered in float64 before
     # upload, so the GPU never re-derives the mean — but the non-normalized
@@ -332,14 +574,17 @@ class PreprocessedSeries:
     # (hi_q - hi_t) is exact for nearby means (Sterbenz) and lo carries the
     # residual, so the device difference is accurate to float32 of the
     # difference itself.
-    # In normalized mode the device windows are already divided by their
-    # locally recomputed RMS, so this is a 1/0 varying-window mask rather
-    # than the CPU rolling inverse sigma. Raw mode does not consume it.
+    # sig_inv_mx and isconstant_mx exist in normalized mode only. The device
+    # windows are already divided by their locally recomputed RMS there, so
+    # sig_inv_mx is a 1/0 varying-window mask rather than a rolling inverse
+    # sigma. Raw mode uses ssq_mx/mu_mx instead (no constant special case).
     sig_inv_mx: mx.array = field(repr=False, default=None)
     isfinite_mx: mx.array = field(repr=False, default=None)
     isconstant_mx: mx.array = field(repr=False, default=None)
     ssq_mx: mx.array = field(repr=False, default=None)
     mu_mx: mx.array = field(repr=False, default=None)  # (l, 2) float32 [hi, lo]
+    # (l,) rolling sigma of Ts, kept only on request (raw mode, keep_sigma)
+    sigma: np.ndarray | None = field(repr=False, default=None)
 
     def release_device(self) -> None:
         """Drop the device-side copies (the CPU arrays stay).
@@ -360,7 +605,7 @@ class PreprocessedSeries:
         refinement avoids retaining the raw-mode standardized series and
         rolling-stat arrays while a large object-dtype result is assembled.
         """
-        self.Ts = self.mu = self.sig_inv = self.ssq = None
+        self.Ts = self.mu = self.ssq = self.sigma = None
 
 
 def preprocess_series(
@@ -372,6 +617,8 @@ def preprocess_series(
     scale: float | None = None,
     isconstant=None,
     isconstant_name: str = "T_subseq_isconstant",
+    keep_sigma: bool = False,
+    stacklevel: int = 3,
 ) -> PreprocessedSeries:
     """Prepare one already-validated float64 series for the GPU engine.
 
@@ -381,20 +628,27 @@ def preprocess_series(
     Normalized search needs only the raw series and finite/constant masks:
     every window is centered and scaled locally by the engine, so no global
     series copy or rolling statistics are built or retained in that mode.
+    ``isconstant`` may be a boolean array or a callable (see
+    :func:`process_isconstant`). ``keep_sigma`` (raw mode) also retains the
+    rolling sigma of ``Ts``. ``stacklevel`` is that of this function's
+    warnings, so wrappers can point them at the user's call.
     """
     n = T.shape[0]
     l = n - m + 1
 
     isfinite_pt = np.isfinite(T)
-    T_nan = np.where(np.isinf(T), np.nan, T)
-
     isfinite = rolling_isfinite(isfinite_pt, m)
-    # windows whose min equals their max (NaN windows never qualify): the
-    # default constant flags, and the windows whose stats are known exactly
-    detected = rolling_isconstant(T_nan, m)
     user_isconstant = isconstant is not None
+    detected = None
+    if not normalize or not user_isconstant:
+        # windows whose min equals their max (NaN windows never qualify, and
+        # the all-inf windows that compare equal are masked here): the
+        # default constant flags, and the windows whose stats are known
+        # exactly. Normalized mode with user flags never reads it.
+        detected = rolling_isconstant(T, m)
+        detected &= isfinite
     if user_isconstant:
-        isconstant = process_isconstant(T_nan, m, isconstant, isconstant_name)
+        isconstant = process_isconstant(T, m, isconstant, isconstant_name)
     else:
         isconstant = detected
     fixed = isconstant & isfinite  # a window with NaN is never constant
@@ -404,11 +658,12 @@ def preprocess_series(
             "contain one or more np.nan/np.inf and so their corresponding values "
             f"in `{isconstant_name}` have been automatically switched from True "
             "to False.",
-            stacklevel=3,
+            stacklevel=stacklevel,
         )
     isconstant = fixed
 
     if normalize:
+        del isfinite_pt
         active = isfinite & ~isconstant
         return PreprocessedSeries(
             T=T,
@@ -421,9 +676,9 @@ def preprocess_series(
             isfinite=isfinite,
             isconstant=isconstant,
             mu=None,
-            sig_inv=None,
             ssq=None,
-            sig_inv_mx=mx.array(active.astype(np.float32)),
+            # converted while copying: exact 0/1, no 4-byte/window host copy
+            sig_inv_mx=mx.array(active, dtype=mx.float32),
             isfinite_mx=mx.array(isfinite),
             isconstant_mx=mx.array(isconstant),
             ssq_mx=None,
@@ -440,23 +695,22 @@ def preprocess_series(
     # zero: on a huge-offset, small-spread series, raw zero would become an
     # enormous sentinel whose contribution poisons cumulative rolling stats
     # for otherwise finite windows long after the bad point has left them.
-    T_filled = np.where(isfinite_pt, T, center)
-    Ts = apply_affine_frame(T_filled, center, scale)
+    Ts = apply_affine_frame(np.where(isfinite_pt, T, center), center, scale)
+    del isfinite_pt
 
     mu, sigma = rolling_mean_sigma(Ts, m, known_constant=detected)
     sigma[isconstant] = 0.0
-    with np.errstate(divide="ignore"):
-        sig_inv = np.where(sigma > 0.0, 1.0 / sigma, 0.0)
 
-    pos = sigma[sigma > 0.0]
     # A user may deliberately mark a varying window as constant; we set its
     # sigma to zero above to implement that override, so it is not evidence
     # that global standardization lost the window's variation. Warn only for
     # windows that neither the data nor the resolved user flags call constant.
     lost_variation = isfinite & ~detected & ~isconstant & (sigma == 0.0)
+    smallest = np.min(sigma, where=sigma > 0.0, initial=np.inf)
     precision_limited = np.any(lost_variation) or (
-        pos.size and pos.min() < 1e-13 * max(1.0, float(np.max(np.abs(Ts))))
+        smallest < 1e-13 * max(1.0, float(max(np.max(Ts), -np.min(Ts))))
     )
+    del lost_variation
     if precision_limited:
         # e.g. a 1e17-amplitude segment next to unit noise: standardization
         # then re-rounds the noise below its own variation (float64 has ~16
@@ -465,16 +719,18 @@ def preprocess_series(
             "The amplitude dynamic range of this series approaches the float64 "
             "standardization limit for raw-distance search; distances involving "
             "its smallest-variance windows may be unreliable.",
-            stacklevel=3,
+            stacklevel=stacklevel,
         )
 
-    ssq = None
-    if not normalize:
-        # centered sum of squares: the engine computes the non-normalized
-        # distance as ||qc - tc||^2 + m*(mu_q - mu_t)^2 (windows centered
-        # before the float32 cast), which kills the ssq_q + ssq_t - 2*QT
-        # cancellation on mixed-scale data
-        ssq = m * sigma * sigma
+    # centered sum of squares: the engine computes the non-normalized
+    # distance as ||qc - tc||^2 + m*(mu_q - mu_t)^2 (windows centered
+    # before the float32 cast), which kills the ssq_q + ssq_t - 2*QT
+    # cancellation on mixed-scale data. (m * sigma) * sigma, as before: the
+    # same rounding, one l-wide buffer
+    ssq = m * sigma
+    ssq *= sigma
+    if not keep_sigma:
+        sigma = None
 
     return PreprocessedSeries(
         T=T,
@@ -487,11 +743,10 @@ def preprocess_series(
         isfinite=isfinite,
         isconstant=isconstant,
         mu=mu,
-        sig_inv=sig_inv,
         ssq=ssq,
-        sig_inv_mx=mx.array(sig_inv.astype(np.float32)),
         isfinite_mx=mx.array(isfinite),
-        isconstant_mx=mx.array(isconstant),
-        ssq_mx=None if ssq is None else mx.array(ssq.astype(np.float32)),
+        # rounded while copying, exactly like astype(float32): no host copy
+        ssq_mx=mx.array(ssq, dtype=mx.float32),
         mu_mx=mx.array(split_float32(mu)),
+        sigma=sigma,
     )
