@@ -26,7 +26,7 @@ anomaly classification on the same silicon.
 ## Status
 
 **v0.1 development — the batched-MASS engine is implemented and golden-tested
-against STUMPY** (893 golden and regression tests). Distance profiles are
+against STUMPY** (894 golden and regression tests). Distance profiles are
 computed in bulk on the GPU as dense matmuls against a locally z-normalized
 subsequence matrix (or a doubly-centered shared-frame matrix for raw
 distances) — materialized in one piece for moderate `n*m`, streamed as column
