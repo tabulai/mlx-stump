@@ -19,6 +19,7 @@ from ._engine import (
     free_gpu_after_error,
     make_reducer,
     query_windows,
+    query_windows_at,
     refine_chunk_rows,
     tiled_chunk_size,
 )
@@ -42,6 +43,44 @@ from ._preprocess import (
 # not be applied to raw-unit AAMP distances, where any fixed absolute cutoff
 # would make the result depend on the user's choice of units.
 P_NORM_THRESHOLD = 1e-14
+
+# The GPU ranks float32 squared distances. Around zero, two distinct raw
+# windows can both round to the same score (often exactly zero), so retaining
+# only the winning index can discard an exact match. The bound covers input
+# rounding and a sequential m-term float32 dot product with generous
+# headroom. It is applied only to a row whose kth or side winner is this
+# close to zero; ordinary rows do not need a second search.
+_ZERO_SCORE_ULPS = 128
+
+
+def _zero_score_bound(m: int) -> float:
+    eps = np.finfo(np.float32).eps
+    # The sequential-dot bound becomes uninformative for very long windows.
+    # Keep this a near-zero check: a larger GPU error needs a different
+    # algorithm, not an all-pairs float64 replay.
+    return min(m / 8.0, _ZERO_SCORE_ULPS * eps * m * (m + 2))
+
+
+def _raw_score_factor(m: int) -> float:
+    # Raw centered-covariance cancellation is proportional to the *pair's*
+    # energy, not m alone. The cap keeps the test local to near-duplicates.
+    return min(1.0 / 8.0, _ZERO_SCORE_ULPS * np.finfo(np.float32).eps * (m + 2))
+
+
+def _ambiguous_scores(
+    query: PreprocessedSeries,
+    target: PreprocessedSeries,
+    rows: np.ndarray,
+    indices: np.ndarray,
+    scores: np.ndarray,
+    normalize: bool,
+) -> np.ndarray:
+    if normalize:
+        return scores <= _zero_score_bound(query.m)
+    valid = indices >= 0
+    safe = np.maximum(indices, 0)
+    energy = query.ssq[rows] + target.ssq[safe]
+    return valid & (scores <= _raw_score_factor(query.m) * energy)
 
 
 # Upper bound on the threads of one refinement call. Every refinement step
@@ -316,6 +355,7 @@ def _compute_profile_tiled(
     k: int,
     chunk_size: int | None,
     excl: int,
+    uncertain_out: np.ndarray | None = None,
 ):
     """Chunked sweep for targets too large to materialize in one piece.
 
@@ -410,6 +450,18 @@ def _compute_profile_tiled(
             rP2 = np.where(left_better, rPl2, rPr2)
             rI = np.where(left_better, rIl, rIr)
             del rows, left_better
+    rows = np.arange(l_q)
+    boundary = rP2 if k == 1 else rPk2[:, -1]
+    boundary_i = rI if k == 1 else rIk[:, -1]
+    uncertain = _ambiguous_scores(
+        query, engine.target, rows, boundary_i, boundary, normalize
+    )
+    if self_join:
+        uncertain |= _ambiguous_scores(
+            query, engine.target, rows, rIl, rPl2, normalize
+        ) | _ambiguous_scores(query, engine.target, rows, rIr, rPr2, normalize)
+    if uncertain_out is not None:
+        uncertain_out[:] = uncertain
     if k == 1:
         rI[~np.isfinite(rP2)] = -1
         return rI.reshape(l_q, 1), IL, IR
@@ -426,6 +478,7 @@ def _compute_profile(
     k: int,
     chunk_size: int | None,
     excl: int,
+    uncertain_out: np.ndarray | None = None,
 ):
     """Chunked GPU sweep: returns the neighbour indices ``(I (l, k), IL, IR)``.
 
@@ -445,6 +498,7 @@ def _compute_profile(
             k=k,
             chunk_size=chunk_size,
             excl=excl,
+            uncertain_out=uncertain_out,
         )
     l_q = query.l
     fused = _engine._fused_reducer(k)
@@ -453,6 +507,7 @@ def _compute_profile(
     I = np.empty((l_q, k), dtype=np.int64)
     IL = np.full(l_q, -1, dtype=np.int64)
     IR = np.full(l_q, -1, dtype=np.int64)
+    uncertain = np.zeros(l_q, dtype=bool)
 
     red = make_reducer(
         query, engine, normalize=normalize, self_join=self_join, excl=excl, k=k, fused=fused
@@ -475,20 +530,254 @@ def _compute_profile(
         if k == 1:
             p2 = np.array(outs[1])[off:]
             I[s:e, 0] = np.where(np.isfinite(p2), np.array(outs[0], dtype=np.int64)[off:], -1)
+            uncertain[s:e] |= _ambiguous_scores(
+                query, engine.target, np.arange(s, e), I[s:e, 0], p2, normalize
+            )
         else:
+            vals = np.array(outs[0])[off:]
             ix = np.array(outs[1], dtype=np.int64)[off:]
-            ix[~np.isfinite(np.array(outs[0])[off:])] = -1
+            ix[~np.isfinite(vals)] = -1
             kk = ix.shape[1]
             I[s:e, :kk] = ix
             if kk < k:
                 I[s:e, kk:] = -1
+            else:
+                uncertain[s:e] |= _ambiguous_scores(
+                    query, engine.target, np.arange(s, e), I[s:e, -1], vals[:, -1], normalize
+                )
         if self_join:
             pl2 = np.array(outs[3])[off:]
             IL[s:e] = np.where(np.isfinite(pl2), np.array(outs[2], dtype=np.int64)[off:], -1)
             pr2 = np.array(outs[5])[off:]
             IR[s:e] = np.where(np.isfinite(pr2), np.array(outs[4], dtype=np.int64)[off:], -1)
+            rows = np.arange(s, e)
+            uncertain[s:e] |= _ambiguous_scores(
+                query, engine.target, rows, IL[s:e], pl2, normalize
+            ) | _ambiguous_scores(query, engine.target, rows, IR[s:e], pr2, normalize)
         del outs
+    if uncertain_out is not None:
+        uncertain_out[:] = uncertain
     return I, IL, IR
+
+
+def _repair_zero_neighbors(
+    query: PreprocessedSeries,
+    target: PreprocessedSeries,
+    engine: MassEngine,
+    I: np.ndarray,
+    IL: np.ndarray,
+    IR: np.ndarray,
+    uncertain: np.ndarray,
+    *,
+    normalize: bool,
+    self_join: bool,
+    excl: int,
+) -> None:
+    """Recover exact matches hidden by float32 near-zero ties.
+
+    The first sweep keeps only k indices. A near copy can have the same
+    float32 score as an exact copy and win by the search tie key, so refining
+    those k indices alone cannot restore the true minimum. Only rows whose
+    kth or side score is inside the zero-score error bound are replayed here.
+    Each target block and small query batch is materialized once; candidates
+    in the band are refined immediately and reduced to k plus left/right
+    winners, keeping host storage bounded even on repeated series.
+    """
+    rows = np.flatnonzero(uncertain)
+    if rows.size == 0:
+        return
+
+    # A repeated/constant series can put every row in the zero band. When
+    # every reported neighbor is already an exact raw copy (or both windows
+    # carry the normalized constant flag), no near copy has displaced it.
+    # Avoid replaying an O(l^2) plateau merely to rediscover those zeros.
+    Q_windows = np.lib.stride_tricks.sliding_window_view(query.T, query.m)
+    T_windows = np.lib.stride_tricks.sliding_window_view(target.T, target.m)
+
+    def selected_exact(row: int, j: int) -> bool:
+        return j >= 0 and (
+            (normalize and query.isconstant[row] and target.isconstant[j])
+            or (
+                (not normalize or query.isconstant[row] == target.isconstant[j])
+                and np.array_equal(Q_windows[row], T_windows[j])
+            )
+        )
+
+    def already_exact(row: int) -> bool:
+        if not all(selected_exact(row, int(j)) for j in I[row]):
+            return False
+        if not self_join:
+            return True
+        if IL[row] >= 0:
+            if not selected_exact(row, int(IL[row])):
+                return False
+        elif row - excl - 1 >= 0:
+            return False
+        if IR[row] >= 0:
+            return selected_exact(row, int(IR[row]))
+        return row + excl + 1 >= target.l
+
+    keep = np.fromiter((not already_exact(int(row)) for row in rows), dtype=bool, count=rows.size)
+    rows = rows[keep]
+    del keep
+    if rows.size == 0:
+        return
+
+    # The first sweep's large batch buffers are no longer used. Keep its
+    # resident window block, but release cached buffers before interleaving
+    # bounded GPU rescans with float64 candidate verification.
+    mx.clear_cache()
+    from ._match import _refine_candidates
+
+    k = I.shape[1]
+    bound = _zero_score_bound(query.m) if normalize else None
+    raw_factor = _raw_score_factor(query.m) if not normalize else None
+    refine_rows = max(1, (8 << 20) // (query.m * 8 * 4))
+    # Shifted/scaled copies are also exact normalized matches. Certify the
+    # currently selected neighbors before replaying a whole affine plateau;
+    # _refine_candidates proves zero without stump's 1e-14 output snap.
+    def refine_seeds(row: int) -> tuple[np.ndarray, np.ndarray]:
+        seeds = I[row, I[row] >= 0]
+        if self_join:
+            seeds = np.concatenate((seeds, [IL[row], IR[row]]))
+            seeds = seeds[seeds >= 0]
+        seeds = np.unique(seeds)
+        d = _refine_candidates(
+            query.T[row : row + query.m], target.T, seeds, normalize,
+            bool(query.isconstant[row]), target.isconstant,
+            max_chunk_rows=refine_rows,
+        )
+        return seeds, d
+
+    keep = np.ones(rows.size, dtype=bool)
+    for pos, row in enumerate(rows):
+        _, d = refine_seeds(int(row))
+        complete = np.all(I[row] >= 0)
+        if self_join:
+            complete &= (IL[row] >= 0 or row - excl - 1 < 0) and (
+                IR[row] >= 0 or row + excl + 1 >= target.l
+            )
+        if complete and d.size and np.all(d == 0.0):
+            keep[pos] = False
+    rows = rows[keep]
+    del keep
+    if rows.size == 0:
+        return
+
+    best_i = np.full((rows.size, k), -1, dtype=np.int64)
+    best_d = np.full((rows.size, k), np.inf, dtype=np.float64)
+    left_i = np.full(rows.size, -1, dtype=np.int64)
+    right_i = np.full(rows.size, -1, dtype=np.int64)
+    left_d = np.full(rows.size, np.inf, dtype=np.float64)
+    right_d = np.full(rows.size, np.inf, dtype=np.float64)
+
+    def keys(row: int, js: np.ndarray) -> np.ndarray:
+        if not self_join:
+            return js
+        return 2 * np.abs(js - row) + (js > row)
+
+    def add(pos: int, js: np.ndarray, distances: np.ndarray) -> None:
+        row = int(rows[pos])
+        valid = np.isfinite(distances)
+        js, distances = js[valid], distances[valid]
+        if js.size == 0:
+            return
+        old = best_i[pos]
+        old_valid = old >= 0
+        fresh = ~np.isin(js, old[old_valid])
+        joined_i = np.concatenate((old[old_valid], js[fresh]))
+        joined_d = np.concatenate((best_d[pos, old_valid], distances[fresh]))
+        order = np.lexsort((keys(row, joined_i), joined_d))[:k]
+        best_i[pos] = -1
+        best_d[pos] = np.inf
+        best_i[pos, : order.size] = joined_i[order]
+        best_d[pos, : order.size] = joined_d[order]
+        if self_join:
+            for side, mask in (("left", js < row), ("right", js > row)):
+                side_js, side_d = js[mask], distances[mask]
+                if side_js.size == 0:
+                    continue
+                winner = np.lexsort((keys(row, side_js), side_d))[0]
+                index, distance = int(side_js[winner]), float(side_d[winner])
+                current_d = left_d[pos] if side == "left" else right_d[pos]
+                current_i = left_i[pos] if side == "left" else right_i[pos]
+                if distance < current_d or (
+                    distance == current_d
+                    and (current_i < 0 or keys(row, np.array([index]))[0]
+                         < keys(row, np.array([current_i]))[0])
+                ):
+                    if side == "left":
+                        left_i[pos], left_d[pos] = index, distance
+                    else:
+                        right_i[pos], right_d[pos] = index, distance
+
+    # Include the original GPU winners. A candidate inside the float32 band
+    # is not necessarily truly better than one just outside it.
+    for pos, row in enumerate(rows):
+        seeds, d = refine_seeds(int(row))
+        add(pos, seeds, d)
+
+    for j0, j1, W in engine.target_blocks():
+        # Bound both the score matrix and locally normalized query windows.
+        # A single very long row can exceed the nominal 8 MiB query budget.
+        batch = max(
+            1,
+            min(
+                64,
+                (8 << 20) // (4 * (j1 - j0)),
+                (8 << 20) // (24 * query.m + 128),
+            ),
+        )
+        for start in range(0, rows.size, batch):
+            stop = min(start + batch, rows.size)
+            selected = rows[start:stop]
+            index = mx.array(selected.astype(np.int32))
+            Q = query_windows_at(query, selected, normalize=normalize)
+            QT = mx.matmul(Q, W)
+            if normalize:
+                d2 = engine.znorm_sq_distances(
+                    QT,
+                    mx.take(query.sig_inv_mx, index, axis=0),
+                    mx.take(query.isconstant_mx, index, axis=0),
+                    mx.take(query.isfinite_mx, index, axis=0),
+                    j0, j1,
+                )
+            else:
+                d2 = engine.absolute_sq_distances(
+                    QT,
+                    mx.take(query.ssq_mx, index, axis=0),
+                    mx.take(query.mu_mx, index, axis=0),
+                    mx.take(query.isfinite_mx, index, axis=0),
+                    j0, j1,
+                )
+            mx.eval(d2)
+            mx.synchronize()
+            scores = np.array(d2)
+            del index, Q, QT, d2
+            for local, row in enumerate(selected):
+                if normalize:
+                    candidates = scores[local] <= bound
+                else:
+                    pair_energy = query.ssq[row] + target.ssq[j0:j1]
+                    candidates = scores[local] <= raw_factor * pair_energy
+                js = np.flatnonzero(candidates).astype(np.int64) + j0
+                if self_join:
+                    js = js[np.abs(js - row) > excl]
+                if js.size == 0:
+                    continue
+                d = _refine_candidates(
+                    query.T[row : row + query.m], target.T, js, normalize,
+                    bool(query.isconstant[row]), target.isconstant,
+                    max_chunk_rows=refine_rows,
+                )
+                add(start + local, js, d)
+            del scores
+        del W
+
+    I[rows] = best_i
+    if self_join:
+        IL[rows] = left_i
+        IR[rows] = right_i
 
 
 def stump(
@@ -693,6 +982,8 @@ def _stump(
             )
 
         engine = MassEngine(Bs, normalize=normalize)
+        excl = exclusion_zone(m, denom)
+        uncertain = np.zeros(A.l, dtype=bool)
         I, IL, IR = _compute_profile(
             A,
             engine,
@@ -700,7 +991,12 @@ def _stump(
             normalize=normalize,
             k=k,
             chunk_size=chunk_size,
-            excl=exclusion_zone(m, denom),
+            excl=excl,
+            uncertain_out=uncertain,
+        )
+        _repair_zero_neighbors(
+            A, Bs, engine, I, IL, IR, uncertain,
+            normalize=normalize, self_join=self_join, excl=excl,
         )
     except BaseException as exc:
         # an error or Ctrl-C mid-sweep: give the window block and the batch

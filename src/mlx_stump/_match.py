@@ -402,7 +402,7 @@ def _high_precision_znorm_rows(
     return out
 
 
-def _refine_candidates(Q, T, js, normalize, q_const, t_const):
+def _refine_candidates(Q, T, js, normalize, q_const, t_const, *, max_chunk_rows=None):
     """Float64 re-evaluation of the finite profile entries ``js``.
 
     The GPU profile is float32, so a perfect occurrence reads ~1e-3 instead
@@ -429,6 +429,8 @@ def _refine_candidates(Q, T, js, normalize, q_const, t_const):
     positive-affine using dyadic-rational arithmetic.  Thus independently
     normalized affine windows read exactly 0.0 while even a one-ULP
     non-affine perturbation retains its non-zero distance.
+    ``max_chunk_rows`` lets the matrix-profile tie repair use smaller host
+    chunks while a GPU window block is resident.
     """
     js = np.asarray(js, dtype=np.int64)
     out = np.empty(js.size, dtype=np.float64)
@@ -436,6 +438,8 @@ def _refine_candidates(Q, T, js, normalize, q_const, t_const):
         return out
     m = Q.shape[0]
     chunk = refine_chunk_rows(m)
+    if max_chunk_rows is not None:
+        chunk = min(chunk, max_chunk_rows)
     if normalize:
         Wfull = np.lib.stride_tricks.sliding_window_view(T, m)
         # Put every raw row into its own bounded midpoint/range frame before
@@ -501,7 +505,7 @@ def _refine_candidates(Q, T, js, normalize, q_const, t_const):
         # the engine computes on the zero-filled series; mirror it (per
         # gathered window, with no zero-filled copy of the series) so a user
         # T_subseq_isfinite override cannot inject NaN into the profile
-        out = _raw_window_distances(Q, T, js)
+        out = _raw_window_distances(Q, T, js, max_chunk_rows=max_chunk_rows)
     return out
 
 

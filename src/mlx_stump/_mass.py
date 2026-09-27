@@ -74,7 +74,9 @@ def _check_stats(M_T, Σ_T, l: int) -> tuple[np.ndarray, np.ndarray]:
     return M, S
 
 
-def _raw_window_distances(Q: np.ndarray, T: np.ndarray, js: np.ndarray) -> np.ndarray:
+def _raw_window_distances(
+    Q: np.ndarray, T: np.ndarray, js: np.ndarray, *, max_chunk_rows: int | None = None
+) -> np.ndarray:
     """Float64 Euclidean distances from ``Q`` to the windows ``js`` of ``T``.
 
     Non-finite points of ``T`` count as raw zero, like the engine's
@@ -87,6 +89,8 @@ def _raw_window_distances(Q: np.ndarray, T: np.ndarray, js: np.ndarray) -> np.nd
     out = np.empty(js.size, dtype=np.float64)
     Wfull = np.lib.stride_tricks.sliding_window_view(T, m)
     chunk = refine_chunk_rows(m)
+    if max_chunk_rows is not None:
+        chunk = min(chunk, max_chunk_rows)
     for start in range(0, js.size, chunk):
         W = Wfull[js[start : start + chunk]]  # fancy indexing: a float64 copy
         finite = np.isfinite(W)
