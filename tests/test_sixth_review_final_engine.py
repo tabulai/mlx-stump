@@ -40,6 +40,14 @@
    neighbour indices, and ``stump`` refines into a fresh array: the output
    is bitwise identical and the sweep's host peak halves at large ``k``.
 
+8. (CI, macos-14) The Metal compiler of macOS 14 ignores ``#pragma METAL
+   fp contract(off)``, so the raw-mode kernel fused ``max(x, 0) +
+   (m*dmu)*dmu`` into an FMA and resolved exact ties differently from the
+   compiled fallback (the fused-vs-fallback bit-identity tests failed on
+   every macos-14 CI job). The product is now OR-ed with a runtime zero,
+   which no compiler can fold; the harness test builds the kernel's own
+   snippet without the pragma, as that compiler does.
+
 Q4 (the bit-identity helper in ``test_sixth_review_engine.py`` checks that
 the fused reducer was built) and MEM-4 (re-measured per-window byte
 figures) change tests and comments only.
@@ -654,3 +662,86 @@ def test_sweep_host_peak_holds_no_profile_values(monkeypatch, tiled, ratio):
 
 def test_unused_sweep_names_are_gone():
     assert not hasattr(st, "_INF")
+
+
+# --------------------- 8: raw distances without the contract pragma
+def _raw_distance_kernel(name, d2_source):
+    """The fused kernels' raw-distance snippets (``_ABS_PRE``/``_ABS_D2``)
+    in a one-cell-per-thread harness, compiled WITHOUT ``#pragma METAL fp
+    contract(off)``: what the Metal compiler of macOS 14 builds, since it
+    ignores the pragma."""
+    source = (
+        """
+        const uint e = thread_position_in_grid.x;
+        const int i = 0;
+        const size_t qbase = 0;
+        const uint j = e;
+        const int jg = (int)e;
+        const float c_m = consts[0];
+        const bool q_fin = qf[i];
+        """
+        + kern._ABS_PRE
+        + d2_source
+        + "\n        out[e] = d2;\n"
+    )
+    return mx.fast.metal_kernel(
+        name=name,
+        input_names=["QT", "qa", "qb", "qf", "ta", "tb", "tf", "par", "consts"],
+        output_names=["out"],
+        source=source,
+        header=kern._HEADER.replace("#pragma METAL fp contract(off)", ""),
+    )
+
+
+@needs_metal
+def test_raw_distance_matches_mlx_where_the_contract_pragma_is_ignored():
+    """GitHub's macos-14 runners ignore ``#pragma METAL fp contract(off)``:
+    there the kernel fused ``max(x, 0) + (m*dmu)*dmu`` into an FMA (120,313
+    of 1,048,576 cells differed from MLX's strictly rounded ops), so raw
+    self-joins resolved exact ties differently from the compiled fallback.
+    The product now goes through an OR with a runtime zero, which rounds it
+    on its own whatever the compiler does with the pragma."""
+    n, m = 1 << 16, 7.0
+    rng = np.random.default_rng(75)
+    QT = rng.standard_normal(n).astype(np.float32) * 3
+    ssq_t = rng.uniform(0.0, 12.0, n).astype(np.float32)
+    mu_t = np.stack(
+        [rng.standard_normal(n), rng.standard_normal(n) * 1e-8], axis=1
+    ).astype(np.float32)
+    ssq_q = np.array([5.0], dtype=np.float32)
+    mu_q = np.array([[0.3, 1e-9]], dtype=np.float32)
+    ones_q, ones_t = mx.array([True]), mx.array(np.ones(n, dtype=bool))
+    consts = mx.array(np.array([m, 1 / m, 2 * m, 4 * m], dtype=np.float32))
+    par = mx.array([0, 0, 0, 0], dtype=mx.int32)
+    inputs = [
+        mx.array(QT), mx.array(ssq_q), mx.array(mu_q.reshape(-1)), ones_q,
+        mx.array(ssq_t), mx.array(mu_t.reshape(-1)), ones_t, par, consts,
+    ]
+    ref = eng._abs_sq(
+        mx.array(QT)[None, :], mx.array(ssq_q), mx.array(mu_q), ones_q,
+        mx.array(ssq_t), mx.array(mu_t), ones_t, m,
+    )
+    ref = np.array(ref)[0]
+
+    def run(name, d2_source):
+        (out,) = _raw_distance_kernel(name, d2_source)(
+            inputs=inputs, grid=(n, 1, 1), threadgroup=(256, 1, 1),
+            output_shapes=[(n,)], output_dtypes=[mx.float32],
+        )
+        return np.array(out)
+
+    # the pre-fix one-expression form, for scale: without the pragma the
+    # compiler fused it on every macOS measured (7,356 cells here)
+    start = kern._ABS_D2.index("        // round the product")
+    stop = kern._ABS_D2.index("+ p;") + len("+ p;")
+    original = (
+        kern._ABS_D2[:start]
+        + "        float d2 = mlx_max(x, 0.0f) + (c_m * dmu) * dmu;"
+        + kern._ABS_D2[stop:]
+    )
+    fused_cells = int(np.sum(run("mlx_stump_test_raw_d2_original", original) != ref))
+    got = run("mlx_stump_test_raw_d2", kern._ABS_D2)
+    assert np.array_equal(got, ref), (
+        f"{int(np.sum(got != ref))} cells differ from MLX "
+        f"({fused_cells} with the pre-fix expression)"
+    )

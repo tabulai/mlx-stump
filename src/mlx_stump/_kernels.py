@@ -12,9 +12,13 @@ plus O(k) bytes per row.
 Bit-identity with the compiled fallback (``_engine.ReduceStep``, the
 reference) is by construction:
 
-- ``#pragma METAL fp contract(off)``: without it the Metal compiler fuses
-  ``x + (m*dmu)*dmu`` (raw mode) and similar products into FMAs, which MLX's
-  own kernels do not do;
+- no FMA contraction: the Metal compiler fuses ``x + (m*dmu)*dmu`` (raw
+  mode) into an FMA, which MLX's own kernels do not do. ``#pragma METAL fp
+  contract(off)`` prevents it where the compiler honours the pragma, but
+  the Metal compiler of macOS 14 ignores it (measured on GitHub's macos-14
+  runners), so the raw product is also passed through a bitwise OR with a
+  runtime zero (``par[3]``) that no compiler can fold: the product is then
+  rounded on its own before the addition, on every macOS;
 - the same float32 constants: the kernels read ``m``, the host-computed
   ``float32(1/m)``, ``2m`` and ``4m`` from one input buffer; the compiled
   step receives ``m`` and the same ``float32(1/m)`` as 0-d arrays and forms
@@ -114,11 +118,17 @@ _ABS_PRE = r"""
     const float q_s = qa[i];
     const float q_mu0 = qb[2 * i];
     const float q_mu1 = qb[2 * i + 1];
+    const uint zbits = (uint)par[3];  // always 0, unknown to the compiler
 """
 _ABS_D2 = r"""
         float dmu = (q_mu0 - tb[2 * jg]) + (q_mu1 - tb[2 * jg + 1]);
         float x = (q_s + ta[jg]) - 2.0f * QT[qbase + j];
-        float d2 = mlx_max(x, 0.0f) + (c_m * dmu) * dmu;
+        // round the product on its own (see the module docstring): OR-ing
+        // its bits with a runtime zero keeps any compiler from fusing the
+        // sum below into an FMA, even one that ignores the contract pragma
+        float p = (c_m * dmu) * dmu;
+        p = as_type<float>(as_type<uint>(p) | zbits);
+        float d2 = mlx_max(x, 0.0f) + p;
         d2 = (q_fin && tf[jg]) ? d2 : INFINITY;
 """
 
@@ -416,7 +426,7 @@ class FusedReduce:
 
     def _run(self, QT, s0: int, j0: int):
         B = QT.shape[0]
-        par = mx.array([int(s0), int(j0), self.excl], dtype=mx.int32)
+        par = mx.array([int(s0), int(j0), self.excl, 0], dtype=mx.int32)
         lr_shapes = [(B,)] * 4 if self.self_join else []
         lr_dtypes = [mx.int32, mx.float32] * 2 if self.self_join else []
         if self.k == 1:
