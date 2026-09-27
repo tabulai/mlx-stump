@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import warnings
-from collections.abc import Callable
 from dataclasses import dataclass
 
 import mlx.core as mx
@@ -12,20 +11,44 @@ from numpy.typing import ArrayLike
 
 from ._engine import MassEngine, refine_chunk_rows
 from ._preprocess import (
+    IsConstantSpec,
     apply_affine_frame,
     call_isconstant,
     center_rows_stable,
     check_series,
     check_window_size,
+    finite_center_scale,
     preprocess_series,
     process_isconstant,
     rowwise_l2_inplace,
     split_float32,
-    stable_center_scale,
 )
 
-# a constant-flag spec: a boolean array, or STUMPY's callable f(a, w)
-IsConstantSpec = ArrayLike | Callable[[np.ndarray, int], ArrayLike] | None
+
+def _free_gpu_after_error(exc: BaseException) -> None:
+    """Return a failed call's GPU buffers to the system.
+
+    The success path releases its device arrays and clears MLX's cache
+    itself. Call this from an inline ``except`` handler (a decorator would
+    add a frame and shift every warning's ``stacklevel``) after dropping
+    the handler frame's own device references. The finished frames below
+    the handler (the block generator, the distance helpers) are kept alive
+    by the traceback with their locals, e.g. the window block: clear those
+    of mlx-stump's own frames (user frames stay intact for post-mortem
+    debugging), wait for work still in flight, then clear the cache.
+    (Private copy of the engine's helper, to be deduplicated.)
+    """
+    tb = exc.__traceback__
+    tb = tb.tb_next if tb is not None else None  # the handler's frame is executing
+    while tb is not None:
+        if tb.tb_frame.f_globals.get("__name__", "").startswith("mlx_stump."):
+            try:
+                tb.tb_frame.clear()
+            except RuntimeError:  # a still-executing or suspended frame
+                pass
+        tb = tb.tb_next
+    mx.synchronize()  # a batch still in flight holds its buffers until it completes
+    mx.clear_cache()
 
 
 def _as_flag(value, name: str, Q: np.ndarray | None = None) -> bool | None:
@@ -221,12 +244,12 @@ def _mass(
     zero_query: bool = True,
     keep_sigma: bool = False,
     copy_series: bool = True,
-    stacklevel: int = 2,
+    stacklevel: int,
 ) -> tuple[np.ndarray, _MassInfo]:
     """``mass``, plus the resolved flags and statistics ``match`` reuses.
 
-    ``stacklevel`` is that of a warning issued directly in this function;
-    the public wrappers pass the depth of the user's call. With
+    ``stacklevel`` (required) is that of a warning issued directly in this
+    function; the public wrappers pass the depth of the user's call. With
     ``zero_query=False``, ``query_idx`` is range-checked but its entry is
     neither compared with ``Q`` nor zeroed (``stumpy.aamp_match`` keeps the
     true distance there). ``keep_sigma`` (raw mode) also returns the
@@ -307,97 +330,112 @@ def _mass(
 
     D2 = np.empty(l, dtype=np.float64)
     forced_zero_fill = None
-    if normalize:
-        # T_subseq_isfinite is deliberately NOT applied here: STUMPY documents
-        # it as ignored when normalize=True (it only feeds mass_absolute)
-        prep = preprocess_series(
-            T, m, isconstant=T_subseq_isconstant, stacklevel=stacklevel + 1
-        )
-        info.isconstant, info.isfinite = prep.isconstant, prep.isfinite
-        if user_stats:
-            # The supplied arrays are compatibility metadata: every raw window
-            # still goes through the same local float64 centering and RMS
-            # normalization, so the profile equals the no-stats call exactly.
-            # STUMPY's literal
-            # use of the supplied values (`QT - m*mu_Q*M_T`, `1/(sigma_Q*Σ_T)`)
-            # lets their rounding into the distance — amplified by
-            # (mu/sigma)^2 for M_T, and as a sqrt(2m*delta) floor on perfect
-            # matches for Σ_T. The one convention kept is STUMPY's marker
-            # for windows containing NaN: an infinite M_T reports inf.
-            bad_mean = np.isinf(M_T)
-            if bad_mean.any():
-                prep.isfinite = prep.isfinite & ~bad_mean
-                prep.isfinite_mx = mx.array(prep.isfinite)
-            del bad_mean, M_T, Σ_T
-
-        # Put Q in a bounded midpoint/range frame before its two-pass stats:
-        # shifting by the first element alone avoids large common-offset
-        # cancellation but can still overflow for opposite-sign extremes,
-        # while squaring raw tiny values can underflow to zero.
-        Qc = Q.copy()[None, :]
-        center_rows_stable(Qc)
-        Qc = Qc[0]
-        sigma_q = float(np.sqrt(Qc @ Qc / m))
-        s = sigma_q if (np.isfinite(sigma_q) and sigma_q > 0.0) else 1.0
-        Qs = Qc / s
-        del Qc
-
-        engine = MassEngine(prep)
-        Qb = mx.array(Qs.astype(np.float32))[None, :]
-        del Qs
-        sig_inv_q = mx.array([0.0 if q_const else 1.0], dtype=mx.float32)
-        isconst_q = mx.array([q_const])
-        isfinite_q = mx.array([True])
-        for j0, j1, W in engine.target_blocks():
-            d2 = engine.znorm_sq_distances(
-                mx.matmul(Qb, W), sig_inv_q, isconst_q, isfinite_q, j0, j1
+    prep = None
+    try:
+        if normalize:
+            # T_subseq_isfinite is deliberately NOT applied here: STUMPY documents
+            # it as ignored when normalize=True (it only feeds mass_absolute)
+            prep = preprocess_series(
+                T, m, isconstant=T_subseq_isconstant, stacklevel=stacklevel + 1
             )
-            mx.eval(d2)
-            mx.synchronize()  # completion handler returns the block's buffers
-            D2[j0:j1] = np.array(d2[0], dtype=np.float64)
-            del W, d2  # release this block before the next one is built
-        del Qb, sig_inv_q, isconst_q, isfinite_q
-    else:
-        if user_stats:
-            # normalize=False does not consult compatibility statistics.
-            del M_T, Σ_T
-        finite = np.concatenate([Q, T[np.isfinite(T)]])
-        center, scale = stable_center_scale(finite)
-        del finite
-        prep = preprocess_series(
-            T,
-            m,
-            normalize=False,
-            center=center,
-            scale=scale,
-            keep_sigma=keep_sigma,
-            stacklevel=stacklevel + 1,
-        )
-        info.isfinite, info.sigma = prep.isfinite, prep.sigma
-        info.center, info.scale = prep.center, prep.scale
-        override = _check_isfinite_override(T_subseq_isfinite, l)
-        if override is not None:
-            forced_zero_fill = override & ~prep.isfinite
-            prep.isfinite = override
-            prep.isfinite_mx = mx.array(override)
-        del override
-        Qs = apply_affine_frame(Q, center, scale)
-        mu_q = float(Qs.mean())
-        Qsc = Qs - mu_q
-        del Qs
-        engine = MassEngine(prep, normalize=False)
-        Qb = mx.array(Qsc.astype(np.float32))[None, :]
-        ssq_q = mx.array([float(np.sum(Qsc * Qsc))], dtype=mx.float32)
-        del Qsc
-        mu_q_mx = mx.array(split_float32(np.array([mu_q])))
-        isfinite_q = mx.array([True])
-        for j0, j1, W in engine.target_blocks():
-            d2 = engine.absolute_sq_distances(mx.matmul(Qb, W), ssq_q, mu_q_mx, isfinite_q, j0, j1)
-            mx.eval(d2)
-            mx.synchronize()
-            D2[j0:j1] = np.array(d2[0], dtype=np.float64)
-            del W, d2
-        del Qb, ssq_q, mu_q_mx, isfinite_q
+            info.isconstant, info.isfinite = prep.isconstant, prep.isfinite
+            if user_stats:
+                # The supplied arrays are compatibility metadata: every raw window
+                # still goes through the same local float64 centering and RMS
+                # normalization, so the profile equals the no-stats call exactly.
+                # STUMPY's literal
+                # use of the supplied values (`QT - m*mu_Q*M_T`, `1/(sigma_Q*Σ_T)`)
+                # lets their rounding into the distance — amplified by
+                # (mu/sigma)^2 for M_T, and as a sqrt(2m*delta) floor on perfect
+                # matches for Σ_T. The one convention kept is STUMPY's marker
+                # for windows containing NaN: an infinite M_T reports inf.
+                bad_mean = np.isinf(M_T)
+                if bad_mean.any():
+                    prep.isfinite = prep.isfinite & ~bad_mean
+                    prep.isfinite_mx = mx.array(prep.isfinite)
+                del bad_mean, M_T, Σ_T
+
+            # Put Q in a bounded midpoint/range frame before its two-pass stats:
+            # shifting by the first element alone avoids large common-offset
+            # cancellation but can still overflow for opposite-sign extremes,
+            # while squaring raw tiny values can underflow to zero.
+            Qc = Q.copy()[None, :]
+            center_rows_stable(Qc)
+            Qc = Qc[0]
+            sigma_q = float(np.sqrt(Qc @ Qc / m))
+            s = sigma_q if (np.isfinite(sigma_q) and sigma_q > 0.0) else 1.0
+            Qs = Qc / s
+            del Qc
+
+            engine = MassEngine(prep)
+            Qb = mx.array(Qs.astype(np.float32))[None, :]
+            del Qs
+            sig_inv_q = mx.array([0.0 if q_const else 1.0], dtype=mx.float32)
+            isconst_q = mx.array([q_const])
+            isfinite_q = mx.array([True])
+            for j0, j1, W in engine.target_blocks():
+                d2 = engine.znorm_sq_distances(
+                    mx.matmul(Qb, W), sig_inv_q, isconst_q, isfinite_q, j0, j1
+                )
+                mx.eval(d2)
+                mx.synchronize()  # completion handler returns the block's buffers
+                D2[j0:j1] = np.array(d2[0], dtype=np.float64)
+                del W, d2  # release this block before the next one is built
+            del Qb, sig_inv_q, isconst_q, isfinite_q
+        else:
+            if user_stats:
+                # normalize=False does not consult compatibility statistics.
+                del M_T, Σ_T
+            # the shared frame of the query and T's finite values, without
+            # compacted-length copies (Q is finite here)
+            center, scale = finite_center_scale(Q, T)
+            prep = preprocess_series(
+                T,
+                m,
+                normalize=False,
+                center=center,
+                scale=scale,
+                keep_sigma=keep_sigma,
+                stacklevel=stacklevel + 1,
+            )
+            info.isfinite, info.sigma = prep.isfinite, prep.sigma
+            info.center, info.scale = prep.center, prep.scale
+            override = _check_isfinite_override(T_subseq_isfinite, l)
+            if override is not None:
+                forced_zero_fill = override & ~prep.isfinite
+                prep.isfinite = override
+                prep.isfinite_mx = mx.array(override)
+            del override
+            Qs = apply_affine_frame(Q, center, scale)
+            mu_q = float(Qs.mean())
+            Qsc = Qs - mu_q
+            del Qs
+            engine = MassEngine(prep, normalize=False)
+            Qb = mx.array(Qsc.astype(np.float32))[None, :]
+            ssq_q = mx.array([float(np.sum(Qsc * Qsc))], dtype=mx.float32)
+            del Qsc
+            mu_q_mx = mx.array(split_float32(np.array([mu_q])))
+            isfinite_q = mx.array([True])
+            for j0, j1, W in engine.target_blocks():
+                d2 = engine.absolute_sq_distances(
+                    mx.matmul(Qb, W), ssq_q, mu_q_mx, isfinite_q, j0, j1
+                )
+                mx.eval(d2)
+                mx.synchronize()
+                D2[j0:j1] = np.array(d2[0], dtype=np.float64)
+                del W, d2
+            del Qb, ssq_q, mu_q_mx, isfinite_q
+    except BaseException as exc:
+        # an error or interrupt (Ctrl-C) mid-search: drop this frame's device
+        # references (the block loop's locals) and prep's arrays, then what
+        # the traceback still holds below this frame, so nothing stays
+        # cached in MLX after the call raises
+        engine = W = d2 = Qb = None
+        sig_inv_q = isconst_q = isfinite_q = ssq_q = mu_q_mx = None
+        if prep is not None:
+            prep.release_device()
+        _free_gpu_after_error(exc)
+        raise
 
     # nothing of the GPU phase is needed any more: drop every device array
     # (window block, query batch, per-window stats) BEFORE clearing MLX's

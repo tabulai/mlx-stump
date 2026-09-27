@@ -17,15 +17,13 @@ which is what ``stumpy.gpu_stimp`` computes; there is no SCRIMP approximation.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 
 import numpy as np
 from numpy.typing import ArrayLike
 
-from ._preprocess import check_series, excl_zone_denom
+from ._preprocess import IsConstantFunc, check_series, excl_zone_denom
 from ._stump import _check_device_id, _stump
-
-IsConstantFunc = Callable[[np.ndarray, int], ArrayLike]
 
 
 def _bfs_order(n: int) -> np.ndarray:
@@ -80,6 +78,8 @@ class stimp:
     ``stumpy.aamp_stimp`` (``percentage=1.0, pre_scraamp=False``) and
     supports ``p=2.0`` only; ``p`` is ignored when ``normalize=True``.
 
+    ``min_m``, ``max_m`` and ``step`` must be integers (STUMPY also accepts
+    floats and truncates them to int64; here a float raises TypeError).
     Window sizes: with ``max_m=None`` they run from ``min_m`` to
     ``max(min_m + 1, max_window)`` in steps of ``step``; otherwise
     ``min_m``/``max_m`` are swapped if needed and the range is clamped to
@@ -216,8 +216,11 @@ class stimp:
         if self._normalize:
             return 1.0 / (2.0 * np.sqrt(ms))
         # a constant series divides by zero here, as in STUMPY: its rows
-        # become NaN (0 * inf) or 1 after pan()'s cap at 1.0
-        with np.errstate(divide="ignore"):
+        # become NaN (0 * inf) or 1 after pan()'s cap at 1.0. Raw values
+        # near float64's limits (e.g. 2**-1060 or 1e305 units) under- or
+        # overflow the product or the reciprocal: STUMPY's formula and bits,
+        # without tripping a caller's np.errstate(all="raise")
+        with np.errstate(divide="ignore", over="ignore", under="ignore"):
             return 1.0 / (np.abs(self._T_max - self._T_min) * np.power(ms, 1.0 / 2.0))
 
     def pan(
@@ -265,7 +268,9 @@ class stimp:
         if done.shape[0] > 0:
             rows = PAN[done]
             if normalize:
-                with np.errstate(invalid="ignore"):  # raw mode, constant T: 0 * inf
+                # raw mode: constant T (0 * inf), extreme scales (a subnormal-range
+                # distance times a tiny scale underflows)
+                with np.errstate(invalid="ignore", under="ignore"):
                     rows = np.minimum(1.0, rows * self._pan_scale(done)[:, None])
             if contrast:
                 # stable ranks over the flattened rows, in update order (the
