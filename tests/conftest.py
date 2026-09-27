@@ -44,12 +44,12 @@ def pytest_sessionstart(session):
 
 def pytest_collection_modifyitems(config, items):
     """gpu-marked tests measure Metal behavior (e.g. peak GPU memory); they
-    are skipped when ``mx.metal.is_available()`` is False."""
+    are skipped unless MLX actively uses an available Metal GPU."""
     import mlx.core as mx
 
-    if mx.metal.is_available():
+    if mx.metal.is_available() and mx.default_device() == mx.gpu:
         return
-    skip_gpu = pytest.mark.skip(reason="requires a Metal GPU")
+    skip_gpu = pytest.mark.skip(reason="requires an active Metal GPU")
     for item in items:
         if "gpu" in item.keywords:
             item.add_marker(skip_gpu)

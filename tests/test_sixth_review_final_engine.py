@@ -83,7 +83,10 @@ stumpy = pytest.importorskip("stumpy")
 
 MIB = 1 << 20
 FIELDS = ("P_", "I_", "left_I_", "right_I_")
-needs_metal = pytest.mark.skipif(not mx.metal.is_available(), reason="requires a Metal GPU")
+needs_metal = pytest.mark.skipif(
+    not (mx.metal.is_available() and mx.default_device() == mx.gpu),
+    reason="requires an active Metal GPU",
+)
 real_sigint = pytest.mark.skipif(
     signal.getsignal(signal.SIGINT) is not signal.default_int_handler,
     reason="SIGINT does not raise KeyboardInterrupt here",

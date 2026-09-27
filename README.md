@@ -125,19 +125,22 @@ STUMPY's own `mparray` loses them on a round trip.
 |---|---|---|
 | `stump(T_A, m, T_B=None, ignore_trivial=True, normalize=True, p=2.0, k=1, T_A_subseq_isconstant=None, T_B_subseq_isconstant=None, *, chunk_size=None)` | `stumpy.stump` | self-joins and AB-joins; `normalize=False` computes the non-normalized profile (`p=2.0` only); constant flags may be boolean arrays or STUMPY-style callables; `chunk_size` is an mlx-stump extension |
 | `aamp(T_A, m, T_B=None, ignore_trivial=True, p=2.0, k=1, *, chunk_size=None)` | `stumpy.aamp` | `stump(..., normalize=False)` under aamp's positional signature, where the fifth argument is `p`; `p=2.0` only |
-| `gpu_stump(T_A, m, T_B=None, ignore_trivial=True, device_id=0, normalize=True, p=2.0, k=1, T_A_subseq_isconstant=None, T_B_subseq_isconstant=None, *, chunk_size=None)` | `stumpy.gpu_stump` | same computation as `stump`; `device_id` (an int or a list of ints) is validated and ignored, because the Mac's one GPU is always used |
-| `gpu_aamp(T_A, m, T_B=None, ignore_trivial=True, device_id=0, p=2.0, k=1, *, chunk_size=None)` | `stumpy.gpu_aamp` | same computation as `aamp`; `device_id` is validated like `gpu_stump`'s and ignored |
+| `gpu_stump(T_A, m, T_B=None, ignore_trivial=True, device_id=0, normalize=True, p=2.0, k=1, T_A_subseq_isconstant=None, T_B_subseq_isconstant=None, *, chunk_size=None)` | `stumpy.gpu_stump` | same computation as `stump`; requires an available Metal GPU as MLX's active device; `device_id` (an int or a list of ints) is validated and ignored |
+| `gpu_aamp(T_A, m, T_B=None, ignore_trivial=True, device_id=0, p=2.0, k=1, *, chunk_size=None)` | `stumpy.gpu_aamp` | same computation as `aamp`; requires an active Metal GPU; `device_id` is validated like `gpu_stump`'s and ignored |
 | `mass(Q, T, ...)` | `stumpy.mass` | normalized or raw (`p=2`) distance profile of one query; constant flags may be boolean arrays or STUMPY-style callables |
 | `mass_absolute(Q, T, T_subseq_isfinite=None, p=2.0, query_idx=None)` | `stumpy.core.mass_absolute` | STUMPY's exact signature, so positional calls port unchanged; `p=2.0` only |
 | `match(Q, T, max_distance=..., max_matches=...)` | `stumpy.match` | normalized or raw (`p=2`) matches of a query, nearest first; `max_distance` may be a number or a callable returning a number or a size-1 array |
 | `aamp_match(Q, T, T_subseq_isfinite=None, max_distance=None, max_matches=None, atol=1e-8, query_idx=None, p=2.0)` | `stumpy.aamp_match` | STUMPY's exact signature and `query_idx` semantics (the query window keeps its true distance); `p=2.0` only |
 | `stimp(T, min_m=3, max_m=None, step=1, normalize=True, p=2.0, T_subseq_isconstant_func=None)` | `stumpy.stimp` with `percentage=1.0, pre_scrump=False` | pan matrix profile: `update()`, `pan(...)`, `PAN_`, `M_`, `P_`; every `update()` computes one exact profile; `normalize=False` follows `stumpy.aamp_stimp`, `p=2.0` only |
-| `gpu_stimp(T, min_m=3, max_m=None, step=1, device_id=0, normalize=True, p=2.0, T_subseq_isconstant_func=None)` | `stumpy.gpu_stimp` | same computation as `stimp`; `device_id` is validated like `gpu_stump`'s and ignored |
+| `gpu_stimp(T, min_m=3, max_m=None, step=1, device_id=0, normalize=True, p=2.0, T_subseq_isconstant_func=None)` | `stumpy.gpu_stimp` | same computation as `stimp`; requires an active Metal GPU at construction and each update; `device_id` is validated like `gpu_stump`'s and ignored |
 | `estimated_peak_bytes(l, m, k=1, self_join=True, l_q=None, chunk_size=None, fused=None)` | — | mlx-stump extension: the modeled peak bytes of one join beyond its O(n) per-series arrays (see [Known limitations](#known-limitations)) |
 
 Use these wrappers rather than aliasing `stump`: in a positional call,
 `gpu_stump`'s fifth argument (`device_id`) and `aamp`'s (`p`) would otherwise
 bind to `normalize`. Inputs are 1-D float64 series, as in STUMPY.
+The plain `stump`, `aamp` and `stimp` APIs follow MLX's active device and can
+run on CPU; the `gpu_*` APIs raise `RuntimeError` when Metal is unavailable or
+MLX's active device is CPU.
 Byte-swapped float64 (`'>f8'`, e.g. read from FITS or HDF5) is accepted and
 converted to native byte order once; STUMPY rejects it.
 

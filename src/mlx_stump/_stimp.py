@@ -1,4 +1,4 @@
-"""`stimp`: the pan matrix profile, one exact GPU matrix profile per window size.
+"""`stimp`: the pan matrix profile, one exact matrix profile per window size.
 
 The pan matrix profile (SKIMP, DOI 10.1109/ICBK.2019.00031, Table 2) stacks
 the matrix profiles of a range of window sizes. The window sizes are visited
@@ -23,7 +23,7 @@ import numpy as np
 from numpy.typing import ArrayLike
 
 from ._preprocess import IsConstantFunc, check_series, excl_zone_denom
-from ._stump import _check_device_id, _stump
+from ._stump import _check_device_id, _require_metal_gpu, _stump
 
 
 def _bfs_order(n: int) -> np.ndarray:
@@ -67,7 +67,7 @@ def _as_int(value, name: str) -> int:
 
 
 class stimp:
-    """Pan matrix profile computed on the GPU; drop-in for ``stumpy.stimp``.
+    """Pan matrix profile on MLX's active device; drop-in for ``stumpy.stimp``.
 
     Every :meth:`update` computes one exact matrix profile with
     :func:`mlx_stump.stump` (a self-join, ``k=1``) for the next window size
@@ -173,6 +173,9 @@ class stimp:
             self._T_min = float(finite.min())
             self._T_max = float(finite.max())
 
+    def _check_update_device(self) -> None:
+        """Allow the plain ``stimp`` API to follow MLX's active device."""
+
     def update(self) -> None:
         """Compute the matrix profile of the next window size in ``M_``.
 
@@ -181,6 +184,7 @@ class stimp:
         """
         if self._n_processed >= self._M.shape[0]:
             return
+        self._check_update_device()
         m = int(self._M[self._n_processed])
         func = self._T_subseq_isconstant_func
         if not self._normalize and self._isconstant_func_checked:
@@ -331,7 +335,8 @@ class gpu_stimp(stimp):
     """:class:`stimp` under ``stumpy.gpu_stimp``'s signature.
 
     ``device_id`` (an int or a list of ints, as in STUMPY) is validated and
-    then ignored: an Apple silicon Mac has one GPU, which MLX already uses.
+    then ignored. An available Metal GPU must be MLX's active device at
+    construction and for each computing :meth:`update` call.
     """
 
     def __init__(
@@ -346,6 +351,7 @@ class gpu_stimp(stimp):
         T_subseq_isconstant_func: IsConstantFunc | None = None,
     ) -> None:
         _check_device_id(device_id)
+        _require_metal_gpu("gpu_stimp")
         super().__init__(
             T,
             min_m=min_m,
@@ -355,3 +361,6 @@ class gpu_stimp(stimp):
             p=p,
             T_subseq_isconstant_func=T_subseq_isconstant_func,
         )
+
+    def _check_update_device(self) -> None:
+        _require_metal_gpu("gpu_stimp.update")

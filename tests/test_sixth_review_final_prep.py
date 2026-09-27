@@ -342,7 +342,9 @@ def _extreme_series():
     }
 
 
-@pytest.mark.parametrize("cls", [mlx_stump.stimp, mlx_stump.gpu_stimp])
+@pytest.mark.parametrize(
+    "cls", [mlx_stump.stimp, pytest.param(mlx_stump.gpu_stimp, marks=pytest.mark.gpu)]
+)
 @pytest.mark.parametrize("name", ["tiny", "huge", "near_max", "mixed"])
 def test_raw_pan_ignores_caller_trapping_on_extreme_scales(cls, name):
     T = _extreme_series()[name]
