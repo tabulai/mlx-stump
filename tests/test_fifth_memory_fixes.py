@@ -233,7 +233,11 @@ assert distance > 0.0
 """
     before, peak, _ = run_isolated(source)
     growth_mib = peak - before
-    assert growth_mib < 64.0, f"Decimal refinement grew RSS by {growth_mib:.1f} MiB"
+    # Streaming grows RSS ~43 MiB locally (Python 3.10 and 3.12) but 66-67
+    # MiB on some GitHub macos-14 runners, which made a 64 MiB limit flaky.
+    # One retained list of 1e6 Decimals alone adds ~117 MiB on top of the
+    # streaming baseline, so 128 MiB still catches the regression.
+    assert growth_mib < 128.0, f"Decimal refinement grew RSS by {growth_mib:.1f} MiB"
 
 
 def test_default_threshold_has_one_linear_scratch_array():
