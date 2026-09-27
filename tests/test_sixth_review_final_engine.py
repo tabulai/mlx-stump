@@ -10,8 +10,9 @@
    denom)`` near or above ``2**31``) overflowed the reducers' int32 zone
    arithmetic: the fused kernel raised ``std::bad_cast`` and the compiled
    fallback reported every row as its own neighbour at distance 0, where
-   STUMPY returns an all-inf profile. Both reducers clamp the zone to ``l``,
-   which already excludes every candidate.
+   STUMPY returns an all-inf profile. The fused kernels also raised in
+   AB-joins, which have no zone but still pass it. Both reducers clamp the
+   zone to ``l``, which already excludes every candidate.
 3. (MEM-1) Tiled blocks differ in width by one column, and MLX reuses a
    cached buffer only within 2 pages of the request. With an explicit
    ``chunk_size`` above ~4096 rows (and, for ``m >= ~8192``, for the window
@@ -61,7 +62,12 @@ import mlx_stump._kernels as kern
 import mlx_stump._stump as st
 from mlx_stump._preprocess import exclusion_zone, preprocess_series, stable_center_scale
 
-from .conftest import run_isolated
+from .conftest import (
+    assert_indices_tie_tolerant,
+    assert_profile_close,
+    run_isolated,
+    tie_tolerance,
+)
 
 stumpy = pytest.importorskip("stumpy")
 
@@ -179,6 +185,52 @@ def test_extreme_exclusion_zone_excludes_every_candidate(monkeypatch, zone, norm
                         got = mlx_stump.stump(T, m, k=k, normalize=normalize)
                 assert got._excl_zone_denom == denom
                 _assert_same(got, ref, f"k={k} {device} tiled={tiled}")
+
+
+@pytest.mark.parametrize("denom", [1e-9, 1e-12])
+@pytest.mark.parametrize("normalize", [True, False])
+def test_extreme_exclusion_zone_leaves_ab_joins_unchanged(monkeypatch, denom, normalize):
+    """An AB-join has no exclusion zone, but the fused kernels still pack it
+    into their int32 parameters: before the fix the fused k=1 and top-k
+    reductions raised ``std::bad_cast``. Now every path returns exactly
+    what it returns at the default denominator, which matches STUMPY."""
+    T_A = _walk(500, seed=63)
+    T_B = _walk(300, seed=64)
+    m = 50
+    tie = tie_tolerance(m)
+    default = stumpy.config.STUMPY_EXCL_ZONE_DENOM
+    ref_fn = stumpy.stump if normalize else stumpy.aamp
+    for k in (1, 5, 20):
+        ref = ref_fn(T_A, m, T_B, ignore_trivial=False, k=k)
+        for device in ("default", "fallback", "cpu"):
+            for tiled in (False, True):
+                runs = {}
+                for d in (default, denom):
+                    with monkeypatch.context() as mp:
+                        mp.setattr(stumpy.config, "STUMPY_EXCL_ZONE_DENOM", d)
+                        if device == "fallback":
+                            _force_fallback(mp)
+                        if tiled:
+                            _force_tiles(mp, m, 100)
+                        with mx.stream(mx.cpu if device == "cpu" else mx.default_device()):
+                            runs[d] = mlx_stump.stump(
+                                T_A, m, T_B, ignore_trivial=False, k=k, normalize=normalize
+                            )
+                got = runs[denom]
+                label = f"k={k} {device} tiled={tiled}"
+                assert got._excl_zone_denom == denom
+                _assert_same(got, runs[default], label)
+                P = np.asarray(got.P_, dtype=np.float64).reshape(-1, k)
+                I = np.asarray(got.I_, dtype=np.int64).reshape(-1, k)
+                Pr = np.asarray(ref.P_, dtype=np.float64).reshape(-1, k)
+                Ir = np.asarray(ref.I_, dtype=np.int64).reshape(-1, k)
+                for j in range(k):
+                    assert_profile_close(P[:, j], Pr[:, j], m=m, tie_atol=tie)
+                    assert_indices_tie_tolerant(
+                        I[:, j], Ir[:, j], T_A, T_B, m, normalize=normalize, tie_atol=tie
+                    )
+                assert (np.asarray(got.left_I_) == -1).all()
+                assert (np.asarray(got.right_I_) == -1).all()
 
 
 # --------------------------------------- 3: blocks that narrow by one column

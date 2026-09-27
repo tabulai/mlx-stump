@@ -250,16 +250,17 @@ def estimated_peak_bytes(
       the centering temporary;
     - sweep: the resident block plus the per-batch intermediates budget (or
       one batch row, when even a single row exceeds the budget), plus the
-      numeric profile/index outputs (float64 + int64 per neighbor,
-      left/right indices; the tiled sweep also keeps float32/int64 top-k
-      accumulators). The budget is enforced batch by batch — each batch is
-      synchronized before the next allocates and the trailing batch is
-      computed at full width — so exactly one set of intermediates exists
-      (the next batch's query windows, built while it runs, are within the
-      per-row query allowance). Tiled top-k joins also merge each device
-      result into the running set on the host; the two concatenations, tie
-      keys, full lexsort permutation, gather results, and sorting workspace
-      are included here;
+      numeric outputs: the int64 neighbor and left/right indices the sweep
+      fills, and the float64 profile, which only the refinement allocates
+      but which is charged here too, as headroom (the tiled sweep also
+      keeps float32/int64 top-k accumulators). The budget is enforced batch
+      by batch — each batch is synchronized before the next allocates and
+      the trailing batch is computed at full width — so exactly one set of
+      intermediates exists (the next batch's query windows, built while it
+      runs, are within the per-row query allowance). Tiled top-k joins also
+      merge each device result into the running set on the host; the two
+      concatenations, tie keys, full lexsort permutation, gather results,
+      and sorting workspace are included here;
     - assembly: after the device memory is released, the float64
       refinement chunk plus the numeric outputs, the top-k reordering
       temporaries, and the object-dtype ``mparray`` STUMPY's output layout
@@ -328,7 +329,10 @@ def estimated_peak_bytes(
     else:
         batch = min(int(chunk_size), max(1, l_q))
         device_batch = batch * one_row
-    numeric = l_q * (16 * k + 16)  # P (float64) and I (int64) per neighbor, IL/IR
+    # P (float64) and I (int64) per neighbor, IL/IR. The sweep fills only the
+    # indices (P is allocated by the refinement, in the assembly phase), so
+    # in the sweep term the 8 B/cell for P is headroom.
+    numeric = l_q * (16 * k + 16)
     accum = l_q * 12 * k if (tiled and k > 1) else 0  # tiled top-k merge state
     if tiled and k > 1:
         # the _merge_topk workspace (see _TILED_MERGE_CELL); the automatic
@@ -336,8 +340,9 @@ def estimated_peak_bytes(
         # is added here once more as headroom
         host_batch = batch * k * _TILED_MERGE_CELL
     elif k > 1:
-        # Dense output conversion holds one float64 value copy and one int64
-        # index copy for the current batch alongside the persistent outputs.
+        # Dense output conversion holds one float32 value copy (only its
+        # finiteness is used), its masks, and one int64 index copy for the
+        # current batch alongside the persistent outputs: < 16 B per cell.
         host_batch = batch * k * 16
     else:
         # Value/index and (for self-joins) left/right conversion vectors.
@@ -354,7 +359,10 @@ def estimated_peak_bytes(
     # The block is centered chunk by chunk straight into its device buffer
     # (no NumPy staging copy). _center_rows has a one-row floor when a single
     # float64 window plus its rowwise scratch exceeds the nominal centering
-    # budget. Model it too.
+    # budget. Model it too. _build_block_T's staged fallback (an MLX that
+    # does not export the buffer writable) would hold one more block; it is
+    # only a safety net, and the tests keep it from being taken on the
+    # supported MLX versions.
     upload = block + max(_CENTER_BYTES, m * 8 + _CENTER_ROW_BYTES)
     return max(upload, sweep, assembly)
 
