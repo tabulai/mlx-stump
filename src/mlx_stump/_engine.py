@@ -69,9 +69,13 @@ documented one-row/one-block floors can exceed a nominal budget at extreme
   the sigma repair in preprocessing and the float64 refinement chunks (see
   ``_preprocess`` / ``_stump``), each a fixed budget independent of ``n``.
 
-Building a block stages it in numpy before the device copy, so the block
-exists twice for the duration of the upload. ``estimated_peak_bytes`` puts
-the pieces together; the O(n) per-series arrays are on top of it.
+A block is built in place: each centered float64 chunk is cast straight
+into the block's own device buffer (unified memory), so no block-sized host
+staging copy exists. ``estimated_peak_bytes`` puts the pieces together; the
+O(n) per-series arrays are on top of it. A ``stump`` call that raises
+(including Ctrl-C) releases its device arrays and MLX's cache before the
+exception propagates, as a successful call does before it returns
+(``free_gpu_after_error``).
 
 Distance special cases follow STUMPY's semantics:
 - z-normalized: d = sqrt(2m(1 - rho)), rho from the mean-centered covariance;
@@ -98,12 +102,14 @@ _TOPK_CHUNK = 1024
 # distances, masked left/right variants and top-k sort/gather buffers).
 # Actual peak memory also includes the per-call constants (the window
 # matrix or one tile of it) and the O(l) per-series device arrays (window
-# stats and masks, 14-18 B per window and series, and the fallback's 4 B
-# column index) on top of this. The k == 1 sweeps fill the budget: their
-# cells carry no headroom (the fused kernels on MLX 0.30 and 0.32, the
-# fallback on 0.30), so measured peaks exceed block + budget by part of
-# those arrays: at n=131072, m=50 by +1.5 MiB (fused, raw self-join; the
-# arrays are 2.3 MiB) and +3.5 MiB (fallback on 0.30, raw AB-join; 5.0 MiB).
+# stats and masks: 6 B per window and series normalized, 13 B raw, plus the
+# fallback's 4 B column index per target window) on top of this. The
+# k == 1 sweeps fill the budget: their cells carry no headroom (the fused
+# kernels on MLX 0.30 and 0.32, the fallback on 0.30), so measured peaks
+# exceed block + budget by part of those arrays: at n=131072, m=50 by
+# +0.8 MiB (fused, raw self-join; the arrays are 1.6 MiB), +2.4 MiB (fused,
+# raw AB-join; 3.25 MiB) and +2.3 MiB (fallback on 0.30, raw AB-join;
+# 3.75 MiB).
 _CHUNK_MEM_BUDGET = 3 << 27  # ~384 MiB
 # Device bytes per QT cell (batch row x target column) live during one
 # batch, measured as the slope of MLX's peak over two explicit batch sizes
@@ -151,6 +157,54 @@ def _center_rows(m: int) -> int:
     return max(1, _CENTER_BYTES // (m * 8 + _CENTER_ROW_BYTES))
 
 
+def _writable_host_view(a: mx.array) -> np.ndarray | None:
+    """A writable NumPy view of the evaluated, freshly allocated float32
+    array ``a``'s own buffer, or None when MLX does not export one.
+
+    An evaluated ``mx.zeros`` owns a private, C-contiguous buffer in unified
+    memory, exported writable through the buffer protocol (checked on MLX
+    0.30 and 0.32, on the GPU and the CPU device), and later device work on
+    ``a`` reads what the host wrote. Only arrays nothing else references
+    may be written this way: MLX treats arrays as immutable.
+    """
+    try:
+        mv = memoryview(a)
+    except (TypeError, ValueError, BufferError):
+        return None
+    if mv.readonly or not mv.c_contiguous or mv.format != "f" or mv.shape != tuple(a.shape):
+        return None
+    return np.asarray(mv)
+
+
+def free_gpu_after_error(exc: BaseException) -> None:
+    """Return the GPU phase's memory to the system while ``exc`` propagates.
+
+    Call it inline from the ``except`` clause of the function that owns the
+    device arrays, after releasing its own references (a decorator would
+    add a frame and shift every ``stacklevel``). The traceback keeps the
+    finished mlx-stump frames below the handler alive, and with them the
+    window block, the reducer and the batch arrays in their locals: those
+    frames are cleared (the user's frames stay intact for post-mortem
+    debugging). A batch still in flight (``mx.async_eval``) holds its
+    buffers until it completes, so the stream is synchronized before MLX's
+    cache is cleared.
+    """
+    tb = exc.__traceback__
+    tb = tb.tb_next if tb is not None else None  # the handler's own frame is still executing
+    while tb is not None:
+        if tb.tb_frame.f_globals.get("__name__", "").startswith("mlx_stump."):
+            try:
+                tb.tb_frame.clear()
+            except RuntimeError:  # an executing or suspended frame
+                pass
+        tb = tb.tb_next
+    for release in (mx.synchronize, mx.clear_cache):
+        try:
+            release()
+        except Exception:  # never mask the exception being handled
+            pass
+
+
 def resident_block_bytes(l: int, m: int) -> int:
     """Bytes of the float32 window block the engine keeps on the device."""
     for name, value in (("l", l), ("m", m)):
@@ -192,20 +246,21 @@ def estimated_peak_bytes(
     including requests that deliberately exceed the automatic ~384 MiB
     device budget. The largest of three phases:
 
-    - upload: the block staged in numpy plus its device copy plus the
-      centering temporary;
+    - upload: the block, which is built in place in its device buffer, plus
+      the centering temporary;
     - sweep: the resident block plus the per-batch intermediates budget (or
       one batch row, when even a single row exceeds the budget), plus the
-      numeric profile/index outputs (float64 + int64 per neighbor,
-      left/right indices; the tiled sweep also keeps float32/int64 top-k
-      accumulators). The budget is enforced batch by batch — each batch is
-      synchronized before the next allocates and the trailing batch is
-      computed at full width — so exactly one set of intermediates exists
-      (the next batch's query windows, built while it runs, are within the
-      per-row query allowance). Tiled top-k joins also merge each device
-      result into the running set on the host; the two concatenations, tie
-      keys, full lexsort permutation, gather results, and sorting workspace
-      are included here;
+      numeric outputs: the int64 neighbor and left/right indices the sweep
+      fills, and the float64 profile, which only the refinement allocates
+      but which is charged here too, as headroom (the tiled sweep also
+      keeps float32/int64 top-k accumulators). The budget is enforced batch
+      by batch — each batch is synchronized before the next allocates and
+      the trailing batch is computed at full width — so exactly one set of
+      intermediates exists (the next batch's query windows, built while it
+      runs, are within the per-row query allowance). Tiled top-k joins also
+      merge each device result into the running set on the host; the two
+      concatenations, tie keys, full lexsort permutation, gather results,
+      and sorting workspace are included here;
     - assembly: after the device memory is released, the float64
       refinement chunk plus the numeric outputs, the top-k reordering
       temporaries, and the object-dtype ``mparray`` STUMPY's output layout
@@ -218,7 +273,13 @@ def estimated_peak_bytes(
     It is an estimate with headroom, not a hard cap: MLX's allocator rounds
     buffers up (about +0.5% observed), the O(n) series and stat arrays are
     not included, and the figures are MLX's own active-memory peak plus
-    host memory (GPU-written buffers are invisible to RSS on macOS).
+    host memory (GPU-written buffers are invisible to RSS on macOS). The
+    phases are also not perfectly disjoint in process terms: Metal returns
+    cleared buffers asynchronously (tens to ~200 ms after
+    ``mx.clear_cache()``) and macOS keeps freed large host temporaries
+    resident, so at large ``m`` the refinement's float64 chunks can land on
+    part of the sweep's footprint (tiled n=60000, m=4000: RSS grew 555-571
+    MiB against a 508-516 MiB estimate).
     """
     for name, value in (("l", l), ("m", m), ("k", k)):
         if not (
@@ -268,7 +329,10 @@ def estimated_peak_bytes(
     else:
         batch = min(int(chunk_size), max(1, l_q))
         device_batch = batch * one_row
-    numeric = l_q * (16 * k + 16)  # P (float64) and I (int64) per neighbor, IL/IR
+    # P (float64) and I (int64) per neighbor, IL/IR. The sweep fills only the
+    # indices (P is allocated by the refinement, in the assembly phase), so
+    # in the sweep term the 8 B/cell for P is headroom.
+    numeric = l_q * (16 * k + 16)
     accum = l_q * 12 * k if (tiled and k > 1) else 0  # tiled top-k merge state
     if tiled and k > 1:
         # the _merge_topk workspace (see _TILED_MERGE_CELL); the automatic
@@ -276,8 +340,9 @@ def estimated_peak_bytes(
         # is added here once more as headroom
         host_batch = batch * k * _TILED_MERGE_CELL
     elif k > 1:
-        # Dense output conversion holds one float64 value copy and one int64
-        # index copy for the current batch alongside the persistent outputs.
+        # Dense output conversion holds one float32 value copy (only its
+        # finiteness is used), its masks, and one int64 index copy for the
+        # current batch alongside the persistent outputs: < 16 B per cell.
         host_batch = batch * k * 16
     else:
         # Value/index and (for self-joins) left/right conversion vectors.
@@ -291,9 +356,14 @@ def estimated_peak_bytes(
     # undercounted the canonical k=100 process peak by ~25 MiB.
     boxed = l_q * (2 * k + 2) * (8 + 32)
     assembly = refine + numeric + reorder + boxed
-    # _center_rows has a one-row floor when a single float64 window plus its
-    # rowwise scratch exceeds the nominal centering budget. Model it too.
-    upload = 2 * block + max(_CENTER_BYTES, m * 8 + _CENTER_ROW_BYTES)
+    # The block is centered chunk by chunk straight into its device buffer
+    # (no NumPy staging copy). _center_rows has a one-row floor when a single
+    # float64 window plus its rowwise scratch exceeds the nominal centering
+    # budget. Model it too. _build_block_T's staged fallback (an MLX that
+    # does not export the buffer writable) would hold one more block; it is
+    # only a safety net, and the tests keep it from being taken on the
+    # supported MLX versions.
+    upload = block + max(_CENTER_BYTES, m * 8 + _CENTER_ROW_BYTES)
     return max(upload, sweep, assembly)
 
 
@@ -403,10 +473,21 @@ class MassEngine:
         window embedded in a much larger-range series enough to change its
         nearest neighbor; local normalization removes that conditioning.
         Raw-distance windows keep the shared affine frame and rolling mean.
+
+        The centered chunks are written straight into the block's own MLX
+        buffer (unified memory, exported writable) rather than staged in a
+        NumPy copy first: a freed block-sized staging array stays resident
+        on macOS, which put RSS above ``estimated_peak_bytes`` at large
+        ``m``. The float32 values and the transposed layout are unchanged.
         """
         source = self.target.T if self.normalize else self.target.Ts
         w = np.lib.stride_tricks.sliding_window_view(source, self.m)[j0:j1]
-        out = np.empty((j1 - j0, self.m), dtype=np.float32)
+        blk = mx.zeros((j1 - j0, self.m), dtype=mx.float32)
+        mx.eval(blk)  # waits for the fill: the host writes below come after it
+        out = _writable_host_view(blk)
+        if out is None:  # not exported writable by this MLX: stage in NumPy
+            blk = None
+            out = np.empty((j1 - j0, self.m), dtype=np.float32)
         step = _center_rows(self.m)
         for s in range(0, j1 - j0, step):
             e = min(s + step, j1 - j0)
@@ -423,7 +504,10 @@ class MassEngine:
                 del active, rms, safe_rms, work
             else:
                 out[s:e] = w[s:e] - self.target.mu[j0 + s : j0 + e, None]
-        return mx.array(out).T
+        if blk is None:
+            blk = mx.array(out)
+        del out
+        return blk.T
 
     def target_blocks(self) -> Iterator[tuple[int, int, mx.array]]:
         """Yield (j0, j1, block) covering all target windows in column order.
@@ -436,9 +520,10 @@ class MassEngine:
 
         Only one block is meant to be alive at a time: the generator drops
         its own reference after yielding, and callers must ``del`` theirs
-        before advancing (a ``for`` target is only rebound on the next
-        iteration), or the previous block stays resident while the next one
-        is built.
+        (and every batch result computed from it) before advancing (a
+        ``for`` target is only rebound on the next iteration), or the
+        previous block stays resident while the next one is built, and the
+        cache clear where the blocks narrow cannot release it.
         """
         if not self.tiled:
             yield 0, self.l, self.W_T
@@ -448,6 +533,13 @@ class MassEngine:
         j0 = 0
         for b in range(nblocks):
             j1 = j0 + base + (1 if b < extra else 0)
+            if b == extra and b > 0:
+                # The blocks narrow by one column here, once per sweep. MLX
+                # reuses a cached buffer only within 2 pages (32 KiB) of the
+                # request, so the wider blocks' window block (m >= ~8192) and
+                # batch buffers (QT at a chunk_size above ~4096 rows) would
+                # otherwise stay cached next to fresh, narrower ones.
+                mx.clear_cache()
             block = self._build_block_T(j0, j1)
             mx.eval(block)
             yield j0, j1, block
@@ -725,10 +817,14 @@ class ReduceStep:
             def dist(QT, a, b, qf, t_a, t_b, t_f, m, inv_m):
                 return _abs_sq(QT, a, b, qf, t_a, t_b, t_f, m)
 
+        # A zone of l columns already excludes every self-join candidate
+        # (offsets are below l); clamping keeps i +/- (excl + 1) inside int32
+        # for an extreme STUMPY_EXCL_ZONE_DENOM, which otherwise wrapped the
+        # zone negative and reported every row as its own neighbour.
         self._consts = (
             mx.array(consts[0]),
             mx.array(consts[1]),
-            mx.array(int(excl), dtype=mx.int32),
+            mx.array(min(int(excl), int(target.l)), dtype=mx.int32),
         )
         self._j_full = mx.arange(target.l)[None, :]
 

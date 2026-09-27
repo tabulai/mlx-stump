@@ -16,6 +16,7 @@ from . import _engine
 from ._engine import (
     MassEngine,
     default_chunk_size,
+    free_gpu_after_error,
     make_reducer,
     query_windows,
     refine_chunk_rows,
@@ -36,7 +37,6 @@ from ._preprocess import (
     rowwise_l2_inplace,
 )
 
-_INF = float("inf")
 # Matches stumpy.config.STUMPY_P_NORM_THRESHOLD for the normalized profile:
 # tiny z-distance residuals come only from normalization roundoff.  It must
 # not be applied to raw-unit AAMP distances, where any fixed absolute cutoff
@@ -66,7 +66,9 @@ def _map_refine_chunks(job, l: int, m: int) -> None:
     most that many rows are in flight at once. Chunks write disjoint rows,
     so the result does not depend on the split or the scheduling. Each job
     must enter its own ``np.errstate`` (it is per thread); a single chunk
-    runs in the calling thread.
+    runs in the calling thread. A failing job, or an interrupted caller
+    (Ctrl-C), stops every thread after the chunk it holds; the pool is
+    joined before this returns or raises.
     """
     rows = refine_chunk_rows(m)
     workers = max(1, min(_REFINE_MAX_WORKERS, _cpu_count(), rows))
@@ -97,9 +99,16 @@ def _map_refine_chunks(job, l: int, m: int) -> None:
                 raise
 
     with ThreadPoolExecutor(max_workers=lanes) as pool:
-        tasks = [pool.submit(lane) for _ in range(lanes)]
-    for task in tasks:
-        task.result()  # re-raises a worker exception here
+        try:
+            tasks = [pool.submit(lane) for _ in range(lanes)]
+            for task in tasks:
+                task.result()  # re-raises a worker exception here
+        except BaseException:
+            # a worker failed, or the caller was interrupted (Ctrl-C) while
+            # submitting or waiting: stop every lane at its next chunk before
+            # the pool joins, instead of refining to the end in the background
+            failed.set()
+            raise
 
 
 def _znorm_rows(w: np.ndarray, isconstant: np.ndarray, m: int) -> np.ndarray:
@@ -386,30 +395,26 @@ def _compute_profile_tiled(
             del outs
         del W  # release this block before the generator builds the next one
 
+    # Only the neighbours leave the sweep: stump() recomputes every reported
+    # value in float64, so the float32 minima serve only to mark rows without
+    # a finite candidate (-1) and, for k == 1, to combine the two sides.
+    # (Comparing and testing the float32 values is exact: no float64 copy.)
     if self_join:
-        pl2 = rPl2.astype(np.float64)
-        IL = np.where(np.isfinite(pl2), rIl, -1)
-        pr2 = rPr2.astype(np.float64)
-        IR = np.where(np.isfinite(pr2), rIr, -1)
-        # the combined left/right minimum IS the global one; exact ties go to
-        # the nearer side, and to the left on an equal offset
-        rows = np.arange(l_q)
-        left_better = (pl2 < pr2) | ((pl2 == pr2) & ((rows - rIl) <= (rIr - rows)))
-        p2_min = np.where(left_better, pl2, pr2)
-        I_min = np.where(left_better, rIl, rIr)
-    elif k == 1:
-        p2_min = rP2.astype(np.float64)
-        I_min = rI
-
-    P = np.empty((l_q, k), dtype=np.float64)
-    I = np.empty((l_q, k), dtype=np.int64)
+        IL = np.where(np.isfinite(rPl2), rIl, -1)
+        IR = np.where(np.isfinite(rPr2), rIr, -1)
+        if k == 1:
+            # the combined left/right minimum IS the global one; exact ties
+            # go to the nearer side, and to the left on an equal offset
+            rows = np.arange(l_q)
+            left_better = (rPl2 < rPr2) | ((rPl2 == rPr2) & ((rows - rIl) <= (rIr - rows)))
+            rP2 = np.where(left_better, rPl2, rPr2)
+            rI = np.where(left_better, rIl, rIr)
+            del rows, left_better
     if k == 1:
-        P[:, 0] = np.sqrt(p2_min)
-        I[:, 0] = np.where(np.isfinite(p2_min), I_min, -1)
-    else:
-        P[:, :] = np.sqrt(rPk2.astype(np.float64))
-        I[:, :] = np.where(np.isfinite(rPk2), rIk, -1)
-    return P, I, IL, IR
+        rI[~np.isfinite(rP2)] = -1
+        return rI.reshape(l_q, 1), IL, IR
+    rIk[~np.isfinite(rPk2)] = -1
+    return rIk, IL, IR
 
 
 def _compute_profile(
@@ -422,8 +427,10 @@ def _compute_profile(
     chunk_size: int | None,
     excl: int,
 ):
-    """Chunked GPU sweep: returns (P (l,k) f64-in-f32, I, IL, IR) numpy arrays.
+    """Chunked GPU sweep: returns the neighbour indices ``(I (l, k), IL, IR)``.
 
+    Rows without a finite candidate get -1. No profile values are returned:
+    :func:`stump` recomputes every one of them in float64 at these indices.
     ``excl`` is the self-join exclusion-zone half width, ``ceil(m / denom)``.
     The reduction is the fused Metal kernel or the compiled fallback, per
     ``_engine._fused_reducer(k)``, and the automatic batch is sized for the
@@ -443,7 +450,6 @@ def _compute_profile(
     fused = _engine._fused_reducer(k)
     B = chunk_size or default_chunk_size(engine, l_q, k, self_join, fused=fused)
 
-    P = np.empty((l_q, k), dtype=np.float64)
     I = np.empty((l_q, k), dtype=np.int64)
     IL = np.full(l_q, -1, dtype=np.int64)
     IR = np.full(l_q, -1, dtype=np.int64)
@@ -464,27 +470,25 @@ def _compute_profile(
         Q = next(Qs, None)
         mx.eval(*outs)
         mx.synchronize()  # see _compute_profile_tiled: releases this batch's buffers
+        # the float32 squared distances only mark rows without a finite
+        # candidate; stump() recomputes every reported value in float64
         if k == 1:
-            p2 = np.array(outs[1], dtype=np.float64)[off:]
-            P[s:e, 0] = np.sqrt(p2)
+            p2 = np.array(outs[1])[off:]
             I[s:e, 0] = np.where(np.isfinite(p2), np.array(outs[0], dtype=np.int64)[off:], -1)
         else:
-            v = np.sqrt(np.array(outs[0], dtype=np.float64)[off:])
             ix = np.array(outs[1], dtype=np.int64)[off:]
-            ix[~np.isfinite(v)] = -1
-            kk = v.shape[1]
-            P[s:e, :kk] = v
+            ix[~np.isfinite(np.array(outs[0])[off:])] = -1
+            kk = ix.shape[1]
             I[s:e, :kk] = ix
             if kk < k:
-                P[s:e, kk:] = np.inf
                 I[s:e, kk:] = -1
         if self_join:
-            pl2 = np.array(outs[3], dtype=np.float64)[off:]
+            pl2 = np.array(outs[3])[off:]
             IL[s:e] = np.where(np.isfinite(pl2), np.array(outs[2], dtype=np.int64)[off:], -1)
-            pr2 = np.array(outs[5], dtype=np.float64)[off:]
+            pr2 = np.array(outs[5])[off:]
             IR[s:e] = np.where(np.isfinite(pr2), np.array(outs[4], dtype=np.int64)[off:], -1)
         del outs
-    return P, I, IL, IR
+    return I, IL, IR
 
 
 def stump(
@@ -683,16 +687,27 @@ def _stump(
             )
         )
 
-    engine = MassEngine(Bs, normalize=normalize)
-    P32, I, IL, IR = _compute_profile(
-        A,
-        engine,
-        self_join=self_join,
-        normalize=normalize,
-        k=k,
-        chunk_size=chunk_size,
-        excl=exclusion_zone(m, denom),
-    )
+    engine = None
+    try:
+        engine = MassEngine(Bs, normalize=normalize)
+        I, IL, IR = _compute_profile(
+            A,
+            engine,
+            self_join=self_join,
+            normalize=normalize,
+            k=k,
+            chunk_size=chunk_size,
+            excl=exclusion_zone(m, denom),
+        )
+    except BaseException as exc:
+        # an error or Ctrl-C mid-sweep: give the window block and the batch
+        # buffers back to the system as a normal return does, rather than
+        # leaving them in MLX's cache (hundreds of MiB) until the next call
+        engine = None
+        A.release_device()
+        Bs.release_device()
+        free_gpu_after_error(exc)
+        raise
     # the sweep is over: drop the window matrix and return the batch buffers
     # MLX cached for it to the system before the CPU refinement allocates its
     # float64 chunks, so the documented ceiling holds one phase at a time and
@@ -704,14 +719,11 @@ def _stump(
     A.release_search_arrays()
     Bs.release_search_arrays()  # likewise idempotent for self-joins
 
-    # float64 re-evaluation of the profile values at the chosen indices
+    # float64 re-evaluation of the profile values at the chosen indices: the
+    # sweep keeps only the neighbours, and every reported value is computed
+    # here (all k columns in one pass; rows without a neighbour get inf)
     refine = _refine_znorm if normalize else _refine_absolute
-    P = P32  # refined in place: the float32-derived values are not needed again
-    # Do not keep a second name alive through the top-k reorder and object
-    # assembly.  At large k this alias alone can pin tens of MiB until return
-    # (P32 is otherwise never read again).
-    del P32
-    refine(A, Bs, I, out=P)  # all k columns in one pass, written into P
+    P = refine(A, Bs, I)
     if k > 1:
         # near-ties can reorder under the refined values; keep columns ascending
         order = np.argsort(P, axis=1, kind="stable")
