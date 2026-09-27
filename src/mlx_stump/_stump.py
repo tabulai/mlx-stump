@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import threading
 import warnings
@@ -21,8 +22,8 @@ from ._engine import (
     query_windows,
     query_windows_at,
     refine_chunk_rows,
-    tiled_chunk_size,
 )
+from ._merge_kernels import TiledMerge
 from ._mparray import mparray
 from ._preprocess import (
     IsConstantSpec,
@@ -338,12 +339,116 @@ def _merge_topk(run_vals, run_idxs, blk_vals, blk_idxs, k, rows=None):
     return np.take_along_axis(allv, order, axis=1), np.take_along_axis(alli, order, axis=1)
 
 
-def _query_args(batches, query, normalize):
-    """Yield each batch's float32 query windows, built one batch ahead: the
-    caller asks for batch i+1 while batch i runs on the GPU. ``batches`` is
-    a second ``_batches`` generator running one step ahead of the sweep's."""
+def _query_args(batches, query, normalize, packed_target=None):
+    """Yield float32 query batches one step ahead of the sweep.
+
+    A dense self-join with shared preprocessing already has every query row
+    packed in the target matrix. Its transpose supplies the same values as
+    ``query_windows`` without another CPU normalization and upload. Other
+    joins build each batch as before while the preceding one runs on the GPU.
+    """
+    packed_queries = None if packed_target is None else packed_target.T
     for s0, _, e in batches:
-        yield query_windows(query, s0, e, normalize=normalize)
+        if packed_queries is None:
+            yield query_windows(query, s0, e, normalize=normalize)
+        else:
+            yield packed_queries[s0:e]
+
+
+def _tiled_query_args(batches, query, normalize, cache):
+    """Build the first target block's exact query batches, then reuse them.
+
+    Holding the batches instead of repacking all query windows per target
+    block preserves the GEMM's batch shapes and every float32 input bit. The
+    cache is ``None`` when the bounded memory planner disables this path.
+    """
+    if cache:
+        yield from cache
+    else:
+        for Q in _query_args(batches, query, normalize):
+            if cache is not None:
+                cache.append(Q)
+            yield Q
+
+
+def _compute_profile_tiled_metal(
+    query: PreprocessedSeries,
+    engine: MassEngine,
+    *,
+    self_join: bool,
+    normalize: bool,
+    k: int,
+    B: int,
+    excl: int,
+    uncertain_out: np.ndarray | None,
+    query_cache: list[mx.array] | None,
+):
+    """Keep tiled block winners on the GPU and merge them once per block."""
+    l_q = query.l
+    red = make_reducer(
+        query, engine, normalize=normalize, self_join=self_join, excl=excl, k=k, fused=True
+    )
+    merged = TiledMerge(l_q, k, self_join)
+    nout = 6 if self_join else 2
+    for j0, j1, W in engine.target_blocks():
+        pieces = [[] for _ in range(nout)]
+        Qs = _tiled_query_args(_batches(l_q, B), query, normalize, query_cache)
+        Q = next(Qs)
+        for s0, s, _e in _batches(l_q, B):
+            off = s - s0
+            outs = red.block(mx.matmul(Q, W), s0, j0, j1)
+            mx.async_eval(*outs)
+            Q = next(Qs, None)
+            mx.eval(*outs)
+            mx.synchronize()
+            for part, out in zip(pieces, outs, strict=True):
+                part.append(out[off:])
+            del outs
+        block = tuple(mx.concatenate(part, axis=0) for part in pieces)
+        # Materialize the compact block and release the per-batch outputs
+        # before allocating the next running set in the merge kernel.
+        mx.eval(*block)
+        mx.synchronize()
+        del pieces
+        merged.add(block, j0)
+        del block, W
+
+    run = merged.result()
+    vals = np.array(run[0])
+    idxs = np.array(run[1], dtype=np.int64)
+    if self_join:
+        rIl = np.array(run[2], dtype=np.int64)
+        rPl2 = np.array(run[3])
+        rIr = np.array(run[4], dtype=np.int64)
+        rPr2 = np.array(run[5])
+        IL = np.where(np.isfinite(rPl2), rIl, -1)
+        IR = np.where(np.isfinite(rPr2), rIr, -1)
+        if k == 1:
+            rows = np.arange(l_q)
+            left_better = (rPl2 < rPr2) | (
+                (rPl2 == rPr2) & ((rows - rIl) <= (rIr - rows))
+            )
+            vals = np.where(left_better, rPl2, rPr2)
+            idxs = np.where(left_better, rIl, rIr)
+    else:
+        IL = IR = np.full(l_q, -1, dtype=np.int64)
+
+    rows = np.arange(l_q)
+    boundary = vals if k == 1 else vals[:, -1]
+    boundary_i = idxs if k == 1 else idxs[:, -1]
+    uncertain = _ambiguous_scores(
+        query, engine.target, rows, boundary_i, boundary, normalize
+    )
+    if self_join:
+        uncertain |= _ambiguous_scores(
+            query, engine.target, rows, rIl, rPl2, normalize
+        ) | _ambiguous_scores(query, engine.target, rows, rIr, rPr2, normalize)
+    if uncertain_out is not None:
+        uncertain_out[:] = uncertain
+    idxs[~np.isfinite(vals)] = -1
+    if k == 1:
+        return idxs.reshape(l_q, 1), IL, IR
+    return idxs, IL, IR
 
 
 def _compute_profile_tiled(
@@ -356,13 +461,16 @@ def _compute_profile_tiled(
     chunk_size: int | None,
     excl: int,
     uncertain_out: np.ndarray | None = None,
+    metal_merge: bool = True,
 ):
     """Chunked sweep for targets too large to materialize in one piece.
 
     The target window matrix is streamed as column blocks (each block
     doubly-centered exactly like the single-block path), and per-row minima /
-    top-k sets are merged across blocks on the CPU in the sweep's
-    lexicographic ``(d2, key)`` order (see ``_engine.ReduceStep``). Blocks
+    top-k sets are merged across blocks in the sweep's lexicographic
+    ``(d2, key)`` order (see ``_engine.ReduceStep``). Metal merges
+    top-k results on the GPU for 2 <= k <= 16 when the batch count is bounded;
+    other cases use the CPU. Blocks
     arrive in ascending column order: on the right (and in AB-joins) an
     earlier block's equal minimum is the nearer / lower column and a strict
     ``<`` keeps it, while on the left a later block's is nearer and ``<=``
@@ -370,7 +478,21 @@ def _compute_profile_tiled(
     """
     l_q = query.l
     fused = _engine._fused_reducer(k)
-    B = chunk_size or tiled_chunk_size(engine, l_q, k, self_join, fused=fused)
+    B, cache_bytes = _engine.tiled_query_cache_plan(
+        target_rows=engine.l, window=engine.m, query_rows=l_q, k=k,
+        self_join=self_join, fused=fused, tile_rows=engine.tile_rows,
+        chunk_size=chunk_size,
+    )
+    query_cache = [] if cache_bytes else None
+    # The GPU path holds one small result buffer per query batch until the
+    # block is complete. Fall back for an explicit tiny batch that would make
+    # thousands of Python/MLX array objects live at once.
+    if metal_merge and fused and k > 1 and -(-l_q // B) <= 4096:
+        return _compute_profile_tiled_metal(
+            query, engine, self_join=self_join, normalize=normalize, k=k,
+            B=B, excl=excl, uncertain_out=uncertain_out,
+            query_cache=query_cache,
+        )
 
     IL = np.full(l_q, -1, dtype=np.int64)
     IR = np.full(l_q, -1, dtype=np.int64)
@@ -390,7 +512,7 @@ def _compute_profile_tiled(
         query, engine, normalize=normalize, self_join=self_join, excl=excl, k=k, fused=fused
     )
     for j0, j1, W in engine.target_blocks():
-        Qs = _query_args(_batches(l_q, B), query, normalize)
+        Qs = _tiled_query_args(_batches(l_q, B), query, normalize, query_cache)
         Q = next(Qs)
         for s0, s, e in _batches(l_q, B):
             off = s - s0
@@ -512,7 +634,11 @@ def _compute_profile(
     red = make_reducer(
         query, engine, normalize=normalize, self_join=self_join, excl=excl, k=k, fused=fused
     )
-    Qs = _query_args(_batches(l_q, B), query, normalize)
+    # Only the implicit self-join shares the exact preprocessing object.
+    # An explicit equal T_B may carry different user constant flags, and its
+    # packed rows must not replace those of the query series.
+    packed_target = engine.W_T if self_join and query is engine.target else None
+    Qs = _query_args(_batches(l_q, B), query, normalize, packed_target)
     Q = next(Qs)
     for s0, s, e in _batches(l_q, B):
         off = s - s0
@@ -520,8 +646,8 @@ def _compute_profile(
         # keep the B*l*4-byte product alive through the eval below
         outs = red.full(mx.matmul(Q, engine.W_T), s0)
         mx.async_eval(*outs)
-        # build the next batch's windows on the CPU while this one runs; still
-        # exactly one live set of device intermediates
+        # Fetch the next packed view, or build the next AB-join query batch on
+        # the CPU while this one runs; still one live set of intermediates.
         Q = next(Qs, None)
         mx.eval(*outs)
         mx.synchronize()  # see _compute_profile_tiled: releases this batch's buffers
@@ -627,7 +753,7 @@ def _repair_zero_neighbors(
     # resident window block, but release cached buffers before interleaving
     # bounded GPU rescans with float64 candidate verification.
     mx.clear_cache()
-    from ._match import _refine_candidates
+    from ._match import _NormalizedWindowCache, _refine_candidates
 
     k = I.shape[1]
     bound = _zero_score_bound(query.m) if normalize else None
@@ -649,27 +775,11 @@ def _repair_zero_neighbors(
         )
         return seeds, d
 
-    keep = np.ones(rows.size, dtype=bool)
-    for pos, row in enumerate(rows):
-        _, d = refine_seeds(int(row))
-        complete = np.all(I[row] >= 0)
-        if self_join:
-            complete &= (IL[row] >= 0 or row - excl - 1 < 0) and (
-                IR[row] >= 0 or row + excl + 1 >= target.l
-            )
-        if complete and d.size and np.all(d == 0.0):
-            keep[pos] = False
-    rows = rows[keep]
-    del keep
-    if rows.size == 0:
-        return
-
-    best_i = np.full((rows.size, k), -1, dtype=np.int64)
-    best_d = np.full((rows.size, k), np.inf, dtype=np.float64)
-    left_i = np.full(rows.size, -1, dtype=np.int64)
-    right_i = np.full(rows.size, -1, dtype=np.int64)
-    left_d = np.full(rows.size, np.inf, dtype=np.float64)
-    right_d = np.full(rows.size, np.inf, dtype=np.float64)
+    # Allocate winners on the first row that really needs replay. The same
+    # arrays receive the once-refined seeds and later replay candidates, so
+    # no second full-length seed matrix survives next to the result matrix.
+    keep = np.zeros(rows.size, dtype=bool)
+    best_i = best_d = left_i = right_i = left_d = right_d = None
 
     def keys(row: int, js: np.ndarray) -> np.ndarray:
         if not self_join:
@@ -678,6 +788,33 @@ def _repair_zero_neighbors(
 
     def add(pos: int, js: np.ndarray, distances: np.ndarray) -> None:
         row = int(rows[pos])
+        if k == 1:
+            old_j = int(best_i[pos, 0])
+            old_d = float(best_d[pos, 0])
+            old_key = 2 * abs(old_j - row) + (old_j > row) if self_join else old_j
+            li, ld = int(left_i[pos]), float(left_d[pos])
+            ri, rd = int(right_i[pos]), float(right_d[pos])
+            for j, dist in zip(js, distances, strict=True):
+                j, dist = int(j), float(dist)
+                if not math.isfinite(dist):
+                    continue
+                key = 2 * abs(j - row) + (j > row) if self_join else j
+                if j != old_j and (
+                    dist < old_d or (dist == old_d and (old_j < 0 or key < old_key))
+                ):
+                    old_j, old_d, old_key = j, dist, key
+                if self_join and j < row:
+                    left_key = 2 * (row - li)
+                    if dist < ld or (dist == ld and (li < 0 or key < left_key)):
+                        li, ld = j, dist
+                elif self_join and j > row:
+                    right_key = 2 * (ri - row) + 1
+                    if dist < rd or (dist == rd and (ri < 0 or key < right_key)):
+                        ri, rd = j, dist
+            best_i[pos, 0], best_d[pos, 0] = old_j, old_d
+            left_i[pos], left_d[pos] = li, ld
+            right_i[pos], right_d[pos] = ri, rd
+            return
         valid = np.isfinite(distances)
         js, distances = js[valid], distances[valid]
         if js.size == 0:
@@ -712,10 +849,41 @@ def _repair_zero_neighbors(
                         right_i[pos], right_d[pos] = index, distance
 
     # Include the original GPU winners. A candidate inside the float32 band
-    # is not necessarily truly better than one just outside it.
+    # is not necessarily truly better than one just outside it. Keep each
+    # seed's verified distance here instead of recomputing it after screening.
     for pos, row in enumerate(rows):
         seeds, d = refine_seeds(int(row))
+        complete = np.all(I[row] >= 0)
+        if self_join:
+            complete &= (IL[row] >= 0 or row - excl - 1 < 0) and (
+                IR[row] >= 0 or row + excl + 1 >= target.l
+            )
+        if complete and d.size and np.all(d == 0.0):
+            continue
+        if best_i is None:
+            best_i = np.full((rows.size, k), -1, dtype=np.int64)
+            best_d = np.full((rows.size, k), np.inf, dtype=np.float64)
+            left_i = np.full(rows.size, -1, dtype=np.int64)
+            right_i = np.full(rows.size, -1, dtype=np.int64)
+            left_d = np.full(rows.size, np.inf, dtype=np.float64)
+            right_d = np.full(rows.size, np.inf, dtype=np.float64)
+        keep[pos] = True
         add(pos, seeds, d)
+    active = np.flatnonzero(keep)
+    del keep
+    if active.size == 0:
+        return
+
+    # Building every normalized target row only pays off for dense replay.
+    # Decide from one already materialized score batch, and retain at most
+    # 64 MiB including inverse sigmas. Exact raw windows remain available to
+    # certify positive-affine zeros (and protect one-ULP differences).
+    cache_eligible = (
+        normalize and self_join and k == 1 and active.size >= 32
+        and target.l * (target.m + 1) * 8 <= _engine._REPAIR_NORMALIZED_CACHE_MAX_BYTES
+        and bool(np.all(target.isfinite))
+    )
+    normalized_cache = None
 
     for j0, j1, W in engine.target_blocks():
         # Bound both the score matrix and locally normalized query windows.
@@ -728,9 +896,10 @@ def _repair_zero_neighbors(
                 (8 << 20) // (24 * query.m + 128),
             ),
         )
-        for start in range(0, rows.size, batch):
-            stop = min(start + batch, rows.size)
-            selected = rows[start:stop]
+        for start in range(0, active.size, batch):
+            stop = min(start + batch, active.size)
+            positions = active[start:stop]
+            selected = rows[positions]
             index = mx.array(selected.astype(np.int32))
             Q = query_windows_at(query, selected, normalize=normalize)
             QT = mx.matmul(Q, W)
@@ -754,6 +923,29 @@ def _repair_zero_neighbors(
             mx.synchronize()
             scores = np.array(d2)
             del index, Q, QT, d2
+            if cache_eligible and normalized_cache is None:
+                # Predict only from this target block; this conservative
+                # estimate avoids building the full cache for sparse repairs.
+                counts = 0
+                for local, row in enumerate(selected):
+                    band = scores[local] <= bound
+                    lo = min(j1 - j0, max(0, int(row) - excl - j0))
+                    hi = min(j1 - j0, max(0, int(row) + excl + 1 - j0))
+                    counts += int(np.count_nonzero(band)) - int(np.count_nonzero(band[lo:hi]))
+                remaining = active.size - start
+                if counts * remaining >= 2 * target.l * selected.size:
+                    try:
+                        normalized_cache = _NormalizedWindowCache(
+                            target.T, target.m, target.isconstant
+                        )
+                    except MemoryError:
+                        # This is an optional acceleration; a host under
+                        # pressure can still refine in bounded chunks.
+                        cache_eligible = False
+                else:
+                    # If this block is sparse, later batches may still be
+                    # dense; sample each until one crosses the payoff gate.
+                    cache_eligible = remaining > batch
             for local, row in enumerate(selected):
                 if normalize:
                     candidates = scores[local] <= bound
@@ -765,19 +957,31 @@ def _repair_zero_neighbors(
                     js = js[np.abs(js - row) > excl]
                 if js.size == 0:
                     continue
-                d = _refine_candidates(
-                    query.T[row : row + query.m], target.T, js, normalize,
-                    bool(query.isconstant[row]), target.isconstant,
-                    max_chunk_rows=refine_rows,
-                )
-                add(start + local, js, d)
+                if normalized_cache is None:
+                    d = _refine_candidates(
+                        query.T[row : row + query.m], target.T, js, normalize,
+                        bool(query.isconstant[row]), target.isconstant,
+                        max_chunk_rows=refine_rows,
+                    )
+                else:
+                    d = _refine_candidates(
+                        query.T[row : row + query.m], target.T, js, normalize,
+                        bool(query.isconstant[row]), target.isconstant,
+                        max_chunk_rows=refine_rows, normalized_cache=normalized_cache,
+                    )
+                add(int(positions[local]), js, d)
             del scores
         del W
 
-    I[rows] = best_i
-    if self_join:
-        IL[rows] = left_i
-        IR[rows] = right_i
+    # Bound the fancy-index copy on assignment even for very large k.
+    write_rows = max(1, (8 << 20) // (16 * k))
+    for s in range(0, active.size, write_rows):
+        pos = active[s : s + write_rows]
+        selected = rows[pos]
+        I[selected] = best_i[pos]
+        if self_join:
+            IL[selected] = left_i[pos]
+            IR[selected] = right_i[pos]
 
 
 def stump(

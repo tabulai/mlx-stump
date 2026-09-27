@@ -26,14 +26,19 @@ anomaly classification on the same silicon.
 ## Status
 
 **v0.1 development — the batched-MASS engine is implemented and golden-tested
-against STUMPY** (894 golden and regression tests). Distance profiles are
+against STUMPY** (over 900 golden and regression tests). Distance profiles are
 computed in bulk on the GPU as dense matmuls against a locally z-normalized
 subsequence matrix (or a doubly-centered shared-frame matrix for raw
 distances) — materialized in one piece for moderate `n*m`, streamed as column
 blocks beyond that — with the distance evaluation and the per-row
 argmin/top-k selection fused into one-pass Metal kernels
 (`mx.fast.metal_kernel`, `k ≤ 16`); a bit-identical `mx.compile` step serves
-the CPU device and `k > 16`. It is 2.9–3.0× as fast as STUMPY using all 16
+the CPU device and `k > 16`. Dense self-joins reuse their already-packed
+target windows for query batches. Tiled top-k sweeps on Metal merge block
+results with a second Metal kernel, transferring only the final winners
+when the query batch count is bounded. Joins with many target tiles can
+reuse one bounded packing of their query batches across those tiles.
+It is 2.9–3.0× as fast as STUMPY using all 16
 CPU cores on the same machine at `m=200` and 3.5–5.9× at `m=50`, with max
 profile error ≤ 4.4e-5 at `m=200` and ≤ 4.9e-6 at `m=50` in the current
 benchmarks (see [Benchmarks](#benchmarks)). The engine still does O(m) work
@@ -128,6 +133,7 @@ STUMPY's own `mparray` loses them on a round trip.
 | `gpu_stump(T_A, m, T_B=None, ignore_trivial=True, device_id=0, normalize=True, p=2.0, k=1, T_A_subseq_isconstant=None, T_B_subseq_isconstant=None, *, chunk_size=None)` | `stumpy.gpu_stump` | same computation as `stump`; requires an available Metal GPU as MLX's active device; `device_id` (an int or a list of ints) is validated and ignored |
 | `gpu_aamp(T_A, m, T_B=None, ignore_trivial=True, device_id=0, p=2.0, k=1, *, chunk_size=None)` | `stumpy.gpu_aamp` | same computation as `aamp`; requires an active Metal GPU; `device_id` is validated like `gpu_stump`'s and ignored |
 | `mass(Q, T, ...)` | `stumpy.mass` | normalized or raw (`p=2`) distance profile of one query; constant flags may be boolean arrays or STUMPY-style callables |
+| `prepare_target(T, m, ...)` | — | keep a private target snapshot for repeated `.mass(Q)` and `.match(Q)` calls; normalized dense targets retain their packed GPU window matrix |
 | `mass_absolute(Q, T, T_subseq_isfinite=None, p=2.0, query_idx=None)` | `stumpy.core.mass_absolute` | STUMPY's exact signature, so positional calls port unchanged; `p=2.0` only |
 | `match(Q, T, max_distance=..., max_matches=...)` | `stumpy.match` | normalized or raw (`p=2`) matches of a query, nearest first; `max_distance` may be a number or a callable returning a number or a size-1 array |
 | `aamp_match(Q, T, T_subseq_isfinite=None, max_distance=None, max_matches=None, atol=1e-8, query_idx=None, p=2.0)` | `stumpy.aamp_match` | STUMPY's exact signature and `query_idx` semantics (the query window keeps its true distance); `p=2.0` only |
@@ -143,6 +149,25 @@ run on CPU; the `gpu_*` APIs raise `RuntimeError` when Metal is unavailable or
 MLX's active device is CPU.
 Byte-swapped float64 (`'>f8'`, e.g. read from FITS or HDF5) is accepted and
 converted to native byte order once; STUMPY rejects it.
+
+For many queries against the same target and window size, prepare the target
+once:
+
+```python
+with mlx_stump.prepare_target(T, m) as target:
+    profiles = [target.mass(Q) for Q in queries]
+    occurrences = target.match(queries[0], max_matches=5)
+```
+
+The prepared object owns a private copy of `T`, so later changes to the
+original array cannot change its answers. Target constant flags and the
+optional `M_T`/`Σ_T` compatibility metadata are fixed when it is created;
+query flags and `query_idx` can vary per call. `close()` (or the `with` block)
+releases its retained storage. A normalized target whose packed window matrix
+fits the 256 MiB resident limit reuses that matrix across calls. Larger
+normalized targets still stream bounded window blocks each time. Raw
+(`normalize=False`) methods are supported but build the target windows per
+query, since the exact shared affine frame depends on both `Q` and `T`.
 
 The typed accessors feed downstream STUMPY functions directly: for example,
 `stumpy.fluss(mp.I_, ...)` and `stumpy.motifs(T, mp.P_, ...)`. The full 2-D
@@ -341,6 +366,31 @@ python bench/bench_stump.py --sizes 16384 65536 131072 262144 --m 50 --repeat 2 
 python bench/bench_stump.py --sizes 524288 1048576 --m 200 --repeat 1 --seed 0 --no-stumpy
 ```
 
+To compare the Metal block merge and dense query-window reuse against their
+previous paths, with exact-output checks (the tiled example forces small
+blocks to stress the merge; it is not a production-size throughput benchmark):
+
+```bash
+PYTHONPATH=src python bench/bench_fusion.py --mode tiled --n 8192 --m 200 --k 16
+PYTHONPATH=src python bench/bench_fusion.py --mode dense --n 4096 --m 2048 --k 1
+```
+
+The fused reducers use narrower threadgroups for short target rows. Dense
+AB-joins with 4–1024 target windows and `m ≤ 512` may also use up to 8192
+query rows per batch, subject to the same 384 MiB intermediate budget. Longer
+windows keep the 1024-row cap: widening their GEMM changed float32 scores and
+some neighbor indices in testing.
+
+A separate [triangular self-join prototype](bench/bench_symmetric.py) computes
+each off-diagonal score tile once and reduces it in both directions with a
+coalesced Metal column kernel. It is benchmark-only while changed GEMM shapes
+can change rankings near ties; `--strict` checks its public outputs against
+the production sweep:
+
+```bash
+PYTHONPATH=src python bench/bench_symmetric.py --n 16384 --m 200 --repeat 3 --strict
+```
+
 ## Roadmap
 
 - **v0.1** (this cycle): batched-MASS engine (`stump`, `mass`, `match`,
@@ -408,7 +458,7 @@ python bench/bench_stump.py --sizes 524288 1048576 --m 200 --repeat 1 --seed 0 -
   for bit. Only `k` and the kernel threadgroup width are compile-time
   parameters, so a new window size `m` does not trigger a new Metal
   compile.
-- Memory is bounded by three fixed budgets rather than by `n·m`: the
+- Memory is bounded by fixed budgets rather than by `n·m`: the
   resident window block (the whole float32 subsequence matrix when it is
   ≤ 256 MiB, otherwise ~128 MiB column blocks, at least four windows wide,
   streamed one at a time — same reduction, bit-identical numerics,
@@ -423,15 +473,24 @@ python bench/bench_stump.py --sizes 524288 1048576 --m 200 --repeat 1 --seed 0 -
   plus a 4 B column index per target window on the compiled fallback) come
   on top of it; each batch is synchronized before the next one allocates,
   the trailing batch is computed at full width, and MLX's cache is cleared
-  once where tiled blocks narrow by a column, so no second set of buffers
-  ever exists), and bounded CPU temporaries (block centering and sigma
-  repair are ≤ 64 MiB each; the refinement's float64 windows are ≤ 256 MiB
-  in total across its threads and are processed after the window matrix
-  and MLX's cached batch buffers have been released). Tiled top-k joins
-  additionally need a batch-sized host merge workspace for concatenation,
-  tie keys, lexicographic sorting, and gathering (≤ 85 B per neighbor per
-  row measured); it scales with `batch_rows·k`, is charged per row when
-  the batch is sized, and is included in the peak estimate. Each block is
+  once where tiled blocks narrow by a column, so no second set of per-batch
+  distance buffers exists), an optional packed-query cache modeled at ≤ 32 MiB
+  for tiled joins with at least four target blocks (including an allowance for
+  each retained MLX array; it preserves the original batch shape and is
+  added to `estimated_peak_bytes`), and bounded CPU temporaries (block
+  centering and sigma repair are ≤ 64 MiB each). Dense near-zero repair in
+  a normalized `k=1` self-join may retain up to 64 MiB of float64-normalized
+  target rows and inverse sigmas alongside the resident GPU block; this is
+  included in `estimated_peak_bytes`. The final profile refinement's float64
+  windows are ≤ 256 MiB in total across its threads and are processed after
+  the window matrix and MLX's cached batch buffers have been released.
+  Tiled top-k joins
+  on the Metal fused path (`2 ≤ k ≤ 16`, at most 4,096 query batches per
+  block) merge sorted block winners on the GPU; the CPU fallback uses a
+  batch-sized host merge workspace for
+  concatenation, tie keys, sorting, and gathering (≤ 85 B per neighbor per
+  row measured). Batch sizing and the peak estimate conservatively charge
+  this larger CPU workspace for both paths. Each block is
   built in place: its centered float64 chunks are cast straight into the
   block's own device buffer (unified memory), so no host staging copy
   exists (checked on MLX 0.30 and 0.32; an MLX that does not export the
@@ -439,7 +498,7 @@ python bench/bench_stump.py --sizes 524288 1048576 --m 200 --repeat 1 --seed 0 -
   The dominant modeled peak beyond the O(n) series arrays is therefore
   estimated as `block + max(64 MiB, 8·m + 128 B)` during the build (the
   second term includes the documented one-window float64 floor) or
-  `block + 384 MiB` during the sweep, plus numeric/object outputs —
+  `block + 384 MiB + optional query cache` during the sweep, plus numeric/object outputs —
   ~640 MiB for the largest dense block (n=68,000, m=1000, k=1, where RSS
   grew 434–475 MiB in fresh interpreters), ~512 MiB in tiled mode at `k=1`
   (`mlx_stump.estimated_peak_bytes(l, m, k, self_join, l_q, chunk_size,

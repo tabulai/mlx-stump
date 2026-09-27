@@ -65,6 +65,44 @@ FUSED_TOPK_MAX = 16
 _TG_MEM_LIMIT = 32 * 1024
 _ARGMIN_TG = 1024
 
+
+def argmin_threadgroup(width: int, max_tg: int) -> int:
+    """Threads per row for a ``k == 1`` reduction of ``width`` columns.
+
+    A 1024-thread group leaves most lanes idle on short rows. Narrow groups
+    process several columns per thread but launch more resident query rows;
+    the lexicographic reduction is independent of the group width. Keep the
+    probed device limit for wide rows, where fewer threads lose bandwidth.
+    """
+    if width <= 128:
+        preferred = max(32, 1 << (width - 1).bit_length())
+    elif width <= 1024:
+        preferred = 128
+    elif width <= 8192:
+        preferred = 256
+    else:
+        preferred = _ARGMIN_TG
+    return min(preferred, max_tg)
+
+
+def topk_row_threadgroup(width: int, max_tg: int) -> int:
+    """Use shorter top-k groups only where their launch geometry helps.
+
+    Each thread holds a k-item list and the merge uses ``TG * k`` scratch,
+    even when most threads see no column. Wide rows retain the probed group
+    because smaller groups have to scan more columns per thread.
+    """
+    if width <= 256:
+        preferred = 32
+    elif width <= 1024:
+        preferred = 64
+    elif width <= 4096:
+        preferred = 128
+    else:
+        preferred = max_tg
+    return min(preferred, max_tg)
+
+
 _HEADER = r"""
 #pragma METAL fp contract(off)
 
@@ -415,17 +453,24 @@ class FusedReduce:
             self._t = (target.ssq_mx, target.mu_mx, target.isfinite_mx)
         self._consts = mx.array(consts)
         self._tg = tg
+        self._adaptive_tg = threadgroup is None
         if k == 1:
             self._kern = _kernel("argmin", normalize, self_join)
-            self._template = [("TG", tg)]
         else:
             self._kern = _kernel("topk", normalize, self_join)
             tg_bytes = topk_threadgroup_bytes(k, tg)
             assert tg_bytes <= _TG_MEM_LIMIT, f"top-k kernel needs {tg_bytes} B threadgroup memory"
-            self._template = [("TG", tg), ("KK", k)]
+        self._template = [("TG", tg)] if k == 1 else [("TG", tg), ("KK", k)]
 
     def _run(self, QT, s0: int, j0: int):
         B = QT.shape[0]
+        if self._adaptive_tg:
+            choose_tg = argmin_threadgroup if self.k == 1 else topk_row_threadgroup
+            tg = choose_tg(QT.shape[1], self._tg)
+            template = [("TG", tg)] if self.k == 1 else [("TG", tg), ("KK", self.k)]
+        else:
+            tg = self._tg
+            template = self._template
         par = mx.array([int(s0), int(j0), self.excl, 0], dtype=mx.int32)
         lr_shapes = [(B,)] * 4 if self.self_join else []
         lr_dtypes = [mx.int32, mx.float32] * 2 if self.self_join else []
@@ -437,9 +482,9 @@ class FusedReduce:
             dtypes = [mx.float32, mx.int32, *lr_dtypes]
         return self._kern(
             inputs=[QT, *self._q, *self._t, par, self._consts],
-            template=self._template,
-            grid=(self._tg, B, 1),
-            threadgroup=(self._tg, 1, 1),
+            template=template,
+            grid=(tg, B, 1),
+            threadgroup=(tg, 1, 1),
             output_shapes=shapes,
             output_dtypes=dtypes,
         )
