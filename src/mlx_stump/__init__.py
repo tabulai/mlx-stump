@@ -12,7 +12,7 @@ from ._mparray import mparray
 from ._stimp import gpu_stimp, stimp
 from ._stump import aamp, gpu_aamp, gpu_stump, stump
 
-__version__ = "0.1.0.dev0"
+__version__ = "0.1.0"
 
 __all__ = [
     "stump",
