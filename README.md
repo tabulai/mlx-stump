@@ -53,8 +53,13 @@ default device is not the Metal GPU (`MLX_STUMP_REQUIRE_METAL=1`).
 
 ## Install
 
-Not on PyPI yet (that lands with the v0.1 release — `pip install mlx-stump`
-once it does). Until then, install from a checkout:
+Install the release from PyPI:
+
+```bash
+pip install mlx-stump
+```
+
+To install from a source checkout:
 
 ```bash
 pip install .
