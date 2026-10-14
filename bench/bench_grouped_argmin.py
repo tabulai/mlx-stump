@@ -1,9 +1,12 @@
-"""Prototype: one SIMD group per narrow AB-join query row.
+"""One SIMD group per narrow AB-join query row vs one threadgroup per row.
 
-The current reducer launches one threadgroup per row, even when a row has
-only 32–128 target columns. This benchmark compares it with four independent
-SIMD groups in one 128-thread group. Both evaluate the same distance expression
-and exact (distance, column) tie rule. Only `k=1` AB joins are modeled.
+The per-row argmin kernel launches one threadgroup per row, even when a row
+has only 32–128 target columns. This benchmark compares it, at the width the
+adaptive reducer would pick, with one and four independent SIMD groups per
+threadgroup. The four-group variant is the production kernel for these rows
+(``_kernels._grouped_argmin_source``), adopted from this prototype. All
+evaluate the same distance expression and exact (distance, column) tie rule.
+Only `k=1` AB joins are modeled.
 
 Usage:
     PYTHONPATH=src python bench/bench_grouped_argmin.py --rows 8192 --width 128
@@ -106,8 +109,18 @@ def main() -> None:
     t = _series(args.width, normalize, rng)
     qt = mx.array(rng.random((args.rows, args.width), dtype=np.float32) * 32)
     consts_np = np.array([64, 1 / 64, 128, 256], dtype=np.float32)
+    # a fixed group width keeps the per-row kernel: an adaptive reducer
+    # would dispatch the grouped production kernel for rows this narrow
+    per_row_tg = _kernels.argmin_threadgroup(args.width, _kernels.launch_threadgroup(1))
     old = _kernels.FusedReduce(
-        q, t, normalize=normalize, self_join=False, excl=0, k=1, consts=consts_np
+        q,
+        t,
+        normalize=normalize,
+        self_join=False,
+        excl=0,
+        k=1,
+        consts=consts_np,
+        threadgroup=per_row_tg,
     )
     kernels = {r: grouped_kernel(normalize, r) for r in (1, 4)}
     inp = [
@@ -165,7 +178,7 @@ def main() -> None:
     print(provenance())
     print(
         f"rows={args.rows} width={args.width} normalize={normalize} repeat={args.repeat} "
-        f"baseline_tg={_kernels.argmin_threadgroup(args.width, old._tg)}"
+        f"baseline_tg={per_row_tg}"
     )
     print(
         f"baseline={base * 1e3:.3f}ms one_warp={one * 1e3:.3f}ms "

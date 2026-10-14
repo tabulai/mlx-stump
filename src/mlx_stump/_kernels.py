@@ -44,6 +44,13 @@ variants launch (the lexicographic reduction does not depend on it). If
 none does, or the kernel fails to build, the dispatch predicate
 (``_engine._fused_reducer``) sends ``k`` to the compiled fallback, whose
 batches it also sizes.
+
+Narrow AB-join rows of a ``k == 1`` reduction (at most 128 columns in the
+block) run four to a 128-thread group, one simdgroup per row with no
+threadgroup-memory reduction (``_grouped_argmin_source``); the per-row
+kernel launches a whole group per row there. ``grouped_argmin_launches``
+probes that kernel once per process; where it cannot launch, those rows keep
+the per-row kernel, which selects the same minimum.
 """
 
 from __future__ import annotations
@@ -321,17 +328,11 @@ def _topk_source(normalize: bool, self_join: bool) -> str:
         if ((tid % (2 * s)) == 0) {
             const uint a = tid * KK, b = (tid + s) * KK;
             int pa = 0, pb = 0;
-            float av = sv[a], bv = sv[b];
-            uint ak = sk[a], bk = sk[b];
             for (int t = 0; t < KK; t++) {
-                if (lex_lt(bv, bk, av, ak)) {
-                    v[t] = bv; kv[t] = bk; pb++;
-                    if (pb < KK) { bv = sv[b + pb]; bk = sk[b + pb]; }
-                    else { bv = INFINITY; bk = 0xFFFFFFFFu; }
+                if (lex_lt(sv[b + pb], sk[b + pb], sv[a + pa], sk[a + pa])) {
+                    v[t] = sv[b + pb]; kv[t] = sk[b + pb]; pb++;
                 } else {
-                    v[t] = av; kv[t] = ak; pa++;
-                    if (pa < KK) { av = sv[a + pa]; ak = sk[a + pa]; }
-                    else { av = INFINITY; ak = 0xFFFFFFFFu; }
+                    v[t] = sv[a + pa]; kv[t] = sk[a + pa]; pa++;
                 }
             }
             for (int t = 0; t < KK; t++) { sv[a + t] = v[t]; sk[a + t] = kv[t]; }
@@ -424,6 +425,9 @@ _KERNELS: dict = {}
 # k -> the threadgroup width all four variants of the k kernel launch with
 # on this GPU, or None when they cannot run here (see launch_threadgroup)
 _LAUNCH: dict = {}
+# whether the grouped k=1 AB-join kernel launches here; None until probed
+# (see grouped_argmin_launches)
+_GROUPED_LAUNCH: bool | None = None
 _PKG_PREFIX = os.path.dirname(__file__) + os.sep
 
 
@@ -463,6 +467,25 @@ def _kernel(kind: str, normalize: bool, self_join: bool):
     return _KERNELS[key]
 
 
+def _stat_inputs(series, normalize: bool) -> tuple:
+    """The per-window statistics a kernel reads for one side of the join."""
+    if normalize:
+        return (series.sig_inv_mx, series.isconstant_mx, series.isfinite_mx)
+    return (series.ssq_mx, series.mu_mx, series.isfinite_mx)
+
+
+def _grouped_argmin(kern, QT, q: tuple, t: tuple, par, consts):
+    """Dispatch the grouped k=1 AB-join kernel: four rows per 128 threads."""
+    B = QT.shape[0]
+    return kern(
+        inputs=[QT, *q, *t, par, consts],
+        grid=(128, -(-B // 4), 1),
+        threadgroup=(128, 1, 1),
+        output_shapes=[(B,), (B,)],
+        output_dtypes=[mx.int32, mx.float32],
+    )
+
+
 class FusedReduce:
     """The fused sweep reduction for ``k <= FUSED_TOPK_MAX``.
 
@@ -496,19 +519,17 @@ class FusedReduce:
         # candidate, and the clamp keeps EXCL + 1 and the int32 parameter
         # buffer from overflowing (an extreme denominator raised bad_cast)
         self.excl = min(int(excl), int(target.l))
-        if normalize:
-            self._q = (query.sig_inv_mx, query.isconstant_mx, query.isfinite_mx)
-            self._t = (target.sig_inv_mx, target.isconstant_mx, target.isfinite_mx)
-        else:
-            self._q = (query.ssq_mx, query.mu_mx, query.isfinite_mx)
-            self._t = (target.ssq_mx, target.mu_mx, target.isfinite_mx)
+        self._q = _stat_inputs(query, normalize)
+        self._t = _stat_inputs(target, normalize)
         self._consts = mx.array(consts)
         self._tg = tg
         self._adaptive_tg = threadgroup is None
+        # narrow AB-join rows (<= 128 columns) of an adaptive k=1 reduction
+        # run four to a 128-thread group (grouped_argmin_launches)
         self._kern4 = None
         if k == 1:
             self._kern = _kernel("argmin", normalize, self_join)
-            if not self_join and tg >= 128:
+            if not self_join and self._adaptive_tg and tg >= 128 and grouped_argmin_launches():
                 self._kern4 = _kernel("argmin4", normalize, False)
         else:
             self._kern = _kernel("topk", normalize, self_join)
@@ -531,14 +552,8 @@ class FusedReduce:
         if self.k == 1:
             shapes = [(B,), (B,), *lr_shapes]
             dtypes = [mx.int32, mx.float32, *lr_dtypes]
-            if self._adaptive_tg and self._kern4 is not None and W <= 128 and tg <= 128 and B >= 4:
-                return self._kern4(
-                    inputs=[QT, *self._q, *self._t, par, self._consts],
-                    grid=(128, -(-B // 4), 1),
-                    threadgroup=(128, 1, 1),
-                    output_shapes=shapes,
-                    output_dtypes=dtypes,
-                )
+            if self._kern4 is not None and W <= 128 and tg <= 128 and B >= 4:
+                return _grouped_argmin(self._kern4, QT, self._q, self._t, par, self._consts)
         else:
             shapes = [(B, self.k), (B, self.k), *lr_shapes]
             dtypes = [mx.float32, mx.int32, *lr_dtypes]
@@ -558,23 +573,27 @@ class FusedReduce:
         return self._run(QT, s0, j0)
 
 
-def _probe(k: int, tg: int) -> None:
-    """Build and dispatch all four variants (z-normalized/raw x self/AB-join)
-    of the ``k`` kernel at ``tg`` threads on a tiny input with the real
-    input dtypes; raises what MLX raises."""
-    n = 64
+def _probe_inputs(n: int = 64):
+    """A tiny ``n``-window series with the real input dtypes, and the
+    constants of ``m = 8``."""
     stats = mx.zeros((n,), dtype=mx.float32)
-    flags = mx.zeros((n,), dtype=mx.bool_)
     series = SimpleNamespace(
         l=n,
         sig_inv_mx=stats,
-        isconstant_mx=flags,
+        isconstant_mx=mx.zeros((n,), dtype=mx.bool_),
         isfinite_mx=mx.ones((n,), dtype=mx.bool_),
         ssq_mx=stats,
         mu_mx=mx.zeros((n, 2), dtype=mx.float32),
     )
-    consts = np.array([8.0, 1.0 / 8.0, 16.0, 32.0], dtype=np.float32)
-    QT = mx.zeros((2, n), dtype=mx.float32)
+    return series, np.array([8.0, 1.0 / 8.0, 16.0, 32.0], dtype=np.float32)
+
+
+def _probe(k: int, tg: int) -> None:
+    """Build and dispatch all four variants (z-normalized/raw x self/AB-join)
+    of the ``k`` kernel at ``tg`` threads on a tiny input with the real
+    input dtypes; raises what MLX raises."""
+    series, consts = _probe_inputs()
+    QT = mx.zeros((2, series.l), dtype=mx.float32)
     outs = []
     for normalize in (True, False):
         for self_join in (True, False):
@@ -615,3 +634,29 @@ def launch_threadgroup(k: int) -> int | None:
             tg = None
         _LAUNCH[k] = tg
     return _LAUNCH[k]
+
+
+def grouped_argmin_launches() -> bool:
+    """Whether both variants (z-normalized/raw) of the grouped k=1 AB-join
+    kernel build and launch 128-thread groups on this GPU; probed once per
+    process with a dispatch, since MLX builds a kernel at its first one.
+    When they cannot, narrow rows keep the per-row argmin kernel, which
+    selects the same lexicographic minimum, so no warning is raised. Call
+    only with a Metal GPU as the default device."""
+    global _GROUPED_LAUNCH
+    if _GROUPED_LAUNCH is None:
+        series, consts = _probe_inputs()
+        QT = mx.zeros((5, series.l), dtype=mx.float32)  # a full and a partial group
+        par = mx.array([0, 0, 1, 0], dtype=mx.int32)
+        try:
+            outs = []
+            for normalize in (True, False):
+                stats = _stat_inputs(series, normalize)
+                kern = _kernel("argmin4", normalize, False)
+                outs.extend(_grouped_argmin(kern, QT, stats, stats, par, mx.array(consts)))
+            mx.eval(*outs)
+            ok = True
+        except Exception:  # any failure: keep the per-row kernel
+            ok = False
+        _GROUPED_LAUNCH = ok
+    return _GROUPED_LAUNCH

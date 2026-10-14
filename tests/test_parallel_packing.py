@@ -1,4 +1,5 @@
-"""Parallel normalized target packing preserves the serial window matrix."""
+"""Parallel target packing, normalized and raw, preserves the serial window
+matrix, bounds its float64 work, and releases its block when a worker fails."""
 
 from __future__ import annotations
 
@@ -152,5 +153,39 @@ def test_worker_failure_releases_packed_block_before_cache_clear(monkeypatch, ti
         mlx_stump.stump(target, 512)
     frames = traceback.extract_tb(caught.value.__traceback__)
     assert any(frame.name == "pack_rows" for frame in frames)
+    assert mx.get_active_memory() <= baseline_active + (1 << 20)
+    assert mx.get_cache_memory() <= baseline_cache + (1 << 20)
+
+
+@pytest.mark.parametrize("tiled", [False, True])
+def test_raw_worker_failure_releases_packed_block_before_cache_clear(monkeypatch, tiled):
+    """Raw-mode packing has no centering step to fail in; fail a worker after
+    it has written its rows, while the other workers still hold theirs."""
+    target = _target(6_400 if tiled else 4_600)
+    if tiled:
+        monkeypatch.setattr(_engine, "_MATMUL_WINDOW_BYTES", 0)
+        monkeypatch.setattr(_engine, "_TILE_WINDOW_BYTES", 3_000 * 512 * 4)
+    monkeypatch.setattr(_engine.os, "cpu_count", lambda: 8)
+    mx.synchronize()
+    mx.clear_cache()
+    baseline_active = mx.get_active_memory()
+    baseline_cache = mx.get_cache_memory()
+    real_pool = _engine.ThreadPoolExecutor
+    submitted = []
+
+    class FailingPool(real_pool):
+        def submit(self, fn, *args, **kwargs):
+            submitted.append(fn.__name__)
+
+            def write_then_fail(*a, **kw):
+                fn(*a, **kw)
+                raise MemoryError("injected raw packing failure")
+
+            return super().submit(write_then_fail, *args, **kwargs)
+
+    monkeypatch.setattr(_engine, "ThreadPoolExecutor", FailingPool)
+    with pytest.raises(MemoryError, match="injected raw packing failure"):
+        mlx_stump.stump(target, 512, normalize=False)
+    assert submitted and set(submitted) == {"pack_rows"}
     assert mx.get_active_memory() <= baseline_active + (1 << 20)
     assert mx.get_cache_memory() <= baseline_cache + (1 << 20)

@@ -162,8 +162,10 @@ _CENTER_ROW_BYTES = 128
 # byte budget for the float64 window copies live at once across all the
 # refinement threads, which split one chunk of refine_chunk_rows(m) rows;
 # each thread holds at most three window blocks of its rows (query, target
-# and one temporary) against the four budgeted. The refinement runs after
-# the device memory has been released
+# and one temporary) against the four budgeted. A z-normalized refinement
+# that caches every normalized target window (at most two blocks) charges
+# the cache to this budget and splits a correspondingly smaller chunk. The
+# refinement runs after the device memory has been released
 _REFINE_MEM_BUDGET = 1 << 28  # ~256 MiB
 # Optional float64-normalized target rows plus inverse sigmas retained while
 # repairing dense near-zero self-join candidates. The cache is built only

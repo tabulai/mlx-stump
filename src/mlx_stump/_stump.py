@@ -88,7 +88,8 @@ def _ambiguous_scores(
 # is row-wise and NumPy releases the GIL in the gather, ufunc and reduction
 # loops that dominate, so row chunks run in parallel with bit-identical
 # results. The threads split one serial chunk between them, so the float64
-# windows live at once stay within the same _REFINE_MEM_BUDGET.
+# windows live at once stay within the same _REFINE_MEM_BUDGET (a call that
+# caches normalized target windows charges them to it; see _refine_znorm).
 _REFINE_MAX_WORKERS = 8
 
 
@@ -98,45 +99,58 @@ def _cpu_count() -> int:
     return getattr(os, "process_cpu_count", os.cpu_count)() or 1
 
 
-def _map_refine_chunks(job, l: int, m: int) -> None:
+def _map_refine_chunks(job, l: int, m: int, *, rows: int | None = None, prepare=None) -> None:
     """Run ``job(s, e)`` over row chunks ``[s, e)`` that cover ``[0, l)``.
 
-    One serial refinement chunk, ``refine_chunk_rows(m)`` rows, is divided
-    among up to ``_REFINE_MAX_WORKERS`` threads of a per-call pool, so at
-    most that many rows are in flight at once. Chunks write disjoint rows,
-    so the result does not depend on the split or the scheduling. Each job
-    must enter its own ``np.errstate`` (it is per thread); a single chunk
-    runs in the calling thread. A failing job, or an interrupted caller
-    (Ctrl-C), stops every thread after the chunk it holds; the pool is
-    joined before this returns or raises.
+    One serial refinement chunk, ``rows`` rows (default
+    ``refine_chunk_rows(m)``), is divided among up to ``_REFINE_MAX_WORKERS``
+    threads of a per-call pool, so at most that many rows are in flight at
+    once. Chunks write disjoint rows, so the result does not depend on the
+    split or the scheduling. ``prepare``, an optional ``(job, l)`` pair, is a
+    first pass over its own rows in the same chunks and pool: every chunk of
+    it finishes before any chunk of ``job`` starts. Each job must enter its
+    own ``np.errstate`` (it is per thread); a single chunk runs in the
+    calling thread. A failing job, or an interrupted caller (Ctrl-C), stops
+    every thread after the chunk it holds; the pool is joined before this
+    returns or raises.
     """
-    rows = refine_chunk_rows(m)
+    rows = refine_chunk_rows(m) if rows is None else rows
     workers = max(1, min(_REFINE_MAX_WORKERS, _cpu_count(), rows))
     step = rows // workers
-    starts = range(0, l, step)
-    lanes = min(workers, len(starts))
+    passes = [(job, l)] if prepare is None else [prepare, (job, l)]
+    lanes = min(workers, max(len(range(0, n, step)) for _, n in passes))
     if lanes <= 1:
-        for s in starts:
-            job(s, min(s + step, l))
+        for fn, n in passes:
+            for s in range(0, n, step):
+                fn(s, min(s + step, n))
         return
-    # Each lane pulls the next chunk from one shared cursor, so the pool
-    # holds one task per thread rather than one per chunk (at large m there
-    # are ~l*m/2**20 chunks) while a slow thread still takes fewer chunks.
-    cursor = iter(starts)
+    # Each lane pulls the next chunk from one shared cursor per pass, so the
+    # pool holds one task per thread rather than one per chunk (at large m
+    # there are ~l*m/2**20 chunks) while a slow thread still takes fewer
+    # chunks. A barrier separates the passes.
+    cursors = [iter(range(0, n, step)) for _, n in passes]
     lock = threading.Lock()
     failed = threading.Event()
+    barrier = threading.Barrier(lanes)
 
     def lane():
-        while not failed.is_set():
-            with lock:
-                s = next(cursor, None)
-            if s is None:
-                return
-            try:
-                job(s, min(s + step, l))
-            except BaseException:
-                failed.set()  # the other lanes stop at their next chunk
-                raise
+        for p, (fn, n) in enumerate(passes):
+            if p:
+                try:
+                    barrier.wait()
+                except threading.BrokenBarrierError:
+                    return  # another lane failed, or the caller was interrupted
+            while not failed.is_set():
+                with lock:
+                    s = next(cursors[p], None)
+                if s is None:
+                    break
+                try:
+                    fn(s, min(s + step, n))
+                except BaseException:
+                    failed.set()  # the other lanes stop at their next chunk
+                    barrier.abort()  # or leave the barrier
+                    raise
 
     with ThreadPoolExecutor(max_workers=lanes) as pool:
         try:
@@ -148,6 +162,7 @@ def _map_refine_chunks(job, l: int, m: int) -> None:
             # submitting or waiting: stop every lane at its next chunk before
             # the pool joins, instead of refining to the end in the background
             failed.set()
+            barrier.abort()
             raise
 
 
@@ -162,6 +177,39 @@ def _znorm_rows(w: np.ndarray, isconstant: np.ndarray, m: int) -> np.ndarray:
     inv = np.where((rms > 0.0) & ~isconstant, 1.0 / np.where(rms > 0.0, rms, 1.0), 0.0)
     w *= inv[:, None]
     return inv
+
+
+# _refine_znorm may normalize every target window once up front instead of
+# once per (row, neighbor) pair. The cache is charged to the refinement
+# budget, so it is limited to two of its four window blocks, and it is built
+# only where it saves a clear share of the normalizations: a pass over every
+# target window loses when few rows reference each one (an AB join of equal
+# lengths at k = 1, or a self-join whose rows mostly have no neighbor).
+_TARGET_CACHE_MIN_WINDOWS = 512
+_TARGET_CACHE_MIN_GAIN = 1.5
+
+
+def _cache_target_windows(
+    I2: np.ndarray, target_l: int, shared: bool, budget_rows: int, m: int
+) -> bool:
+    """Whether ``_refine_znorm`` should normalize all ``target_l`` target
+    windows once for the 2-D neighbor indices ``I2``. Per column, it
+    normalizes each query row with a neighbor once and each valid
+    (row, neighbor) target window again; with the cache, every target window
+    once (and an AB join's query rows as before)."""
+    if not _TARGET_CACHE_MIN_WINDOWS <= target_l <= 2 * budget_rows:
+        return False
+    l, k = I2.shape
+    if l * (k + 1) < _TARGET_CACHE_MIN_GAIN * target_l:
+        return False  # cannot pay off even with every neighbor present
+    pairs = rows = 0
+    step = max(1, budget_rows * m * 8 // k)  # boolean chunks within one window block
+    for s in range(0, l, step):
+        valid = I2[s : s + step] >= 0
+        pairs += int(np.count_nonzero(valid))
+        rows += int(np.count_nonzero(valid.any(axis=1)))
+    cached = target_l + (0 if shared else rows)
+    return rows + pairs >= _TARGET_CACHE_MIN_GAIN * cached
 
 
 def _refine_znorm(
@@ -181,7 +229,11 @@ def _refine_znorm(
     values at O(l * k * m) cost, a sizeable share of the runtime for large
     ``k``. Each row chunk normalizes its query windows once and reuses them
     for all ``k`` neighbor columns, and the chunks run on a few threads
-    (:func:`_map_refine_chunks`). The squared distance is computed as the sum of
+    (:func:`_map_refine_chunks`). Where it pays off
+    (:func:`_cache_target_windows`), a first pass on the same threads
+    normalizes every target window once, and the chunks then gather from it;
+    per-row normalization is deterministic, so both routes give the same
+    bits. The squared distance is computed as the sum of
     squared differences of the two z-normalized windows (each centered and
     scaled by freshly recomputed two-pass float64 stats): unlike `dot - m*mu_q*mu_t` —
     which cancels catastrophically for near-constant windows at an offset
@@ -211,126 +263,23 @@ def _refine_znorm(
     any_const = bool(query.isconstant.any() or (not shared and target.isconstant.any()))
     all_finite = bool(query.isfinite.all() and (shared or target.isfinite.all()))
     budget_rows = refine_chunk_rows(m)
-    use_cache = (
-        target.l >= 512
-        and target.l <= 2 * budget_rows
-        and (shared or target.l <= query.l * I2.shape[1])
-    )
+    chunk_rows = prepare = WT_norm = t_inv = None
+    if _cache_target_windows(I2, target.l, shared, budget_rows, m):
+        # every target window normalized once for all k columns (and, in a
+        # self-join, for the query rows too). The cache lives for the whole
+        # call, so it is charged to the refinement budget: the lanes, which
+        # hold at most three window blocks of their rows, get what it leaves
+        # of the four budgeted blocks (at least two thirds of a chunk)
+        WT_norm = np.empty((target.l, m))
+        t_inv = np.empty(target.l)
+        chunk_rows = min(budget_rows, (4 * budget_rows * m - target.l * (m + 1)) // (3 * m))
 
-    if use_cache:
-        WT_norm = np.empty((target.l, m), dtype=np.float64)
-        t_inv_all = np.empty(target.l, dtype=np.float64)
-
-        def norm_chunk(s, e):
+        def normalize_targets(s, e):
             with np.errstate(invalid="ignore", over="ignore", under="ignore", divide="ignore"):
                 WT_norm[s:e] = WT[s:e]
-                t_inv_all[s:e] = _znorm_rows(WT_norm[s:e], target.isconstant[s:e], m)
+                t_inv[s:e] = _znorm_rows(WT_norm[s:e], target.isconstant[s:e], m)
 
-        def dist_chunk(s, e):
-            Ic = I2[s:e]
-            out2[s:e] = np.inf
-            has_any = (Ic >= 0).any(axis=1)
-            if not has_any.any():
-                return
-            all_rows = bool(has_any.all())
-            rows = slice(None) if all_rows else np.nonzero(has_any)[0]
-            qi_all = slice(s, e) if all_rows else rows + s
-            qc_all = query.isconstant[qi_all]
-            with np.errstate(invalid="ignore", over="ignore", under="ignore", divide="ignore"):
-                if shared:
-                    qw_all = WT_norm[qi_all]
-                    sq_inv_all = t_inv_all[qi_all]
-                else:
-                    qw_all = WQ[s:e].copy() if all_rows else WQ[qi_all]
-                    sq_inv_all = _znorm_rows(qw_all, qc_all, m)
-                for j in range(Ic.shape[1]):
-                    tj = Ic[rows, j]
-                    has = tj >= 0
-                    if not has.any():
-                        continue
-                    all_col = bool(has.all())
-                    sel = slice(None) if all_col else has
-                    tj = tj[sel]
-                    qi = (
-                        slice(s, e)
-                        if (all_rows and all_col)
-                        else (np.nonzero(has)[0] + s if all_rows else qi_all[sel])
-                    )
-                    tw = WT_norm[tj]
-                    st_inv = t_inv_all[tj]
-                    sq_inv = sq_inv_all[sel]
-                    np.subtract(qw_all[sel], tw, out=tw)
-                    d2 = np.einsum("ij,ij->i", tw, tw)
-                    del tw
-                    d2 = np.where((sq_inv == 0.0) | (st_inv == 0.0), 2.0 * m, d2)
-                    if not all_finite:
-                        d2[~np.isfinite(d2)] = 2.0 * m
-                    d2[d2 < P_NORM_THRESHOLD] = 0.0
-                    np.sqrt(d2, out=d2)
-                    np.minimum(d2, dmax, out=d2)
-                    if any_const:
-                        qc = qc_all[sel]
-                        tc = target.isconstant[tj]
-                        d2 = np.where(qc & tc, 0.0, np.where(qc ^ tc, np.sqrt(m), d2))
-                    if not all_finite:
-                        d2[~(query.isfinite[qi] & target.isfinite[tj])] = np.inf
-                    out2[qi, j] = d2
-
-        workers = max(1, min(_REFINE_MAX_WORKERS, _cpu_count(), budget_rows))
-        step = budget_rows // workers
-        q_starts = range(0, I2.shape[0], step)
-        t_starts = range(0, target.l, step)
-        lanes = min(workers, len(q_starts))
-        if lanes <= 1:
-            for s in t_starts:
-                norm_chunk(s, min(s + step, target.l))
-            for s in q_starts:
-                dist_chunk(s, min(s + step, I2.shape[0]))
-            return out
-
-        t_cursor = iter(t_starts)
-        q_cursor = iter(q_starts)
-        lock = threading.Lock()
-        failed = threading.Event()
-        barrier = threading.Barrier(lanes)
-
-        def lane():
-            while not failed.is_set():
-                with lock:
-                    s = next(t_cursor, None)
-                if s is None:
-                    break
-                try:
-                    norm_chunk(s, min(s + step, target.l))
-                except BaseException:
-                    failed.set()
-                    barrier.abort()
-                    raise
-            try:
-                barrier.wait()
-            except threading.BrokenBarrierError:
-                return
-            while not failed.is_set():
-                with lock:
-                    s = next(q_cursor, None)
-                if s is None:
-                    return
-                try:
-                    dist_chunk(s, min(s + step, I2.shape[0]))
-                except BaseException:
-                    failed.set()
-                    raise
-
-        with ThreadPoolExecutor(max_workers=lanes) as pool:
-            try:
-                tasks = [pool.submit(lane) for _ in range(lanes)]
-                for task in tasks:
-                    task.result()
-            except BaseException:
-                failed.set()
-                barrier.abort()
-                raise
-        return out
+        prepare = (normalize_targets, target.l)
 
     def job(s, e):
         Ic = I2[s:e]
@@ -345,8 +294,13 @@ def _refine_znorm(
         # raw windows may hold NaN/inf; those rows are overwritten with inf
         # below, so let the intermediate arithmetic run silently
         with np.errstate(invalid="ignore", over="ignore", under="ignore", divide="ignore"):
-            qw_all = WQ[s:e].copy() if all_rows else WQ[qi_all]
-            sq_inv_all = _znorm_rows(qw_all, qc_all, m)
+            if WT_norm is not None and shared:
+                # a view of the cache when every row has a neighbor; never written
+                qw_all = WT_norm[qi_all]
+                sq_inv_all = t_inv[qi_all]
+            else:
+                qw_all = WQ[s:e].copy() if all_rows else WQ[qi_all]
+                sq_inv_all = _znorm_rows(qw_all, qc_all, m)
             for j in range(Ic.shape[1]):
                 tj = Ic[rows, j]
                 has = tj >= 0
@@ -362,9 +316,12 @@ def _refine_znorm(
                     if (all_rows and all_col)
                     else (np.nonzero(has)[0] + s if all_rows else qi_all[sel])
                 )
-                tc = target.isconstant[tj]
-                tw = WT[tj]
-                st_inv = _znorm_rows(tw, tc, m)
+                if WT_norm is None:
+                    tw = WT[tj]
+                    st_inv = _znorm_rows(tw, target.isconstant[tj], m)
+                else:
+                    tw = WT_norm[tj]  # fancy indexing copies the cached rows
+                    st_inv = t_inv[tj]
                 sq_inv = sq_inv_all[sel]
                 # the target copy doubles as the difference buffer
                 np.subtract(qw_all[sel], tw, out=tw)
@@ -375,18 +332,21 @@ def _refine_znorm(
                 # that, and let the constant-flag rules below overwrite as needed
                 d2 = np.where((sq_inv == 0.0) | (st_inv == 0.0), 2.0 * m, d2)
                 if not all_finite:
-                    d2[~np.isfinite(d2)] = 2.0 * m  # NaN/inf windows: masked below
+                    # NaN/inf windows, masked below; finite windows normalize
+                    # to bounded rows, so their d2 is finite
+                    d2[~np.isfinite(d2)] = 2.0 * m
                 d2[d2 < P_NORM_THRESHOLD] = 0.0
                 np.sqrt(d2, out=d2)
                 np.minimum(d2, dmax, out=d2)
                 if any_const:
                     qc = qc_all[sel]
+                    tc = target.isconstant[tj]
                     d2 = np.where(qc & tc, 0.0, np.where(qc ^ tc, np.sqrt(m), d2))
                 if not all_finite:
                     d2[~(query.isfinite[qi] & target.isfinite[tj])] = np.inf
                 out2[qi, j] = d2
 
-    _map_refine_chunks(job, I2.shape[0], m)
+    _map_refine_chunks(job, I2.shape[0], m, rows=chunk_rows, prepare=prepare)
     return out
 
 
