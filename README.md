@@ -77,7 +77,7 @@ Releases are published by running the `Publish to PyPI` workflow by hand from
 committing on `main`, and letting CI pass:
 
 ```bash
-gh workflow run publish-pypi.yml --ref main -f version=0.1.0
+gh workflow run publish-pypi.yml --ref main -f version=0.1.1
 ```
 
 The workflow refuses to run from any other branch, requires a successful CI
