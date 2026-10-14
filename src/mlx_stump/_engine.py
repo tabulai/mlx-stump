@@ -162,8 +162,11 @@ _CENTER_ROW_BYTES = 128
 # byte budget for the float64 window copies live at once across all the
 # refinement threads, which split one chunk of refine_chunk_rows(m) rows;
 # each thread holds at most three window blocks of its rows (query, target
-# and one temporary) against the four budgeted. The refinement runs after
-# the device memory has been released
+# and one temporary) against the four budgeted. A z-normalized refinement
+# that caches every normalized target window (at most two chunks of them)
+# charges the cache, the lanes' blocks and their per-row vectors to these
+# bytes (refine_cached_chunk_rows). The refinement runs after the device
+# memory has been released
 _REFINE_MEM_BUDGET = 1 << 28  # ~256 MiB
 # Optional float64-normalized target rows plus inverse sigmas retained while
 # repairing dense near-zero self-join candidates. The cache is built only
@@ -174,6 +177,31 @@ _REPAIR_NORMALIZED_CACHE_MAX_BYTES = 64 << 20
 
 def refine_chunk_rows(m: int) -> int:
     return max(1, min(1 << 16, _REFINE_MEM_BUDGET // (m * 8 * 4)))
+
+
+# per refinement row, besides its window blocks: an allowance for the index,
+# mask, inverse-sigma and distance vectors live while it is refined
+_REFINE_ROW_VECTOR_BYTES = 80
+
+
+def refine_cached_chunk_rows(m: int, target_l: int) -> int:
+    """Rows in flight for a z-normalized refinement that caches all
+    ``target_l`` normalized target windows and their inverse sigmas: each
+    row holds at most three window blocks plus its vectors, and the rows get
+    what the cache leaves of ``_REFINE_MEM_BUDGET``, at most one chunk."""
+    free = _REFINE_MEM_BUDGET - target_l * (m + 1) * 8
+    return max(1, min(refine_chunk_rows(m), free // (3 * m * 8 + _REFINE_ROW_VECTOR_BYTES)))
+
+
+def refine_peak_bytes(m: int) -> int:
+    """Float64 bytes one refinement call holds at most: four window blocks
+    per chunk row, or a cache of up to two chunks of normalized target
+    windows plus the rows it leaves room for (within ``_REFINE_MEM_BUDGET``;
+    the larger term where the row cap keeps four blocks below it)."""
+    rows = refine_chunk_rows(m)
+    cached_rows = refine_cached_chunk_rows(m, 2 * rows)
+    cached = 2 * rows * (m + 1) * 8 + cached_rows * (3 * m * 8 + _REFINE_ROW_VECTOR_BYTES)
+    return max(rows * m * 8 * 4, cached)
 
 
 def _center_rows(m: int) -> int:
@@ -417,7 +445,7 @@ def estimated_peak_bytes(
         else 0
     )
     repair = block + l_q * (24 * k + 64) + repair_batch + repair_cache
-    refine = refine_chunk_rows(m) * m * 8 * 4
+    refine = refine_peak_bytes(m)
     reorder = l_q * 16 * k if k > 1 else 0  # argsort order + one reordered copy live
     # Object-array pointers plus CPython's allocation-size footprint for the
     # boxed float/int in every cell. Both 24-byte floats and 28-byte ints use
@@ -619,8 +647,8 @@ class MassEngine:
             out = np.empty((j1 - j0, self.m), dtype=np.float32)
         step = _center_rows(self.m)
 
+        output_ref = weakref.ref(out)
         if self.normalize:
-            output_ref = weakref.ref(out)
 
             def pack_rows(s: int, e: int) -> None:
                 work = w[s:e].copy()
@@ -644,54 +672,61 @@ class MassEngine:
                 # Each worker owns disjoint rows of the evaluated block.
                 # Their total live float64 work is at most one centering step.
 
-            rows = j1 - j0
-            workers = min(8, os.cpu_count() or 1)
-            parallel = (
-                blk is not None
-                and workers > 1
-                and rows >= 1024
-                and rows * self.m >= 1 << 20
-                and step >= 256
-                and step * self.m >= 1 << 18
-            )
-            if parallel:
-                # Reuse one pool for this block, but finish every bounded
-                # centering step before scheduling the next one. Splitting a
-                # step across workers keeps its aggregate float64 temporary
-                # within the same _CENTER_BYTES allowance as serial packing.
-                futures = []
-                future = None
-                try:
-                    with ThreadPoolExecutor(max_workers=workers) as pool:
-                        for start in range(0, rows, step):
-                            end = min(start + step, rows)
-                            count = end - start
-                            if count < 256 or count * self.m < 1 << 18:
-                                pack_rows(start, end)
-                                continue
-                            work_count = min(workers, max(1, count // 128))
-                            width = -(-count // work_count)
-                            futures = [
-                                pool.submit(pack_rows, s, min(s + width, end))
-                                for s in range(start, end, width)
-                            ]
-                            for future in futures:
-                                future.result()
-                except BaseException:
-                    # The pool has finished every writer. Drop its Future
-                    # references and our own block/view before the caller's
-                    # error handler clears MLX's cache. Keep the original
-                    # exception and worker traceback for debugging.
-                    futures.clear()
-                    del future, futures, pack_rows, out, blk
-                    raise
-            else:
-                for s in range(0, rows, step):
-                    pack_rows(s, min(s + step, rows))
         else:
-            for s in range(0, j1 - j0, step):
-                e = min(s + step, j1 - j0)
-                out[s:e] = w[s:e] - self.target.mu[j0 + s : j0 + e, None]
+
+            def pack_rows(s: int, e: int) -> None:
+                output = output_ref()
+                if output is None:
+                    raise RuntimeError("target packing output was released before workers finished")
+                try:
+                    output[s:e] = w[s:e] - self.target.mu[j0 + s : j0 + e, None]
+                finally:
+                    del output
+
+        rows = j1 - j0
+        workers = min(8, os.cpu_count() or 1)
+        parallel = (
+            blk is not None
+            and workers > 1
+            and rows >= 1024
+            and rows * self.m >= 1 << 20
+            and step >= 256
+            and step * self.m >= 1 << 18
+        )
+        if parallel:
+            # Reuse one pool for this block, but finish every bounded
+            # centering step before scheduling the next one. Splitting a
+            # step across workers keeps its aggregate float64 temporary
+            # within the same _CENTER_BYTES allowance as serial packing.
+            futures = []
+            future = None
+            try:
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    for start in range(0, rows, step):
+                        end = min(start + step, rows)
+                        count = end - start
+                        if count < 256 or count * self.m < 1 << 18:
+                            pack_rows(start, end)
+                            continue
+                        work_count = min(workers, max(1, count // 128))
+                        width = -(-count // work_count)
+                        futures = [
+                            pool.submit(pack_rows, s, min(s + width, end))
+                            for s in range(start, end, width)
+                        ]
+                        for future in futures:
+                            future.result()
+            except BaseException:
+                # The pool has finished every writer. Drop its Future
+                # references and our own block/view before the caller's
+                # error handler clears MLX's cache. Keep the original
+                # exception and worker traceback for debugging.
+                futures.clear()
+                del future, futures, pack_rows, out, blk
+                raise
+        else:
+            for s in range(0, rows, step):
+                pack_rows(s, min(s + step, rows))
         if blk is None:
             blk = mx.array(out)
         del out

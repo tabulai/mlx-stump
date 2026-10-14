@@ -288,7 +288,7 @@ def _rolling_reduce(a: np.ndarray, w: int, op: np.ufunc, fill: float) -> np.ndar
     blocks = ap.reshape(nblocks, w)
     prefix = op.accumulate(blocks, axis=1).ravel()
     suffix = op.accumulate(blocks[:, ::-1], axis=1)[:, ::-1].ravel()
-    return op(suffix[:l], prefix[w - 1 : w - 1 + l])
+    return op(suffix[:l], prefix[w - 1 : w - 1 + l], out=suffix[:l])
 
 
 # windows per chunk of the O(n) rolling passes: bounds their int64 / float64

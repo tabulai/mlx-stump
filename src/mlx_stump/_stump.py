@@ -21,6 +21,7 @@ from ._engine import (
     make_reducer,
     query_windows,
     query_windows_at,
+    refine_cached_chunk_rows,
     refine_chunk_rows,
 )
 from ._merge_kernels import TiledMerge
@@ -88,7 +89,8 @@ def _ambiguous_scores(
 # is row-wise and NumPy releases the GIL in the gather, ufunc and reduction
 # loops that dominate, so row chunks run in parallel with bit-identical
 # results. The threads split one serial chunk between them, so the float64
-# windows live at once stay within the same _REFINE_MEM_BUDGET.
+# windows live at once stay within the same _REFINE_MEM_BUDGET (a call that
+# caches normalized target windows charges them to it; see _refine_znorm).
 _REFINE_MAX_WORKERS = 8
 
 
@@ -98,51 +100,58 @@ def _cpu_count() -> int:
     return getattr(os, "process_cpu_count", os.cpu_count)() or 1
 
 
-def _map_refine_chunks(job, l: int, m: int) -> None:
+def _map_refine_chunks(job, l: int, m: int, *, rows: int | None = None, prepare=None) -> None:
     """Run ``job(s, e)`` over row chunks ``[s, e)`` that cover ``[0, l)``.
 
-    One serial refinement chunk, ``refine_chunk_rows(m)`` rows, is divided
-    among up to ``_REFINE_MAX_WORKERS`` threads of a per-call pool, so at
-    most that many rows are in flight at once. Chunks write disjoint rows,
-    so the result does not depend on the split or the scheduling. Each job
-    must enter its own ``np.errstate`` (it is per thread); a single chunk
-    runs in the calling thread. A failing job, or an interrupted caller
-    (Ctrl-C), stops every thread after the chunk it holds; the pool is
-    joined before this returns or raises.
+    One serial refinement chunk, ``rows`` rows (default
+    ``refine_chunk_rows(m)``), is divided among up to ``_REFINE_MAX_WORKERS``
+    threads of a per-call pool, so at most that many rows are in flight at
+    once. Chunks write disjoint rows, so the result does not depend on the
+    split or the scheduling. ``prepare``, an optional ``(job, l)`` pair, is a
+    first pass over its own rows in the same chunks and pool: every chunk of
+    it finishes before any chunk of ``job`` starts. Each job must enter its
+    own ``np.errstate`` (it is per thread); a single chunk runs in the
+    calling thread. A failing job, or an interrupted caller (Ctrl-C), stops
+    every thread after the chunk it holds; the pool is joined before this
+    returns or raises.
     """
-    rows = refine_chunk_rows(m)
+    rows = refine_chunk_rows(m) if rows is None else rows
     workers = max(1, min(_REFINE_MAX_WORKERS, _cpu_count(), rows))
     step = rows // workers
-    starts = range(0, l, step)
-    lanes = min(workers, len(starts))
+    passes = [(job, l)] if prepare is None else [prepare, (job, l)]
+    lanes = min(workers, max(len(range(0, n, step)) for _, n in passes))
     if lanes <= 1:
-        for s in starts:
-            job(s, min(s + step, l))
+        for fn, n in passes:
+            for s in range(0, n, step):
+                fn(s, min(s + step, n))
         return
     # Each lane pulls the next chunk from one shared cursor, so the pool
     # holds one task per thread rather than one per chunk (at large m there
     # are ~l*m/2**20 chunks) while a slow thread still takes fewer chunks.
-    cursor = iter(starts)
+    # A pass gets its own round of lanes once the previous round has
+    # finished; the pool's threads serve both.
     lock = threading.Lock()
     failed = threading.Event()
 
-    def lane():
+    def lane(fn, n, cursor):
         while not failed.is_set():
             with lock:
                 s = next(cursor, None)
             if s is None:
                 return
             try:
-                job(s, min(s + step, l))
+                fn(s, min(s + step, n))
             except BaseException:
                 failed.set()  # the other lanes stop at their next chunk
                 raise
 
     with ThreadPoolExecutor(max_workers=lanes) as pool:
         try:
-            tasks = [pool.submit(lane) for _ in range(lanes)]
-            for task in tasks:
-                task.result()  # re-raises a worker exception here
+            for fn, n in passes:
+                cursor = iter(range(0, n, step))
+                tasks = [pool.submit(lane, fn, n, cursor) for _ in range(lanes)]
+                for task in tasks:
+                    task.result()  # re-raises a worker exception here
         except BaseException:
             # a worker failed, or the caller was interrupted (Ctrl-C) while
             # submitting or waiting: stop every lane at its next chunk before
@@ -164,6 +173,42 @@ def _znorm_rows(w: np.ndarray, isconstant: np.ndarray, m: int) -> np.ndarray:
     return inv
 
 
+# _refine_znorm may normalize every target window once up front instead of
+# once per (row, neighbor) pair. The cache is charged to the refinement
+# budget, so it is limited to two of its four window blocks, and it is built
+# only where it saves a clear share of the normalizations: a pass over every
+# target window loses when few rows reference each one (an AB join of equal
+# lengths at k = 1, or a self-join whose rows mostly have no neighbor).
+_TARGET_CACHE_MIN_WINDOWS = 512
+_TARGET_CACHE_MIN_GAIN = 1.5
+
+
+def _cache_target_windows(
+    I2: np.ndarray, target_l: int, shared: bool, budget_rows: int, m: int
+) -> bool:
+    """Whether ``_refine_znorm`` should normalize all ``target_l`` target
+    windows once for the 2-D neighbor indices ``I2``. Per column, it
+    normalizes each query row with a neighbor once and each valid
+    (row, neighbor) target window again; with the cache, every target window
+    once (and an AB join's query rows as before)."""
+    if not _TARGET_CACHE_MIN_WINDOWS <= target_l <= 2 * budget_rows:
+        return False
+    l, k = I2.shape
+    if k == 0 or l * (k + 1) < _TARGET_CACHE_MIN_GAIN * target_l:
+        return False  # cannot pay off even with every neighbor present
+    if I2.min() >= 0:  # the usual case: every neighbor present
+        pairs, rows = l * k, l
+    else:
+        pairs = rows = 0
+        step = max(1, budget_rows * m * 8 // k)  # boolean chunks within one window block
+        for s in range(0, l, step):
+            valid = I2[s : s + step] >= 0
+            pairs += int(np.count_nonzero(valid))
+            rows += int(np.count_nonzero(valid.any(axis=1)))
+    cached = target_l + (0 if shared else rows)
+    return rows + pairs >= _TARGET_CACHE_MIN_GAIN * cached
+
+
 def _refine_znorm(
     query: PreprocessedSeries,
     target: PreprocessedSeries,
@@ -181,7 +226,11 @@ def _refine_znorm(
     values at O(l * k * m) cost, a sizeable share of the runtime for large
     ``k``. Each row chunk normalizes its query windows once and reuses them
     for all ``k`` neighbor columns, and the chunks run on a few threads
-    (:func:`_map_refine_chunks`). The squared distance is computed as the sum of
+    (:func:`_map_refine_chunks`). Where it pays off
+    (:func:`_cache_target_windows`), a first pass on the same threads
+    normalizes every target window once, and the chunks then gather from it;
+    per-row normalization is deterministic, so both routes give the same
+    bits. The squared distance is computed as the sum of
     squared differences of the two z-normalized windows (each centered and
     scaled by freshly recomputed two-pass float64 stats): unlike `dot - m*mu_q*mu_t` —
     which cancels catastrophically for near-constant windows at an offset
@@ -207,20 +256,47 @@ def _refine_znorm(
     WQ = np.lib.stride_tricks.sliding_window_view(query.T, m)
     WT = np.lib.stride_tricks.sliding_window_view(target.T, m)
     dmax = 2.0 * np.sqrt(m)  # rho >= -1; sqrt rounding can overshoot 1 ulp
+    shared = query is target
+    any_const = bool(query.isconstant.any() or (not shared and target.isconstant.any()))
+    all_finite = bool(query.isfinite.all() and (shared or target.isfinite.all()))
+    budget_rows = refine_chunk_rows(m)
+    chunk_rows = prepare = WT_norm = t_inv = None
+    if _cache_target_windows(I2, target.l, shared, budget_rows, m):
+        # every target window normalized once for all k columns (and, in a
+        # self-join, for the query rows too). The cache lives for the whole
+        # call, so it is charged to the refinement budget: the lanes, which
+        # hold at most three window blocks of their rows, get what it leaves
+        WT_norm = np.empty((target.l, m))
+        t_inv = np.empty(target.l)
+        chunk_rows = refine_cached_chunk_rows(m, target.l)
+
+        def normalize_targets(s, e):
+            with np.errstate(invalid="ignore", over="ignore", under="ignore", divide="ignore"):
+                WT_norm[s:e] = WT[s:e]
+                t_inv[s:e] = _znorm_rows(WT_norm[s:e], target.isconstant[s:e], m)
+
+        prepare = (normalize_targets, target.l)
 
     def job(s, e):
         Ic = I2[s:e]
         out2[s:e] = np.inf
-        rows = np.nonzero((Ic >= 0).any(axis=1))[0]
-        if rows.size == 0:
+        has_any = (Ic >= 0).any(axis=1)
+        if not has_any.any():
             return
-        qi_all = rows + s
+        all_rows = bool(has_any.all())
+        rows = slice(None) if all_rows else np.nonzero(has_any)[0]
+        qi_all = slice(s, e) if all_rows else rows + s
         qc_all = query.isconstant[qi_all]
         # raw windows may hold NaN/inf; those rows are overwritten with inf
         # below, so let the intermediate arithmetic run silently
         with np.errstate(invalid="ignore", over="ignore", under="ignore", divide="ignore"):
-            qw_all = WQ[qi_all]  # fancy indexing copies, so everything can be in place
-            sq_inv_all = _znorm_rows(qw_all, qc_all, m)
+            if WT_norm is not None and shared:
+                # a view of the cache when every row has a neighbor; never written
+                qw_all = WT_norm[qi_all]
+                sq_inv_all = t_inv[qi_all]
+            else:
+                qw_all = WQ[s:e].copy() if all_rows else WQ[qi_all]
+                sq_inv_all = _znorm_rows(qw_all, qc_all, m)
             for j in range(Ic.shape[1]):
                 tj = Ic[rows, j]
                 has = tj >= 0
@@ -228,13 +304,20 @@ def _refine_znorm(
                     continue
                 # usually every row has this neighbor; a full slice then
                 # selects by view, so the query block is not copied per column
-                sel = slice(None) if has.all() else has
+                all_col = bool(has.all())
+                sel = slice(None) if all_col else has
                 tj = tj[sel]
-                qi = qi_all[sel]
-                qc = qc_all[sel]
-                tc = target.isconstant[tj]
-                tw = WT[tj]
-                st_inv = _znorm_rows(tw, tc, m)
+                qi = (
+                    slice(s, e)
+                    if (all_rows and all_col)
+                    else (np.nonzero(has)[0] + s if all_rows else qi_all[sel])
+                )
+                if WT_norm is None:
+                    tw = WT[tj]
+                    st_inv = _znorm_rows(tw, target.isconstant[tj], m)
+                else:
+                    tw = WT_norm[tj]  # fancy indexing copies the cached rows
+                    st_inv = t_inv[tj]
                 sq_inv = sq_inv_all[sel]
                 # the target copy doubles as the difference buffer
                 np.subtract(qw_all[sel], tw, out=tw)
@@ -244,14 +327,22 @@ def _refine_znorm(
                 # window flagged non-constant) means rho == 0 on the GPU; mirror
                 # that, and let the constant-flag rules below overwrite as needed
                 d2 = np.where((sq_inv == 0.0) | (st_inv == 0.0), 2.0 * m, d2)
-                d2[~np.isfinite(d2)] = 2.0 * m  # NaN/inf windows: masked below
+                if not all_finite:
+                    # NaN/inf windows, masked below; finite windows normalize
+                    # to bounded rows, so their d2 is finite
+                    d2[~np.isfinite(d2)] = 2.0 * m
                 d2[d2 < P_NORM_THRESHOLD] = 0.0
-                d = np.minimum(np.sqrt(d2), dmax)
-                d = np.where(qc & tc, 0.0, np.where(qc ^ tc, np.sqrt(m), d))
-                d[~(query.isfinite[qi] & target.isfinite[tj])] = np.inf
-                out2[qi, j] = d
+                np.sqrt(d2, out=d2)
+                np.minimum(d2, dmax, out=d2)
+                if any_const:
+                    qc = qc_all[sel]
+                    tc = target.isconstant[tj]
+                    d2 = np.where(qc & tc, 0.0, np.where(qc ^ tc, np.sqrt(m), d2))
+                if not all_finite:
+                    d2[~(query.isfinite[qi] & target.isfinite[tj])] = np.inf
+                out2[qi, j] = d2
 
-    _map_refine_chunks(job, I2.shape[0], m)
+    _map_refine_chunks(job, I2.shape[0], m, rows=chunk_rows, prepare=prepare)
     return out
 
 
@@ -275,20 +366,27 @@ def _refine_absolute(
     out2 = out[:, None] if out.ndim == 1 else out
     WQ = np.lib.stride_tricks.sliding_window_view(query.T, m)
     WT = np.lib.stride_tricks.sliding_window_view(target.T, m)
+    shared = query is target
+    all_finite = bool(query.isfinite.all() and (shared or target.isfinite.all()))
 
     def job(s, e):
+        Ic = I2[s:e]
         out2[s:e] = np.inf
-        for j in range(I2.shape[1]):
-            qi = np.nonzero(I2[s:e, j] >= 0)[0] + s
-            if qi.size == 0:
+        for j in range(Ic.shape[1]):
+            col = Ic[:, j]
+            has = col >= 0
+            if not has.any():
                 continue
-            tj = I2[qi, j]
-            diff = WQ[qi]  # fancy indexing copies, so the difference can be in place
+            all_col = bool(has.all())
+            qi = slice(s, e) if all_col else np.nonzero(has)[0] + s
+            tj = col if all_col else col[has]
+            diff = WQ[s:e].copy() if all_col else WQ[qi]
             with np.errstate(over="ignore", under="ignore", invalid="ignore"):
                 np.subtract(diff, WT[tj], out=diff)
             d = rowwise_l2_inplace(diff)
             del diff  # not alive while the next column gathers
-            d[~(query.isfinite[qi] & target.isfinite[tj])] = np.inf
+            if not all_finite:
+                d[~(query.isfinite[qi] & target.isfinite[tj])] = np.inf
             out2[qi, j] = d
 
     _map_refine_chunks(job, I2.shape[0], m)
@@ -653,30 +751,37 @@ def _compute_profile(
         mx.synchronize()  # see _compute_profile_tiled: releases this batch's buffers
         # the float32 squared distances only mark rows without a finite
         # candidate; stump() recomputes every reported value in float64
+        rows = None if normalize else np.arange(s, e)
         if k == 1:
-            p2 = np.array(outs[1])[off:]
-            I[s:e, 0] = np.where(np.isfinite(p2), np.array(outs[0], dtype=np.int64)[off:], -1)
+            p2 = np.asarray(outs[1])[off:]
+            I[s:e, 0] = np.asarray(outs[0])[off:]
+            if not np.isfinite(p2).all():
+                I[s:e, 0][~np.isfinite(p2)] = -1
             uncertain[s:e] |= _ambiguous_scores(
-                query, engine.target, np.arange(s, e), I[s:e, 0], p2, normalize
+                query, engine.target, rows, I[s:e, 0], p2, normalize
             )
         else:
-            vals = np.array(outs[0])[off:]
-            ix = np.array(outs[1], dtype=np.int64)[off:]
-            ix[~np.isfinite(vals)] = -1
+            vals = np.asarray(outs[0])[off:]
+            ix = np.asarray(outs[1])[off:]
             kk = ix.shape[1]
             I[s:e, :kk] = ix
+            if not np.isfinite(vals).all():
+                I[s:e, :kk][~np.isfinite(vals)] = -1
             if kk < k:
                 I[s:e, kk:] = -1
             else:
                 uncertain[s:e] |= _ambiguous_scores(
-                    query, engine.target, np.arange(s, e), I[s:e, -1], vals[:, -1], normalize
+                    query, engine.target, rows, I[s:e, -1], vals[:, -1], normalize
                 )
         if self_join:
-            pl2 = np.array(outs[3])[off:]
-            IL[s:e] = np.where(np.isfinite(pl2), np.array(outs[2], dtype=np.int64)[off:], -1)
-            pr2 = np.array(outs[5])[off:]
-            IR[s:e] = np.where(np.isfinite(pr2), np.array(outs[4], dtype=np.int64)[off:], -1)
-            rows = np.arange(s, e)
+            pl2 = np.asarray(outs[3])[off:]
+            IL[s:e] = np.asarray(outs[2])[off:]
+            if not np.isfinite(pl2).all():
+                IL[s:e][~np.isfinite(pl2)] = -1
+            pr2 = np.asarray(outs[5])[off:]
+            IR[s:e] = np.asarray(outs[4])[off:]
+            if not np.isfinite(pr2).all():
+                IR[s:e][~np.isfinite(pr2)] = -1
             uncertain[s:e] |= _ambiguous_scores(
                 query, engine.target, rows, IL[s:e], pl2, normalize
             ) | _ambiguous_scores(query, engine.target, rows, IR[s:e], pr2, normalize)

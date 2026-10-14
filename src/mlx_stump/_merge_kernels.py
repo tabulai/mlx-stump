@@ -26,21 +26,41 @@ _BODY = r"""
     const uint row = thread_position_in_grid.x;
     if (row >= (uint)runV_shape[0]) return;
     const int j0 = par[0];
+    const uint base = row * KK;
     int a = 0, b = 0;
+    float av = runV[base], bv = blkV[base];
+    int ai = metal::isfinite(av) ? runI[base] : -1;
+    int raw_bi = blkI[base];
+    int bi = metal::isfinite(bv) && raw_bi >= 0 ? raw_bi + j0 : -1;
+    uint ak = tie_key(ai, (int)row), bk = tie_key(bi, (int)row);
     for (int t = 0; t < KK; t++) {
-        const float av = a < KK ? runV[row * KK + a] : INFINITY;
-        const int ai = a < KK && metal::isfinite(av) ? runI[row * KK + a] : -1;
-        const float bv = b < KK ? blkV[row * KK + b] : INFINITY;
-        const int bi = b < KK && metal::isfinite(bv) && blkI[row * KK + b] >= 0
-            ? blkI[row * KK + b] + j0 : -1;
-        if (before(bv, tie_key(bi, (int)row), av, tie_key(ai, (int)row))) {
-            outV[row * KK + t] = bv;
-            outI[row * KK + t] = bi;
+        if (before(bv, bk, av, ak)) {
+            outV[base + t] = bv;
+            outI[base + t] = bi;
             b++;
+            if (b < KK) {
+                bv = blkV[base + b];
+                raw_bi = blkI[base + b];
+                bi = metal::isfinite(bv) && raw_bi >= 0 ? raw_bi + j0 : -1;
+                bk = tie_key(bi, (int)row);
+            } else {
+                bv = INFINITY;
+                bi = -1;
+                bk = 0xFFFFFFFFu;
+            }
         } else {
-            outV[row * KK + t] = av;
-            outI[row * KK + t] = ai;
+            outV[base + t] = av;
+            outI[base + t] = ai;
             a++;
+            if (a < KK) {
+                av = runV[base + a];
+                ai = metal::isfinite(av) ? runI[base + a] : -1;
+                ak = tie_key(ai, (int)row);
+            } else {
+                av = INFINITY;
+                ai = -1;
+                ak = 0xFFFFFFFFu;
+            }
         }
     }
 """

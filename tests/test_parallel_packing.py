@@ -1,4 +1,5 @@
-"""Parallel normalized target packing preserves the serial window matrix."""
+"""Parallel target packing, normalized and raw, preserves the serial window
+matrix, bounds its float64 work, and releases its block when a worker fails."""
 
 from __future__ import annotations
 
@@ -25,16 +26,17 @@ def _target(n: int = 4_600) -> np.ndarray:
     return target
 
 
-def _packed(prep) -> np.ndarray:
-    engine = _engine.MassEngine(prep)
+def _packed(prep, normalize: bool = True) -> np.ndarray:
+    engine = _engine.MassEngine(prep, normalize=normalize)
     return np.array(engine.W_T)
 
 
+@pytest.mark.parametrize("normalize", [True, False])
 @pytest.mark.parametrize("n,m", [(7_000, 200), (4_600, 512), (4_600, 1024)])
-def test_parallel_target_packing_is_bit_exact_and_uses_workers(monkeypatch, n, m):
-    prep = preprocess_series(_target(n), m)
+def test_parallel_target_packing_is_bit_exact_and_uses_workers(monkeypatch, n, m, normalize):
+    prep = preprocess_series(_target(n), m, normalize=normalize)
     monkeypatch.setattr(_engine.os, "cpu_count", lambda: 1)
-    serial = _packed(prep)
+    serial = _packed(prep, normalize=normalize)
 
     real_pool = _engine.ThreadPoolExecutor
     launches = []
@@ -45,14 +47,14 @@ def test_parallel_target_packing_is_bit_exact_and_uses_workers(monkeypatch, n, m
 
     monkeypatch.setattr(_engine, "ThreadPoolExecutor", counted_pool)
     monkeypatch.setattr(_engine.os, "cpu_count", lambda: 8)
-    parallel = _packed(prep)
+    parallel = _packed(prep, normalize=normalize)
     np.testing.assert_array_equal(parallel.view(np.uint32), serial.view(np.uint32))
     assert launches == [8]
     assert parallel.shape == (m, len(prep.T) - m + 1)
 
     # A host that does not export MLX's buffer must retain the staged path.
     monkeypatch.setattr(_engine, "_writable_host_view", lambda _: None)
-    staged = _packed(prep)
+    staged = _packed(prep, normalize=normalize)
     np.testing.assert_array_equal(staged.view(np.uint32), serial.view(np.uint32))
     assert launches == [8]
     mx.clear_cache()
@@ -151,5 +153,39 @@ def test_worker_failure_releases_packed_block_before_cache_clear(monkeypatch, ti
         mlx_stump.stump(target, 512)
     frames = traceback.extract_tb(caught.value.__traceback__)
     assert any(frame.name == "pack_rows" for frame in frames)
+    assert mx.get_active_memory() <= baseline_active + (1 << 20)
+    assert mx.get_cache_memory() <= baseline_cache + (1 << 20)
+
+
+@pytest.mark.parametrize("tiled", [False, True])
+def test_raw_worker_failure_releases_packed_block_before_cache_clear(monkeypatch, tiled):
+    """Raw-mode packing has no centering step to fail in; fail a worker after
+    it has written its rows, while the other workers still hold theirs."""
+    target = _target(6_400 if tiled else 4_600)
+    if tiled:
+        monkeypatch.setattr(_engine, "_MATMUL_WINDOW_BYTES", 0)
+        monkeypatch.setattr(_engine, "_TILE_WINDOW_BYTES", 3_000 * 512 * 4)
+    monkeypatch.setattr(_engine.os, "cpu_count", lambda: 8)
+    mx.synchronize()
+    mx.clear_cache()
+    baseline_active = mx.get_active_memory()
+    baseline_cache = mx.get_cache_memory()
+    real_pool = _engine.ThreadPoolExecutor
+    submitted = []
+
+    class FailingPool(real_pool):
+        def submit(self, fn, *args, **kwargs):
+            submitted.append(fn.__name__)
+
+            def write_then_fail(*a, **kw):
+                fn(*a, **kw)
+                raise MemoryError("injected raw packing failure")
+
+            return super().submit(write_then_fail, *args, **kwargs)
+
+    monkeypatch.setattr(_engine, "ThreadPoolExecutor", FailingPool)
+    with pytest.raises(MemoryError, match="injected raw packing failure"):
+        mlx_stump.stump(target, 512, normalize=False)
+    assert submitted and set(submitted) == {"pack_rows"}
     assert mx.get_active_memory() <= baseline_active + (1 << 20)
     assert mx.get_cache_memory() <= baseline_cache + (1 << 20)

@@ -1,8 +1,11 @@
-"""Prototype: keep the two tiled top-k merge heads in Metal registers.
+"""Tiled top-k merge: list heads held in Metal registers vs reloaded.
 
-This is a reducer-only microbenchmark. It compares the production merge
-kernel to a version that loads a list head only when its cursor advances.
-Both use the same thread geometry, tie rule, outputs, and synchronization.
+The production merge kernel (``_merge_kernels._BODY``) keeps the two list
+heads in registers and loads a head only when its cursor advances; it was
+adopted from this benchmark's prototype. This reducer-only microbenchmark
+compares it with the earlier kernel, kept here, which reloaded both heads at
+every output step. Both use the same thread geometry, tie rule, outputs, and
+synchronization.
 
 Usage:
     PYTHONPATH=src python bench/bench_merge_heads.py --rows 65536 --k 16
@@ -20,45 +23,25 @@ from bench_stump import provenance
 import mlx_stump
 from mlx_stump import _engine, _merge_kernels
 
-_BODY = r"""
+_RELOAD_BODY = r"""
     const uint row = thread_position_in_grid.x;
     if (row >= (uint)runV_shape[0]) return;
     const int j0 = par[0];
-    const uint base = row * KK;
     int a = 0, b = 0;
-    float av = runV[base], bv = blkV[base];
-    int ai = metal::isfinite(av) ? runI[base] : -1;
-    int raw_bi = blkI[base];
-    int bi = metal::isfinite(bv) && raw_bi >= 0 ? raw_bi + j0 : -1;
-    uint ak = tie_key(ai, (int)row), bk = tie_key(bi, (int)row);
     for (int t = 0; t < KK; t++) {
-        if (before(bv, bk, av, ak)) {
-            outV[base + t] = bv;
-            outI[base + t] = bi;
+        const float av = a < KK ? runV[row * KK + a] : INFINITY;
+        const int ai = a < KK && metal::isfinite(av) ? runI[row * KK + a] : -1;
+        const float bv = b < KK ? blkV[row * KK + b] : INFINITY;
+        const int bi = b < KK && metal::isfinite(bv) && blkI[row * KK + b] >= 0
+            ? blkI[row * KK + b] + j0 : -1;
+        if (before(bv, tie_key(bi, (int)row), av, tie_key(ai, (int)row))) {
+            outV[row * KK + t] = bv;
+            outI[row * KK + t] = bi;
             b++;
-            if (b < KK) {
-                bv = blkV[base + b];
-                raw_bi = blkI[base + b];
-                bi = metal::isfinite(bv) && raw_bi >= 0 ? raw_bi + j0 : -1;
-                bk = tie_key(bi, (int)row);
-            } else {
-                bv = INFINITY;
-                bi = -1;
-                bk = 0xFFFFFFFFu;
-            }
         } else {
-            outV[base + t] = av;
-            outI[base + t] = ai;
+            outV[row * KK + t] = av;
+            outI[row * KK + t] = ai;
             a++;
-            if (a < KK) {
-                av = runV[base + a];
-                ai = metal::isfinite(av) ? runI[base + a] : -1;
-                ak = tie_key(ai, (int)row);
-            } else {
-                av = INFINITY;
-                ai = -1;
-                ak = 0xFFFFFFFFu;
-            }
         }
     }
 """
@@ -103,7 +86,7 @@ def _inputs(rows: int, k: int, self_join: bool, seed: int):
     return inputs
 
 
-def prototype_kernel(self_join: bool):
+def reload_kernel(self_join: bool):
     side_names = (
         ["runIl", "runPl", "runIr", "runPr", "blkIl", "blkPl", "blkIr", "blkPr"]
         if self_join
@@ -112,10 +95,10 @@ def prototype_kernel(self_join: bool):
     side_out = ["outIl", "outPl", "outIr", "outPr"] if self_join else []
     header = f"#define SELF_JOIN {int(self_join)}\n" + _merge_kernels._HEADER
     return mx.fast.metal_kernel(
-        name=f"mlx_stump_merge_heads_{int(self_join)}",
+        name=f"mlx_stump_merge_reload_{int(self_join)}",
         input_names=["runV", "runI", "blkV", "blkI", *side_names, "par"],
         output_names=["outV", "outI", *side_out],
-        source=_BODY + (_merge_kernels._SIDES if self_join else ""),
+        source=_RELOAD_BODY + (_merge_kernels._SIDES if self_join else ""),
         header=header,
     )
 
@@ -134,18 +117,12 @@ def benchmark_profile(args) -> None:
     _engine._TILE_WINDOW_BYTES = args.tile_kib * 1024
 
     def run(variant):
-        if variant == "heads":
-            _merge_kernels._KERNELS[args.self_join] = prototype
-        elif old_kernel is None:
-            _merge_kernels._KERNELS.pop(args.self_join, None)
-        else:
-            _merge_kernels._KERNELS[args.self_join] = old_kernel
+        _merge_kernels._KERNELS[args.self_join] = heads if variant == "heads" else reload
         return mlx_stump.stump(*call, **options)
 
     try:
-        baseline = _merge_kernels._kernel(args.self_join)
-        prototype = prototype_kernel(args.self_join)
-        old_kernel = baseline
+        heads = _merge_kernels._kernel(args.self_join)
+        reload = reload_kernel(args.self_join)
         run("baseline")
         run("heads")
         timings = {"baseline": [], "heads": []}
@@ -175,7 +152,7 @@ def benchmark_profile(args) -> None:
             f"speedup={baseline_t / heads_t:.2f}x exact={exact}"
         )
         if not exact:
-            raise SystemExit("register-head prototype changed the matrix profile")
+            raise SystemExit("register-head merge changed the matrix profile")
     finally:
         _engine._MATMUL_WINDOW_BYTES, _engine._TILE_WINDOW_BYTES = old_dense, old_tile
         if old_kernel is None:
@@ -206,8 +183,8 @@ def main() -> None:
         benchmark_profile(args)
         return
     inp = _inputs(args.rows, args.k, args.self_join, 447)
-    prototype = prototype_kernel(args.self_join)
-    baseline = _merge_kernels._kernel(args.self_join)
+    baseline = reload_kernel(args.self_join)
+    production = _merge_kernels._kernel(args.self_join)
     shape = (args.rows, args.k)
     shapes = [shape, shape]
     dtypes = [mx.float32, mx.int32]
@@ -228,12 +205,12 @@ def main() -> None:
         mx.synchronize()
         return outs
 
-    old, new = run(baseline), run(prototype)
+    old, new = run(baseline), run(production)
     equal = all(np.array_equal(np.array(a), np.array(b)) for a, b in zip(old, new, strict=True))
     if not equal:
-        raise SystemExit("register-head prototype changed the merge result")
+        raise SystemExit("register-head merge changed the merge result")
     timings = {"baseline": [], "heads": []}
-    kernels = {"baseline": baseline, "heads": prototype}
+    kernels = {"baseline": baseline, "heads": production}
     for rep in range(args.repeat):
         order = ("baseline", "heads") if rep % 2 == 0 else ("heads", "baseline")
         for name in order:

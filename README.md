@@ -240,8 +240,10 @@ error negligible in practice by:
 4. **Float64 refinement** — profile values at the chosen indices are
    re-evaluated on the CPU in float64 (O(l·k·m) work: a small share of the
    runtime at `k=1` but a sizeable one for large `k`, so each query window
-   is normalized once for all `k` neighbors and row chunks run on up to 8
-   CPU threads per call) as sums of squared differences of the z-normalized
+   is normalized once for all `k` neighbors, every target window is
+   normalized once up front where that saves a clear share of the work, and
+   row chunks run on up to 8 CPU threads per call) as sums of squared
+   differences of the z-normalized
    windows, with each window's mean and sigma freshly recomputed two-pass —
    a cancellation-free form that stays relatively accurate down to distance
    0 — so reported `P` values use well-conditioned float64 arithmetic for
@@ -380,7 +382,9 @@ PYTHONPATH=src python bench/bench_fusion.py --mode tiled --n 8192 --m 200 --k 16
 PYTHONPATH=src python bench/bench_fusion.py --mode dense --n 4096 --m 2048 --k 1
 ```
 
-The fused reducers use narrower threadgroups for short target rows. Dense
+The fused reducers use narrower threadgroups for short target rows; `k=1`
+AB-join rows of at most 128 target windows run four to a 128-thread group,
+one SIMD group per row. Dense
 AB-joins with 4–1024 target windows and `m ≤ 512` may also use up to 8192
 query rows per batch, subject to the same 384 MiB intermediate budget. Longer
 windows keep the 1024-row cap: widening their GEMM changed float32 scores and
@@ -487,7 +491,8 @@ PYTHONPATH=src python bench/bench_symmetric.py --n 16384 --m 200 --repeat 3 --st
   a normalized `k=1` self-join may retain up to 64 MiB of float64-normalized
   target rows and inverse sigmas alongside the resident GPU block; this is
   included in `estimated_peak_bytes`. The final profile refinement's float64
-  windows are ≤ 256 MiB in total across its threads and are processed after
+  windows, including any cached normalized target windows, are ≤ 256 MiB in
+  total across its threads and are processed after
   the window matrix and MLX's cached batch buffers have been released.
   Tiled top-k joins
   on the Metal fused path (`2 ≤ k ≤ 16`, at most 4,096 query batches per
