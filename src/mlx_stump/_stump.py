@@ -207,19 +207,145 @@ def _refine_znorm(
     WQ = np.lib.stride_tricks.sliding_window_view(query.T, m)
     WT = np.lib.stride_tricks.sliding_window_view(target.T, m)
     dmax = 2.0 * np.sqrt(m)  # rho >= -1; sqrt rounding can overshoot 1 ulp
+    shared = query is target
+    any_const = bool(query.isconstant.any() or (not shared and target.isconstant.any()))
+    all_finite = bool(query.isfinite.all() and (shared or target.isfinite.all()))
+    budget_rows = refine_chunk_rows(m)
+    use_cache = (
+        target.l >= 512
+        and target.l <= 2 * budget_rows
+        and (shared or target.l <= query.l * I2.shape[1])
+    )
+
+    if use_cache:
+        WT_norm = np.empty((target.l, m), dtype=np.float64)
+        t_inv_all = np.empty(target.l, dtype=np.float64)
+
+        def norm_chunk(s, e):
+            with np.errstate(invalid="ignore", over="ignore", under="ignore", divide="ignore"):
+                WT_norm[s:e] = WT[s:e]
+                t_inv_all[s:e] = _znorm_rows(WT_norm[s:e], target.isconstant[s:e], m)
+
+        def dist_chunk(s, e):
+            Ic = I2[s:e]
+            out2[s:e] = np.inf
+            has_any = (Ic >= 0).any(axis=1)
+            if not has_any.any():
+                return
+            all_rows = bool(has_any.all())
+            rows = slice(None) if all_rows else np.nonzero(has_any)[0]
+            qi_all = slice(s, e) if all_rows else rows + s
+            qc_all = query.isconstant[qi_all]
+            with np.errstate(invalid="ignore", over="ignore", under="ignore", divide="ignore"):
+                if shared:
+                    qw_all = WT_norm[qi_all]
+                    sq_inv_all = t_inv_all[qi_all]
+                else:
+                    qw_all = WQ[s:e].copy() if all_rows else WQ[qi_all]
+                    sq_inv_all = _znorm_rows(qw_all, qc_all, m)
+                for j in range(Ic.shape[1]):
+                    tj = Ic[rows, j]
+                    has = tj >= 0
+                    if not has.any():
+                        continue
+                    all_col = bool(has.all())
+                    sel = slice(None) if all_col else has
+                    tj = tj[sel]
+                    qi = (
+                        slice(s, e)
+                        if (all_rows and all_col)
+                        else (np.nonzero(has)[0] + s if all_rows else qi_all[sel])
+                    )
+                    tw = WT_norm[tj]
+                    st_inv = t_inv_all[tj]
+                    sq_inv = sq_inv_all[sel]
+                    np.subtract(qw_all[sel], tw, out=tw)
+                    d2 = np.einsum("ij,ij->i", tw, tw)
+                    del tw
+                    d2 = np.where((sq_inv == 0.0) | (st_inv == 0.0), 2.0 * m, d2)
+                    if not all_finite:
+                        d2[~np.isfinite(d2)] = 2.0 * m
+                    d2[d2 < P_NORM_THRESHOLD] = 0.0
+                    np.sqrt(d2, out=d2)
+                    np.minimum(d2, dmax, out=d2)
+                    if any_const:
+                        qc = qc_all[sel]
+                        tc = target.isconstant[tj]
+                        d2 = np.where(qc & tc, 0.0, np.where(qc ^ tc, np.sqrt(m), d2))
+                    if not all_finite:
+                        d2[~(query.isfinite[qi] & target.isfinite[tj])] = np.inf
+                    out2[qi, j] = d2
+
+        workers = max(1, min(_REFINE_MAX_WORKERS, _cpu_count(), budget_rows))
+        step = budget_rows // workers
+        q_starts = range(0, I2.shape[0], step)
+        t_starts = range(0, target.l, step)
+        lanes = min(workers, len(q_starts))
+        if lanes <= 1:
+            for s in t_starts:
+                norm_chunk(s, min(s + step, target.l))
+            for s in q_starts:
+                dist_chunk(s, min(s + step, I2.shape[0]))
+            return out
+
+        t_cursor = iter(t_starts)
+        q_cursor = iter(q_starts)
+        lock = threading.Lock()
+        failed = threading.Event()
+        barrier = threading.Barrier(lanes)
+
+        def lane():
+            while not failed.is_set():
+                with lock:
+                    s = next(t_cursor, None)
+                if s is None:
+                    break
+                try:
+                    norm_chunk(s, min(s + step, target.l))
+                except BaseException:
+                    failed.set()
+                    barrier.abort()
+                    raise
+            try:
+                barrier.wait()
+            except threading.BrokenBarrierError:
+                return
+            while not failed.is_set():
+                with lock:
+                    s = next(q_cursor, None)
+                if s is None:
+                    return
+                try:
+                    dist_chunk(s, min(s + step, I2.shape[0]))
+                except BaseException:
+                    failed.set()
+                    raise
+
+        with ThreadPoolExecutor(max_workers=lanes) as pool:
+            try:
+                tasks = [pool.submit(lane) for _ in range(lanes)]
+                for task in tasks:
+                    task.result()
+            except BaseException:
+                failed.set()
+                barrier.abort()
+                raise
+        return out
 
     def job(s, e):
         Ic = I2[s:e]
         out2[s:e] = np.inf
-        rows = np.nonzero((Ic >= 0).any(axis=1))[0]
-        if rows.size == 0:
+        has_any = (Ic >= 0).any(axis=1)
+        if not has_any.any():
             return
-        qi_all = rows + s
+        all_rows = bool(has_any.all())
+        rows = slice(None) if all_rows else np.nonzero(has_any)[0]
+        qi_all = slice(s, e) if all_rows else rows + s
         qc_all = query.isconstant[qi_all]
         # raw windows may hold NaN/inf; those rows are overwritten with inf
         # below, so let the intermediate arithmetic run silently
         with np.errstate(invalid="ignore", over="ignore", under="ignore", divide="ignore"):
-            qw_all = WQ[qi_all]  # fancy indexing copies, so everything can be in place
+            qw_all = WQ[s:e].copy() if all_rows else WQ[qi_all]
             sq_inv_all = _znorm_rows(qw_all, qc_all, m)
             for j in range(Ic.shape[1]):
                 tj = Ic[rows, j]
@@ -228,10 +354,14 @@ def _refine_znorm(
                     continue
                 # usually every row has this neighbor; a full slice then
                 # selects by view, so the query block is not copied per column
-                sel = slice(None) if has.all() else has
+                all_col = bool(has.all())
+                sel = slice(None) if all_col else has
                 tj = tj[sel]
-                qi = qi_all[sel]
-                qc = qc_all[sel]
+                qi = (
+                    slice(s, e)
+                    if (all_rows and all_col)
+                    else (np.nonzero(has)[0] + s if all_rows else qi_all[sel])
+                )
                 tc = target.isconstant[tj]
                 tw = WT[tj]
                 st_inv = _znorm_rows(tw, tc, m)
@@ -244,12 +374,17 @@ def _refine_znorm(
                 # window flagged non-constant) means rho == 0 on the GPU; mirror
                 # that, and let the constant-flag rules below overwrite as needed
                 d2 = np.where((sq_inv == 0.0) | (st_inv == 0.0), 2.0 * m, d2)
-                d2[~np.isfinite(d2)] = 2.0 * m  # NaN/inf windows: masked below
+                if not all_finite:
+                    d2[~np.isfinite(d2)] = 2.0 * m  # NaN/inf windows: masked below
                 d2[d2 < P_NORM_THRESHOLD] = 0.0
-                d = np.minimum(np.sqrt(d2), dmax)
-                d = np.where(qc & tc, 0.0, np.where(qc ^ tc, np.sqrt(m), d))
-                d[~(query.isfinite[qi] & target.isfinite[tj])] = np.inf
-                out2[qi, j] = d
+                np.sqrt(d2, out=d2)
+                np.minimum(d2, dmax, out=d2)
+                if any_const:
+                    qc = qc_all[sel]
+                    d2 = np.where(qc & tc, 0.0, np.where(qc ^ tc, np.sqrt(m), d2))
+                if not all_finite:
+                    d2[~(query.isfinite[qi] & target.isfinite[tj])] = np.inf
+                out2[qi, j] = d2
 
     _map_refine_chunks(job, I2.shape[0], m)
     return out
@@ -275,20 +410,27 @@ def _refine_absolute(
     out2 = out[:, None] if out.ndim == 1 else out
     WQ = np.lib.stride_tricks.sliding_window_view(query.T, m)
     WT = np.lib.stride_tricks.sliding_window_view(target.T, m)
+    shared = query is target
+    all_finite = bool(query.isfinite.all() and (shared or target.isfinite.all()))
 
     def job(s, e):
+        Ic = I2[s:e]
         out2[s:e] = np.inf
-        for j in range(I2.shape[1]):
-            qi = np.nonzero(I2[s:e, j] >= 0)[0] + s
-            if qi.size == 0:
+        for j in range(Ic.shape[1]):
+            col = Ic[:, j]
+            has = col >= 0
+            if not has.any():
                 continue
-            tj = I2[qi, j]
-            diff = WQ[qi]  # fancy indexing copies, so the difference can be in place
+            all_col = bool(has.all())
+            qi = slice(s, e) if all_col else np.nonzero(has)[0] + s
+            tj = col if all_col else col[has]
+            diff = WQ[s:e].copy() if all_col else WQ[qi]
             with np.errstate(over="ignore", under="ignore", invalid="ignore"):
                 np.subtract(diff, WT[tj], out=diff)
             d = rowwise_l2_inplace(diff)
             del diff  # not alive while the next column gathers
-            d[~(query.isfinite[qi] & target.isfinite[tj])] = np.inf
+            if not all_finite:
+                d[~(query.isfinite[qi] & target.isfinite[tj])] = np.inf
             out2[qi, j] = d
 
     _map_refine_chunks(job, I2.shape[0], m)
@@ -653,30 +795,37 @@ def _compute_profile(
         mx.synchronize()  # see _compute_profile_tiled: releases this batch's buffers
         # the float32 squared distances only mark rows without a finite
         # candidate; stump() recomputes every reported value in float64
+        rows = None if normalize else np.arange(s, e)
         if k == 1:
-            p2 = np.array(outs[1])[off:]
-            I[s:e, 0] = np.where(np.isfinite(p2), np.array(outs[0], dtype=np.int64)[off:], -1)
+            p2 = np.asarray(outs[1])[off:]
+            I[s:e, 0] = np.asarray(outs[0])[off:]
+            if not np.isfinite(p2).all():
+                I[s:e, 0][~np.isfinite(p2)] = -1
             uncertain[s:e] |= _ambiguous_scores(
-                query, engine.target, np.arange(s, e), I[s:e, 0], p2, normalize
+                query, engine.target, rows, I[s:e, 0], p2, normalize
             )
         else:
-            vals = np.array(outs[0])[off:]
-            ix = np.array(outs[1], dtype=np.int64)[off:]
-            ix[~np.isfinite(vals)] = -1
+            vals = np.asarray(outs[0])[off:]
+            ix = np.asarray(outs[1])[off:]
             kk = ix.shape[1]
             I[s:e, :kk] = ix
+            if not np.isfinite(vals).all():
+                I[s:e, :kk][~np.isfinite(vals)] = -1
             if kk < k:
                 I[s:e, kk:] = -1
             else:
                 uncertain[s:e] |= _ambiguous_scores(
-                    query, engine.target, np.arange(s, e), I[s:e, -1], vals[:, -1], normalize
+                    query, engine.target, rows, I[s:e, -1], vals[:, -1], normalize
                 )
         if self_join:
-            pl2 = np.array(outs[3])[off:]
-            IL[s:e] = np.where(np.isfinite(pl2), np.array(outs[2], dtype=np.int64)[off:], -1)
-            pr2 = np.array(outs[5])[off:]
-            IR[s:e] = np.where(np.isfinite(pr2), np.array(outs[4], dtype=np.int64)[off:], -1)
-            rows = np.arange(s, e)
+            pl2 = np.asarray(outs[3])[off:]
+            IL[s:e] = np.asarray(outs[2])[off:]
+            if not np.isfinite(pl2).all():
+                IL[s:e][~np.isfinite(pl2)] = -1
+            pr2 = np.asarray(outs[5])[off:]
+            IR[s:e] = np.asarray(outs[4])[off:]
+            if not np.isfinite(pr2).all():
+                IR[s:e][~np.isfinite(pr2)] = -1
             uncertain[s:e] |= _ambiguous_scores(
                 query, engine.target, rows, IL[s:e], pl2, normalize
             ) | _ambiguous_scores(query, engine.target, rows, IR[s:e], pr2, normalize)

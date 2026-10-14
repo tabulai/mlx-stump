@@ -25,16 +25,17 @@ def _target(n: int = 4_600) -> np.ndarray:
     return target
 
 
-def _packed(prep) -> np.ndarray:
-    engine = _engine.MassEngine(prep)
+def _packed(prep, normalize: bool = True) -> np.ndarray:
+    engine = _engine.MassEngine(prep, normalize=normalize)
     return np.array(engine.W_T)
 
 
+@pytest.mark.parametrize("normalize", [True, False])
 @pytest.mark.parametrize("n,m", [(7_000, 200), (4_600, 512), (4_600, 1024)])
-def test_parallel_target_packing_is_bit_exact_and_uses_workers(monkeypatch, n, m):
-    prep = preprocess_series(_target(n), m)
+def test_parallel_target_packing_is_bit_exact_and_uses_workers(monkeypatch, n, m, normalize):
+    prep = preprocess_series(_target(n), m, normalize=normalize)
     monkeypatch.setattr(_engine.os, "cpu_count", lambda: 1)
-    serial = _packed(prep)
+    serial = _packed(prep, normalize=normalize)
 
     real_pool = _engine.ThreadPoolExecutor
     launches = []
@@ -45,14 +46,14 @@ def test_parallel_target_packing_is_bit_exact_and_uses_workers(monkeypatch, n, m
 
     monkeypatch.setattr(_engine, "ThreadPoolExecutor", counted_pool)
     monkeypatch.setattr(_engine.os, "cpu_count", lambda: 8)
-    parallel = _packed(prep)
+    parallel = _packed(prep, normalize=normalize)
     np.testing.assert_array_equal(parallel.view(np.uint32), serial.view(np.uint32))
     assert launches == [8]
     assert parallel.shape == (m, len(prep.T) - m + 1)
 
     # A host that does not export MLX's buffer must retain the staged path.
     monkeypatch.setattr(_engine, "_writable_host_view", lambda _: None)
-    staged = _packed(prep)
+    staged = _packed(prep, normalize=normalize)
     np.testing.assert_array_equal(staged.view(np.uint32), serial.view(np.uint32))
     assert launches == [8]
     mx.clear_cache()

@@ -619,8 +619,8 @@ class MassEngine:
             out = np.empty((j1 - j0, self.m), dtype=np.float32)
         step = _center_rows(self.m)
 
+        output_ref = weakref.ref(out)
         if self.normalize:
-            output_ref = weakref.ref(out)
 
             def pack_rows(s: int, e: int) -> None:
                 work = w[s:e].copy()
@@ -644,54 +644,61 @@ class MassEngine:
                 # Each worker owns disjoint rows of the evaluated block.
                 # Their total live float64 work is at most one centering step.
 
-            rows = j1 - j0
-            workers = min(8, os.cpu_count() or 1)
-            parallel = (
-                blk is not None
-                and workers > 1
-                and rows >= 1024
-                and rows * self.m >= 1 << 20
-                and step >= 256
-                and step * self.m >= 1 << 18
-            )
-            if parallel:
-                # Reuse one pool for this block, but finish every bounded
-                # centering step before scheduling the next one. Splitting a
-                # step across workers keeps its aggregate float64 temporary
-                # within the same _CENTER_BYTES allowance as serial packing.
-                futures = []
-                future = None
-                try:
-                    with ThreadPoolExecutor(max_workers=workers) as pool:
-                        for start in range(0, rows, step):
-                            end = min(start + step, rows)
-                            count = end - start
-                            if count < 256 or count * self.m < 1 << 18:
-                                pack_rows(start, end)
-                                continue
-                            work_count = min(workers, max(1, count // 128))
-                            width = -(-count // work_count)
-                            futures = [
-                                pool.submit(pack_rows, s, min(s + width, end))
-                                for s in range(start, end, width)
-                            ]
-                            for future in futures:
-                                future.result()
-                except BaseException:
-                    # The pool has finished every writer. Drop its Future
-                    # references and our own block/view before the caller's
-                    # error handler clears MLX's cache. Keep the original
-                    # exception and worker traceback for debugging.
-                    futures.clear()
-                    del future, futures, pack_rows, out, blk
-                    raise
-            else:
-                for s in range(0, rows, step):
-                    pack_rows(s, min(s + step, rows))
         else:
-            for s in range(0, j1 - j0, step):
-                e = min(s + step, j1 - j0)
-                out[s:e] = w[s:e] - self.target.mu[j0 + s : j0 + e, None]
+
+            def pack_rows(s: int, e: int) -> None:
+                output = output_ref()
+                if output is None:
+                    raise RuntimeError("target packing output was released before workers finished")
+                try:
+                    output[s:e] = w[s:e] - self.target.mu[j0 + s : j0 + e, None]
+                finally:
+                    del output
+
+        rows = j1 - j0
+        workers = min(8, os.cpu_count() or 1)
+        parallel = (
+            blk is not None
+            and workers > 1
+            and rows >= 1024
+            and rows * self.m >= 1 << 20
+            and step >= 256
+            and step * self.m >= 1 << 18
+        )
+        if parallel:
+            # Reuse one pool for this block, but finish every bounded
+            # centering step before scheduling the next one. Splitting a
+            # step across workers keeps its aggregate float64 temporary
+            # within the same _CENTER_BYTES allowance as serial packing.
+            futures = []
+            future = None
+            try:
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    for start in range(0, rows, step):
+                        end = min(start + step, rows)
+                        count = end - start
+                        if count < 256 or count * self.m < 1 << 18:
+                            pack_rows(start, end)
+                            continue
+                        work_count = min(workers, max(1, count // 128))
+                        width = -(-count // work_count)
+                        futures = [
+                            pool.submit(pack_rows, s, min(s + width, end))
+                            for s in range(start, end, width)
+                        ]
+                        for future in futures:
+                            future.result()
+            except BaseException:
+                # The pool has finished every writer. Drop its Future
+                # references and our own block/view before the caller's
+                # error handler clears MLX's cache. Keep the original
+                # exception and worker traceback for debugging.
+                futures.clear()
+                del future, futures, pack_rows, out, blk
+                raise
+        else:
+            for s in range(0, rows, step):
+                pack_rows(s, min(s + step, rows))
         if blk is None:
             blk = mx.array(out)
         del out

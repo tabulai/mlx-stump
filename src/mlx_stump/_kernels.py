@@ -321,11 +321,17 @@ def _topk_source(normalize: bool, self_join: bool) -> str:
         if ((tid % (2 * s)) == 0) {
             const uint a = tid * KK, b = (tid + s) * KK;
             int pa = 0, pb = 0;
+            float av = sv[a], bv = sv[b];
+            uint ak = sk[a], bk = sk[b];
             for (int t = 0; t < KK; t++) {
-                if (lex_lt(sv[b + pb], sk[b + pb], sv[a + pa], sk[a + pa])) {
-                    v[t] = sv[b + pb]; kv[t] = sk[b + pb]; pb++;
+                if (lex_lt(bv, bk, av, ak)) {
+                    v[t] = bv; kv[t] = bk; pb++;
+                    if (pb < KK) { bv = sv[b + pb]; bk = sk[b + pb]; }
+                    else { bv = INFINITY; bk = 0xFFFFFFFFu; }
                 } else {
-                    v[t] = sv[a + pa]; kv[t] = sk[a + pa]; pa++;
+                    v[t] = av; kv[t] = ak; pa++;
+                    if (pa < KK) { av = sv[a + pa]; ak = sk[a + pa]; }
+                    else { av = INFINITY; ak = 0xFFFFFFFFu; }
                 }
             }
             for (int t = 0; t < KK; t++) { sv[a + t] = v[t]; sk[a + t] = kv[t]; }
@@ -352,6 +358,48 @@ def _topk_source(normalize: bool, self_join: bool) -> str:
     }
 """
     return _PROLOGUE + pre + body
+
+
+def _grouped_argmin_source(normalize: bool) -> str:
+    """Four independent SIMD groups (128 threads) reducing 4 narrow AB-join rows."""
+    pre, d2 = _dist(normalize)
+    return (
+        r"""
+    const uint row = 4u * threadgroup_position_in_grid.y + simdgroup_index_in_threadgroup;
+    if (row >= (uint)QT_shape[0]) return;
+    const uint lane = thread_index_in_simdgroup;
+    const int W = QT_shape[1];
+    const int i = par[0] + (int)row;
+    const int J0 = par[1];
+    const size_t qbase = (size_t)row * (size_t)W;
+    const float c_m = consts[0];
+    const float c_inv_m = consts[1];
+    const float c_2m = consts[2];
+    const float c_4m = consts[3];
+    const bool q_fin = qf[i];
+"""
+        + pre
+        + r"""
+    float bb = INFINITY;
+    uint kb = 0xFFFFFFFFu;
+    for (int j = (int)lane; j < W; j += 32) {
+        const int jg = J0 + j;
+"""
+        + d2
+        + r"""
+        lex_min(bb, kb, d2, (uint)j);
+    }
+    for (ushort off = 16; off > 0; off >>= 1) {
+        float ov = simd_shuffle_down(bb, off);
+        uint ok = simd_shuffle_down(kb, off);
+        lex_min(bb, kb, ov, ok);
+    }
+    if (lane == 0) {
+        outI[row] = kb == 0xFFFFFFFFu ? -1 : (int)kb;
+        outP[row] = bb;
+    }
+"""
+    )
 
 
 def topk_threadgroup(k: int) -> int:
@@ -399,6 +447,9 @@ def _kernel(kind: str, normalize: bool, self_join: bool):
         if kind == "argmin":
             source = _argmin_source(normalize, self_join)
             outs = ["outI", "outP", *lr]
+        elif kind == "argmin4":
+            source = _grouped_argmin_source(normalize)
+            outs = ["outI", "outP"]
         else:
             source = _topk_source(normalize, self_join)
             outs = ["outV", "outI", *lr]
@@ -454,8 +505,11 @@ class FusedReduce:
         self._consts = mx.array(consts)
         self._tg = tg
         self._adaptive_tg = threadgroup is None
+        self._kern4 = None
         if k == 1:
             self._kern = _kernel("argmin", normalize, self_join)
+            if not self_join and tg >= 128:
+                self._kern4 = _kernel("argmin4", normalize, False)
         else:
             self._kern = _kernel("topk", normalize, self_join)
             tg_bytes = topk_threadgroup_bytes(k, tg)
@@ -463,10 +517,10 @@ class FusedReduce:
         self._template = [("TG", tg)] if k == 1 else [("TG", tg), ("KK", k)]
 
     def _run(self, QT, s0: int, j0: int):
-        B = QT.shape[0]
+        B, W = QT.shape
         if self._adaptive_tg:
             choose_tg = argmin_threadgroup if self.k == 1 else topk_row_threadgroup
-            tg = choose_tg(QT.shape[1], self._tg)
+            tg = choose_tg(W, self._tg)
             template = [("TG", tg)] if self.k == 1 else [("TG", tg), ("KK", self.k)]
         else:
             tg = self._tg
@@ -477,6 +531,14 @@ class FusedReduce:
         if self.k == 1:
             shapes = [(B,), (B,), *lr_shapes]
             dtypes = [mx.int32, mx.float32, *lr_dtypes]
+            if self._adaptive_tg and self._kern4 is not None and W <= 128 and tg <= 128 and B >= 4:
+                return self._kern4(
+                    inputs=[QT, *self._q, *self._t, par, self._consts],
+                    grid=(128, -(-B // 4), 1),
+                    threadgroup=(128, 1, 1),
+                    output_shapes=shapes,
+                    output_dtypes=dtypes,
+                )
         else:
             shapes = [(B, self.k), (B, self.k), *lr_shapes]
             dtypes = [mx.float32, mx.int32, *lr_dtypes]

@@ -548,7 +548,7 @@ def _mass(
                 )
                 mx.eval(d2)
                 mx.synchronize()  # completion handler returns the block's buffers
-                D2[j0:j1] = np.array(d2[0], dtype=np.float64)
+                D2[j0:j1] = np.asarray(d2)[0]
                 del W, d2  # release this block before the next one is built
             del Qb, sig_inv_q, isconst_q, isfinite_q
         else:
@@ -591,7 +591,7 @@ def _mass(
                 )
                 mx.eval(d2)
                 mx.synchronize()
-                D2[j0:j1] = np.array(d2[0], dtype=np.float64)
+                D2[j0:j1] = np.asarray(d2)[0]
                 del W, d2
             del Qb, ssq_q, mu_q_mx, isfinite_q
     except BaseException as exc:
