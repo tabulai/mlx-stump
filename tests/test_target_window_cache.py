@@ -7,9 +7,11 @@ the refinement threads, instead of once per (row, neighbor) pair:
   constant windows, user constant flags, extreme scales, rows and columns
   without a neighbor, 1-D indices, AB- and self-joins, on 1 and 8 threads;
 - the cache is charged to the refinement budget: the float64 work of one call
-  stays within ``refine_chunk_rows(m) * m * 8 * 4`` bytes even for an AB-join
-  with partially filled rows (a cache built on top of the lanes' budget
-  reached ~5 of its 4 window blocks);
+  stays within ``_REFINE_MEM_BUDGET`` even for an AB-join with partially
+  filled rows (a cache built on top of the lanes' budget reached ~5 of its 4
+  window blocks), and where the 65536-row cap keeps the four blocks far
+  below that budget (small ``m``) the lanes keep full chunks, within
+  ``refine_peak_bytes(m)``, the estimate's refinement term;
 - it is built only where it saves normalizations: not for an AB-join of
   equal lengths at k = 1, nor for a self-join whose rows mostly have no
   neighbor, nor beyond two budgeted blocks of target windows;
@@ -149,9 +151,36 @@ def test_cache_stays_within_the_refinement_budget(monkeypatch, join):
     finally:
         tracemalloc.stop()
     assert used == [True]
-    budget = rows * m * 8 * 4
-    # small allowance for the per-row vectors (indices, masks, d2)
-    assert peak <= budget * 1.03, (peak / 2**20, budget / 2**20)
+    assert peak <= eng._REFINE_MEM_BUDGET, (peak / 2**20, eng._REFINE_MEM_BUDGET / 2**20)
+    assert eng.refine_peak_bytes(m) == eng._REFINE_MEM_BUDGET
+
+
+def test_small_windows_keep_full_chunks_with_the_cache(monkeypatch):
+    m = 8  # four blocks of the 65536-row cap are 16 MiB of the 256 MiB budget
+    monkeypatch.setattr(st, "_cpu_count", lambda: 8)
+    rows = eng.refine_chunk_rows(m)
+    assert rows * m * 8 * 4 < eng._REFINE_MEM_BUDGET
+    B = preprocess_series(_walk(2 * rows + m - 1, 23), m)  # the largest cache
+    A = preprocess_series(_walk(140_000 + m - 1, 24), m)
+    # an AB-join with holes and empty rows: the lanes' worst case
+    I = _neighbors(np.random.default_rng(6), A.l, B.l, 2, holes=0.03, empty_every=97)
+    chunks = []
+    real = st._map_refine_chunks
+
+    def spy(job, l, m_, **kwargs):
+        chunks.append(kwargs["rows"])
+        return real(job, l, m_, **kwargs)
+
+    monkeypatch.setattr(st, "_map_refine_chunks", spy)
+    out = np.empty(I.shape)
+    tracemalloc.start()
+    try:
+        st._refine_znorm(A, B, I, out=out)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert chunks == [rows]  # not shrunk below the uncached chunk
+    assert rows * m * 8 * 4 < peak <= eng.refine_peak_bytes(m) <= eng._REFINE_MEM_BUDGET
 
 
 def test_cache_is_built_only_where_it_saves_normalizations():

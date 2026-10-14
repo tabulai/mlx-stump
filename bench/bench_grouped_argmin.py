@@ -122,7 +122,8 @@ def main() -> None:
         consts=consts_np,
         threadgroup=per_row_tg,
     )
-    kernels = {r: grouped_kernel(normalize, r) for r in (1, 4)}
+    # one row per 32-thread group (prototype) and the production kernel
+    kernels = {1: grouped_kernel(normalize, 1), 4: _kernels._kernel("argmin4", normalize, False)}
     inp = [
         qt,
         *old._q,

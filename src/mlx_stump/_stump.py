@@ -21,6 +21,7 @@ from ._engine import (
     make_reducer,
     query_windows,
     query_windows_at,
+    refine_cached_chunk_rows,
     refine_chunk_rows,
 )
 from ._merge_kernels import TiledMerge
@@ -124,45 +125,38 @@ def _map_refine_chunks(job, l: int, m: int, *, rows: int | None = None, prepare=
             for s in range(0, n, step):
                 fn(s, min(s + step, n))
         return
-    # Each lane pulls the next chunk from one shared cursor per pass, so the
-    # pool holds one task per thread rather than one per chunk (at large m
-    # there are ~l*m/2**20 chunks) while a slow thread still takes fewer
-    # chunks. A barrier separates the passes.
-    cursors = [iter(range(0, n, step)) for _, n in passes]
+    # Each lane pulls the next chunk from one shared cursor, so the pool
+    # holds one task per thread rather than one per chunk (at large m there
+    # are ~l*m/2**20 chunks) while a slow thread still takes fewer chunks.
+    # A pass gets its own round of lanes once the previous round has
+    # finished; the pool's threads serve both.
     lock = threading.Lock()
     failed = threading.Event()
-    barrier = threading.Barrier(lanes)
 
-    def lane():
-        for p, (fn, n) in enumerate(passes):
-            if p:
-                try:
-                    barrier.wait()
-                except threading.BrokenBarrierError:
-                    return  # another lane failed, or the caller was interrupted
-            while not failed.is_set():
-                with lock:
-                    s = next(cursors[p], None)
-                if s is None:
-                    break
-                try:
-                    fn(s, min(s + step, n))
-                except BaseException:
-                    failed.set()  # the other lanes stop at their next chunk
-                    barrier.abort()  # or leave the barrier
-                    raise
+    def lane(fn, n, cursor):
+        while not failed.is_set():
+            with lock:
+                s = next(cursor, None)
+            if s is None:
+                return
+            try:
+                fn(s, min(s + step, n))
+            except BaseException:
+                failed.set()  # the other lanes stop at their next chunk
+                raise
 
     with ThreadPoolExecutor(max_workers=lanes) as pool:
         try:
-            tasks = [pool.submit(lane) for _ in range(lanes)]
-            for task in tasks:
-                task.result()  # re-raises a worker exception here
+            for fn, n in passes:
+                cursor = iter(range(0, n, step))
+                tasks = [pool.submit(lane, fn, n, cursor) for _ in range(lanes)]
+                for task in tasks:
+                    task.result()  # re-raises a worker exception here
         except BaseException:
             # a worker failed, or the caller was interrupted (Ctrl-C) while
             # submitting or waiting: stop every lane at its next chunk before
             # the pool joins, instead of refining to the end in the background
             failed.set()
-            barrier.abort()
             raise
 
 
@@ -200,14 +194,17 @@ def _cache_target_windows(
     if not _TARGET_CACHE_MIN_WINDOWS <= target_l <= 2 * budget_rows:
         return False
     l, k = I2.shape
-    if l * (k + 1) < _TARGET_CACHE_MIN_GAIN * target_l:
+    if k == 0 or l * (k + 1) < _TARGET_CACHE_MIN_GAIN * target_l:
         return False  # cannot pay off even with every neighbor present
-    pairs = rows = 0
-    step = max(1, budget_rows * m * 8 // k)  # boolean chunks within one window block
-    for s in range(0, l, step):
-        valid = I2[s : s + step] >= 0
-        pairs += int(np.count_nonzero(valid))
-        rows += int(np.count_nonzero(valid.any(axis=1)))
+    if I2.min() >= 0:  # the usual case: every neighbor present
+        pairs, rows = l * k, l
+    else:
+        pairs = rows = 0
+        step = max(1, budget_rows * m * 8 // k)  # boolean chunks within one window block
+        for s in range(0, l, step):
+            valid = I2[s : s + step] >= 0
+            pairs += int(np.count_nonzero(valid))
+            rows += int(np.count_nonzero(valid.any(axis=1)))
     cached = target_l + (0 if shared else rows)
     return rows + pairs >= _TARGET_CACHE_MIN_GAIN * cached
 
@@ -269,10 +266,9 @@ def _refine_znorm(
         # self-join, for the query rows too). The cache lives for the whole
         # call, so it is charged to the refinement budget: the lanes, which
         # hold at most three window blocks of their rows, get what it leaves
-        # of the four budgeted blocks (at least two thirds of a chunk)
         WT_norm = np.empty((target.l, m))
         t_inv = np.empty(target.l)
-        chunk_rows = min(budget_rows, (4 * budget_rows * m - target.l * (m + 1)) // (3 * m))
+        chunk_rows = refine_cached_chunk_rows(m, target.l)
 
         def normalize_targets(s, e):
             with np.errstate(invalid="ignore", over="ignore", under="ignore", divide="ignore"):

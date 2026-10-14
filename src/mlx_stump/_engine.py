@@ -163,9 +163,10 @@ _CENTER_ROW_BYTES = 128
 # refinement threads, which split one chunk of refine_chunk_rows(m) rows;
 # each thread holds at most three window blocks of its rows (query, target
 # and one temporary) against the four budgeted. A z-normalized refinement
-# that caches every normalized target window (at most two blocks) charges
-# the cache to this budget and splits a correspondingly smaller chunk. The
-# refinement runs after the device memory has been released
+# that caches every normalized target window (at most two chunks of them)
+# charges the cache, the lanes' blocks and their per-row vectors to these
+# bytes (refine_cached_chunk_rows). The refinement runs after the device
+# memory has been released
 _REFINE_MEM_BUDGET = 1 << 28  # ~256 MiB
 # Optional float64-normalized target rows plus inverse sigmas retained while
 # repairing dense near-zero self-join candidates. The cache is built only
@@ -176,6 +177,31 @@ _REPAIR_NORMALIZED_CACHE_MAX_BYTES = 64 << 20
 
 def refine_chunk_rows(m: int) -> int:
     return max(1, min(1 << 16, _REFINE_MEM_BUDGET // (m * 8 * 4)))
+
+
+# per refinement row, besides its window blocks: an allowance for the index,
+# mask, inverse-sigma and distance vectors live while it is refined
+_REFINE_ROW_VECTOR_BYTES = 80
+
+
+def refine_cached_chunk_rows(m: int, target_l: int) -> int:
+    """Rows in flight for a z-normalized refinement that caches all
+    ``target_l`` normalized target windows and their inverse sigmas: each
+    row holds at most three window blocks plus its vectors, and the rows get
+    what the cache leaves of ``_REFINE_MEM_BUDGET``, at most one chunk."""
+    free = _REFINE_MEM_BUDGET - target_l * (m + 1) * 8
+    return max(1, min(refine_chunk_rows(m), free // (3 * m * 8 + _REFINE_ROW_VECTOR_BYTES)))
+
+
+def refine_peak_bytes(m: int) -> int:
+    """Float64 bytes one refinement call holds at most: four window blocks
+    per chunk row, or a cache of up to two chunks of normalized target
+    windows plus the rows it leaves room for (within ``_REFINE_MEM_BUDGET``;
+    the larger term where the row cap keeps four blocks below it)."""
+    rows = refine_chunk_rows(m)
+    cached_rows = refine_cached_chunk_rows(m, 2 * rows)
+    cached = 2 * rows * (m + 1) * 8 + cached_rows * (3 * m * 8 + _REFINE_ROW_VECTOR_BYTES)
+    return max(rows * m * 8 * 4, cached)
 
 
 def _center_rows(m: int) -> int:
@@ -419,7 +445,7 @@ def estimated_peak_bytes(
         else 0
     )
     repair = block + l_q * (24 * k + 64) + repair_batch + repair_cache
-    refine = refine_chunk_rows(m) * m * 8 * 4
+    refine = refine_peak_bytes(m)
     reorder = l_q * 16 * k if k > 1 else 0  # argsort order + one reordered copy live
     # Object-array pointers plus CPython's allocation-size footprint for the
     # boxed float/int in every cell. Both 24-byte floats and 28-byte ints use
