@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import numpy as np
 import pytest
 
@@ -180,9 +182,10 @@ def test_prepared_tiled_target_keeps_bounded_streaming(monkeypatch):
         np.testing.assert_array_equal(target.mass(Q), expected)
 
 
-def test_prepared_size_and_lifecycle():
+@pytest.mark.parametrize("normalize", [True, False])
+def test_prepared_size_and_lifecycle(normalize):
     T = _walk(128, seed=4)
-    with mlx_stump.prepare_target(T, 16) as target:
+    with mlx_stump.prepare_target(T, 16, normalize=normalize) as target:
         with pytest.raises(ValueError, match="length 16"):
             target.mass(T[:15])
         with pytest.raises(ValueError, match="length 16"):
@@ -194,3 +197,51 @@ def test_prepared_size_and_lifecycle():
     with pytest.raises(RuntimeError, match="closed"):
         target.match(T[:16])
     target.close()
+
+
+@pytest.mark.parametrize("normalize", [True, False])
+@pytest.mark.parametrize("column_query", [False, True])
+@pytest.mark.parametrize("metadata", ["none", "finite_mask", "stats"])
+def test_prepared_query_length_with_metadata(normalize, column_query, metadata):
+    T = _walk(128, seed=12)
+    m = 16
+    l = T.size - m + 1
+    kwargs = {}
+    if metadata == "finite_mask":
+        kwargs["T_subseq_isfinite"] = np.ones(l, dtype=bool)
+    elif metadata == "stats":
+        kwargs.update(M_T=np.zeros(l), Σ_T=np.ones(l))
+
+    with mlx_stump.prepare_target(T, m, normalize=normalize, **kwargs) as target:
+        for size in (m - 1, m + 1):
+            Q = T[:size, None] if column_query else T[:size]
+            warning = (
+                pytest.warns(UserWarning, match="automatically flattened")
+                if column_query
+                else nullcontext()
+            )
+            with warning, pytest.raises(ValueError, match="Q.*length 16"):
+                target.mass(Q)
+            with pytest.raises(ValueError, match="Q.*length 16"):
+                target.match(Q, max_distance=np.inf, max_matches=2)
+
+        # Correctly sized column queries retain the same result as ordinary
+        # calls, including raw targets with a fixed finite mask or statistics.
+        Q = T[20 : 20 + m].copy()
+        query = Q[:, None] if column_query else Q
+        warning = (
+            pytest.warns(UserWarning, match="automatically flattened")
+            if column_query
+            else nullcontext()
+        )
+        with warning:
+            actual = target.mass(query)
+        np.testing.assert_array_equal(
+            actual, mlx_stump.mass(Q, T, normalize=normalize, **kwargs)
+        )
+        np.testing.assert_array_equal(
+            target.match(query, max_distance=np.inf, max_matches=2),
+            mlx_stump.match(
+                Q, T, normalize=normalize, max_distance=np.inf, max_matches=2, **kwargs
+            ),
+        )

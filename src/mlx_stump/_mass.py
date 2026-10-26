@@ -211,7 +211,7 @@ class PreparedTarget:
             Q_subseq_isconstant,
             query_idx,
             copy_series=False,
-            prepared=self if self.normalize else None,
+            prepared=self,
             stacklevel=3,
         )[0]
 
@@ -244,7 +244,7 @@ class PreparedTarget:
             self._T_subseq_isconstant,
             Q_subseq_isconstant,
             target_owned=True,
-            prepared=self if self.normalize else None,
+            prepared=self,
             stacklevel=3,
         )
 
@@ -435,6 +435,10 @@ def _mass(
     m = check_window_size(int(Q.shape[0]), T.shape[0])
     if prepared is not None and m != prepared.m:
         raise ValueError(f"`Q` must have length {prepared.m} for this prepared target.")
+    # Raw targets share the fixed query-length contract, but their affine frame
+    # and buffers belong to this query. Keep the ordinary raw cleanup path.
+    if not normalize:
+        prepared = None
     l = T.shape[0] - m + 1
     info = _MassInfo()
 

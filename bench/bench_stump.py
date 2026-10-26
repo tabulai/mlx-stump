@@ -1,11 +1,14 @@
 """Benchmark mlx_stump.stump against stumpy.stump on this machine.
 
 Honesty rules:
+- MLX must use an available, active Metal GPU; the device is recorded.
 - STUMPY runs on THIS Mac with all cores (never quoted from published tables).
 - Timings are end-to-end: validation, float64 preprocessing, host<->GPU
   transfer, and the float64 profile refinement are all inside the clock.
-- Precision metrics are printed next to the speed numbers: max |dP| against
-  float64 STUMPY, exact index agreement, and top-10 discord overlap.
+- Precision metrics are printed next to the speed numbers: max finite |dP|
+  against float64 STUMPY, nonfinite agreement, exact index agreement, and
+  top-10 discord overlap. No comparable finite values or valid discords is
+  reported as n/a; discord counts reflect the available reference positions.
 
 Usage:
     python bench/bench_stump.py --sizes 16384 65536 131072 --m 200 --repeat 3
@@ -19,6 +22,7 @@ import os
 import pathlib
 import time
 
+import mlx.core as mx
 import numpy as np
 
 import mlx_stump
@@ -54,13 +58,31 @@ def _discord_topk(P: np.ndarray, excl: int, k: int = 10) -> set[int]:
     return set(out)
 
 
+def _profile_error(P: np.ndarray, reference: np.ndarray) -> tuple[float | None, bool]:
+    """Finite-distance error and agreement of missing-neighbor sentinels.
+
+    No finite pairs means there is no distance error to report. A NaN is
+    always invalid, even if both implementations return it at the same row.
+    """
+    P = np.asarray(P, dtype=np.float64)
+    reference = np.asarray(reference, dtype=np.float64)
+    if P.shape != reference.shape:
+        raise ValueError("Profile shapes must agree for an accuracy comparison.")
+    nonfinite_agree = bool(
+        not (np.isnan(P).any() or np.isnan(reference).any())
+        and np.array_equal(np.isposinf(P), np.isposinf(reference))
+        and np.array_equal(np.isneginf(P), np.isneginf(reference))
+    )
+    finite = np.isfinite(P) & np.isfinite(reference)
+    error = float(np.max(np.abs(P[finite] - reference[finite]))) if finite.any() else None
+    return error, nonfinite_agree
+
+
 def provenance(stumpy_threads: int | None = None) -> str:
     """One line naming the machine, software and commit the numbers came from."""
     import datetime
     import platform
     import subprocess
-
-    import mlx.core as mx
 
     def _run(*cmd):
         try:
@@ -93,6 +115,7 @@ def provenance(stumpy_threads: int | None = None) -> str:
     return (
         f"{chip}, macOS {platform.mac_ver()[0]}, Python {platform.python_version()}, "
         f"mlx {mx.__version__}, numpy {np.__version__}, stumpy {stumpy_v}{thread_info}, "
+        f"device {mx.default_device()}, metal {mx.metal.is_available()}, "
         f"mlx-stump {mlx_stump.__version__} @ {commit}, {datetime.date.today().isoformat()}"
     )
 
@@ -105,6 +128,9 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--no-stumpy", action="store_true", help="skip the CPU baseline")
     args = ap.parse_args()
+
+    if not (mx.metal.is_available() and mx.default_device() == mx.gpu):
+        raise RuntimeError("This GPU benchmark requires an available, active Metal GPU.")
 
     use_stumpy = not args.no_stumpy
     stumpy = None
@@ -144,14 +170,12 @@ def main() -> None:
     if use_stumpy:
         stumpy.stump(T_warm, m)
 
-    stumpy_label = (
-        "stumpy skipped" if stumpy_threads is None else f"stumpy {stumpy_threads}-thread"
-    )
+    stumpy_label = "stumpy skipped" if stumpy_threads is None else f"stumpy {stumpy_threads}-thread"
     header = (
         f"| n | mlx-stump (s) | {stumpy_label} (s) | speedup "
-        "| max dP | idx agree | top-10 discords |"
+        "| max finite dP | nonfinite agree | idx agree | top-10 discords |"
     )
-    rule = "|---|---|---|---|---|---|---|"
+    rule = "|---|---|---|---|---|---|---|---|"
     print(f"\n{provenance(stumpy_threads)}")
     print(f"random walk, m={m}, best of {args.repeat}\n")
     print(header)
@@ -162,15 +186,21 @@ def main() -> None:
         t_ours, mp = _time(lambda T=T: mlx_stump.stump(T, m), args.repeat)
         if use_stumpy:
             t_ref, ref = _time(lambda T=T: stumpy.stump(T, m), args.repeat)
-            dP = float(np.max(np.abs(mp.P_ - ref.P_)))
+            dP, nonfinite_agree = _profile_error(mp.P_, ref.P_)
+            error_label = "n/a" if dP is None else f"{dP:.2e}"
             agree = float(np.mean(mp.I_ == ref.I_))
-            overlap = len(_discord_topk(mp.P_, excl) & _discord_topk(ref.P_, excl))
+            reference_discords = _discord_topk(ref.P_, excl)
+            overlap = len(_discord_topk(mp.P_, excl) & reference_discords)
+            discord_label = (
+                f"{overlap}/{len(reference_discords)}" if reference_discords else "n/a (0 valid)"
+            )
             print(
                 f"| {n:,} | {t_ours:.3f} | {t_ref:.3f} | {t_ref / t_ours:.1f}x "
-                f"| {dP:.2e} | {agree:.2%} | {overlap}/10 |"
+                f"| {error_label} | {'yes' if nonfinite_agree else 'NO'} "
+                f"| {agree:.2%} | {discord_label} |"
             )
         else:
-            print(f"| {n:,} | {t_ours:.3f} | - | - | - | - | - |")
+            print(f"| {n:,} | {t_ours:.3f} | - | - | - | - | - | - |")
         mp = ref = None  # release before the next size's clock starts
 
 
